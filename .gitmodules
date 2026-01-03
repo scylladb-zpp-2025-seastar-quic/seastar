@@ -3,4 +3,4 @@
 	url = https://github.com/scylladb/dpdk.git
 [submodule "external/ngtcp2"]
 	path = external/ngtcp2
-	url = https://github.com/ngtcp2/ngtcp2
+	url = https://github.com/ngtcp2/ngtcp2.git
