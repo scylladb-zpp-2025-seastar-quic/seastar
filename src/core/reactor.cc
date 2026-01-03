@@ -68,7 +68,6 @@ module;
 #include <boost/range/algorithm/find_if.hpp>
 #include <boost/algorithm/clamp.hpp>
 #include <boost/version.hpp>
-#include <dirent.h>
 #define __user /* empty */  // for xfs includes, below
 #include <linux/types.h> // for xfs, below
 #include <sys/ioctl.h>
@@ -324,25 +323,16 @@ reactor::do_send(pollable_fd_state& fd, const void* buffer, size_t len) {
 }
 
 future<size_t>
-reactor::do_sendmsg(pollable_fd_state& fd, net::packet& p) {
-    return writeable(fd).then([this, &fd, &p] () mutable {
-        static_assert(offsetof(iovec, iov_base) == offsetof(net::fragment, base) &&
-            sizeof(iovec::iov_base) == sizeof(net::fragment::base) &&
-            offsetof(iovec, iov_len) == offsetof(net::fragment, size) &&
-            sizeof(iovec::iov_len) == sizeof(net::fragment::size) &&
-            alignof(iovec) == alignof(net::fragment) &&
-            sizeof(iovec) == sizeof(net::fragment)
-            , "net::fragment and iovec should be equivalent");
-
-        iovec* iov = reinterpret_cast<iovec*>(p.fragment_array());
+reactor::do_sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) {
+    return writeable(fd).then([this, &fd, iovs, len] () mutable {
         msghdr mh = {};
-        mh.msg_iov = iov;
-        mh.msg_iovlen = std::min<size_t>(p.nr_frags(), IOV_MAX);
+        mh.msg_iov = iovs.data();
+        mh.msg_iovlen = std::min<size_t>(iovs.size(), IOV_MAX);
         auto r = fd.fd.sendmsg(&mh, MSG_NOSIGNAL);
         if (!r) {
-            return do_sendmsg(fd, p);
+            return do_sendmsg(fd, iovs, len);
         }
-        if (size_t(*r) == p.len()) {
+        if (size_t(*r) == len) {
             fd.speculate_epoll(EPOLLOUT);
         }
         return make_ready_future<size_t>(*r);
@@ -400,9 +390,25 @@ future<temporary_buffer<char>> pollable_fd_state::read_some(internal::buffer_all
     return engine()._backend->read_some(*this, ba);
 }
 
-future<size_t> pollable_fd_state::write_some(net::packet& p) {
-    return engine()._backend->sendmsg(*this, p);
+#if SEASTAR_API_LEVEL >= 9
+future<size_t> pollable_fd_state::write_some(std::span<iovec> iovs) {
+    return engine()._backend->sendmsg(*this, iovs, internal::iovec_len(iovs));
 }
+#else
+future<size_t> pollable_fd_state::write_some(net::packet& p) {
+    static_assert(offsetof(iovec, iov_base) == offsetof(net::fragment, base) &&
+        sizeof(iovec::iov_base) == sizeof(net::fragment::base) &&
+        offsetof(iovec, iov_len) == offsetof(net::fragment, size) &&
+        sizeof(iovec::iov_len) == sizeof(net::fragment::size) &&
+        alignof(iovec) == alignof(net::fragment) &&
+        sizeof(iovec) == sizeof(net::fragment)
+        , "net::fragment and iovec should be equivalent");
+
+    auto fragments = p.fragments();
+    auto iovecs = std::span(reinterpret_cast<iovec*>(fragments._start), fragments._finish - fragments._start);
+    return engine()._backend->sendmsg(*this, iovecs, p.len());
+}
+#endif
 
 future<> pollable_fd_state::write_all(const char* buffer, size_t size) {
     return engine().send_all(*this, buffer, size);
@@ -412,6 +418,14 @@ future<> pollable_fd_state::write_all(const uint8_t* buffer, size_t size) {
     return engine().send_all(*this, buffer, size);
 }
 
+#if SEASTAR_API_LEVEL >= 9
+future<> pollable_fd_state::write_all(std::span<iovec> iovs) {
+    return write_some(iovs).then([this, iovs] (size_t size) {
+        auto niovs = internal::iovec_trim_front(iovs, size);
+        return niovs.empty() ? make_ready_future<>() : write_all(niovs);
+    });
+}
+#else
 future<> pollable_fd_state::write_all(net::packet& p) {
     return write_some(p).then([this, &p] (size_t size) {
         if (p.len() == size) {
@@ -421,6 +435,7 @@ future<> pollable_fd_state::write_all(net::packet& p) {
         return write_all(p);
     });
 }
+#endif
 
 future<> pollable_fd_state::readable() {
     return engine().readable(*this);
@@ -1496,6 +1511,32 @@ bool reactor::test::linux_aio_nowait() {
     return engine()._cfg.aio_nowait_works;
 }
 
+reactor::test::long_task_queue_state
+reactor::test::get_long_task_queue_state() noexcept {
+    auto& r = engine();
+    return long_task_queue_state{
+        .abort_on_too_long_task_queue = r._cfg.abort_on_too_long_task_queue,
+        .max_task_backlog = r._cfg.max_task_backlog,
+    };
+}
+
+future<> reactor::test::restore_long_task_queue_state(const long_task_queue_state& state) noexcept {
+    return smp::invoke_on_all([&state] {
+        reactor::test::set_abort_on_too_long_task_queue(state.abort_on_too_long_task_queue);
+        reactor::test::set_max_task_backlog(state.max_task_backlog);
+    });
+}
+
+void reactor::test::set_abort_on_too_long_task_queue(bool value) noexcept {
+    auto& r = engine();
+    r._cfg.abort_on_too_long_task_queue = value;
+}
+
+void reactor::test::set_max_task_backlog(unsigned value) noexcept {
+    auto& r = engine();
+    r._cfg.max_task_backlog = value;
+}
+
 void
 reactor::block_notifier(int) {
     engine()._cpu_stall_detector->on_signal();
@@ -1909,16 +1950,6 @@ timespec_to_time_point(const timespec& ts) {
     auto d = std::chrono::duration_cast<std::chrono::system_clock::duration>(
             ts.tv_sec * 1s + ts.tv_nsec * 1ns);
     return std::chrono::system_clock::time_point(d);
-}
-
-future<size_t> reactor::read_directory(int fd, char* buffer, size_t buffer_size) {
-    syscall_result<long> ret = co_await _thread_pool->submit<syscall_result<long>>(
-            internal::thread_pool_submit_reason::file_operation, [fd, buffer, buffer_size] () {
-        auto ret = ::syscall(__NR_getdents64, fd, reinterpret_cast<linux_dirent64*>(buffer), buffer_size);
-        return wrap_syscall(ret);
-    });
-    ret.throw_if_error();
-    co_return ret.result;
 }
 
 future<int>
@@ -2651,6 +2682,10 @@ bool reactor::task_queue::run_tasks() {
                 static thread_local logger::rate_limit rate_limit(std::chrono::seconds(10));
                 logger::lambda_log_writer writer([this] (auto it) { return do_dump_task_queue(it, *this); });
                 seastar_logger.log(log_level::warn, rate_limit, writer);
+                if (r._cfg.abort_on_too_long_task_queue) {
+                    auto msg = fmt::format("Too long task queue: {}, max_task_backlog={}", _q.size(), r._cfg.max_task_backlog);
+                    on_fatal_internal_error(seastar_logger, msg);
+                }
             }
         }
     }
@@ -3883,6 +3918,7 @@ reactor_options::reactor_options(program_options::option_group* parent_group)
                 " Useful for short-lived functional tests with a small data set.")
     , overprovisioned(*this, "overprovisioned", "run in an overprovisioned environment (such as docker or a laptop); equivalent to --idle-poll-time-us 0 --thread-affinity 0 --poll-aio 0")
     , abort_on_seastar_bad_alloc(*this, "abort-on-seastar-bad-alloc", "abort when seastar allocator cannot allocate memory")
+    , abort_on_too_long_task_queue(*this, "abort-on-too-long-task-queue", false, "abort when the task queue is too long")
     , force_aio_syscalls(*this, "force-aio-syscalls", false,
                 "Force io_getevents(2) to issue a system call, instead of bypassing the kernel when possible."
                 " This makes strace output more useful, but slows down the application")
@@ -4420,6 +4456,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
         .bypass_fsync = reactor_opts.unsafe_bypass_fsync.get_value(),
         .no_poll_aio = !reactor_opts.poll_aio.get_value() || (reactor_opts.poll_aio.defaulted() && reactor_opts.overprovisioned),
         .aio_nowait_works = reactor_opts.linux_aio_nowait.get_value(), // Mixed in with filesystem-provided values later
+        .abort_on_too_long_task_queue = reactor_opts.abort_on_too_long_task_queue.get_value(),
     };
 
     // Disable hot polling if sched wakeup granularity is too high

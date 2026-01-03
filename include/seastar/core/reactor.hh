@@ -466,7 +466,7 @@ private:
     future<size_t>
     do_send(pollable_fd_state& fd, const void* buffer, size_t size);
     future<size_t>
-    do_sendmsg(pollable_fd_state& fd, net::packet& p);
+    do_sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len);
 
     future<temporary_buffer<char>>
     do_recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba);
@@ -549,6 +549,7 @@ public:
     future<> link_file(std::string_view oldpath, std::string_view newpath) noexcept;
     future<> chmod(std::string_view name, file_permissions permissions) noexcept;
 
+    [[deprecated("Use file::list_directory API instead")]]
     future<size_t> read_directory(int fd, char* buffer, size_t buffer_size);
 
     future<int> inotify_add_watch(int fd, std::string_view path, uint32_t flags);
@@ -763,6 +764,15 @@ public:
         static void set_stall_detector_report_function(std::function<void ()> report);
         static std::function<void ()> get_stall_detector_report_function();
         static bool linux_aio_nowait();
+
+        struct long_task_queue_state {
+            bool abort_on_too_long_task_queue;
+            unsigned max_task_backlog;
+        };
+        static long_task_queue_state get_long_task_queue_state() noexcept;
+        static future<> restore_long_task_queue_state(const long_task_queue_state& state) noexcept;
+        static void set_abort_on_too_long_task_queue(bool value) noexcept;
+        static void set_max_task_backlog(unsigned value) noexcept;
     };
 };
 
