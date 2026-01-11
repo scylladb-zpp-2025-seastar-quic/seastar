@@ -105,6 +105,12 @@ seastar_add_demo (tls_simple_client
 seastar_add_demo (udp_client
   SOURCES udp_client_demo.cc)
 
+seastar_add_demo (ngtcp2_server
+  SOURCES ngtcp2_server_demo.cc)
+
+seastar_add_demo (ngtcp2_client
+  SOURCES ngtcp2_client_demo.cc)
+
 seastar_add_demo (udp_server
   SOURCES udp_server_demo.cc)
 
@@ -132,3 +138,13 @@ if (Seastar_MODULE)
     PRIVATE
       seastar-module)
 endif ()
+
+target_link_libraries (demo_ngtcp2_server
+  PRIVATE 
+    ngtcp2::ngtcp2
+    ngtcp2::ngtcp2_crypto)
+
+target_link_libraries (demo_ngtcp2_client
+  PRIVATE 
+    ngtcp2::ngtcp2
+    ngtcp2::ngtcp2_crypto)]]
