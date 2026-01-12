@@ -8,6 +8,8 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/fstream.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/condition-variable.hh>
 
 #include <seastar/net/api.hh>
 
@@ -75,7 +77,7 @@ static seastar::temporary_buffer<char> packet_to_tb(seastar::net::packet& pkt) {
     return tb;
 }
 
-// Class wrapper for datagram_channel with local and remote addresses.
+// Datagram Socket - datagram channel, socket address local and remote.
 class SeastarDgramSocket {
 public:
     SeastarDgramSocket(seastar::net::datagram_channel ch,
@@ -88,6 +90,8 @@ public:
     }
     seastar::future<seastar::net::datagram> recv_one() { return ch_.receive(); }
 
+    void shutdown() { ch_.close(); }
+
     const seastar::socket_address& local_address()  const { return local_; }
     const seastar::socket_address& remote_address() const { return remote_; }
 
@@ -97,7 +101,7 @@ private:
     seastar::socket_address remote_;
 };
 
-// Class wrapper for client.
+// Client structure.
 struct Client {
     ngtcp2_conn* conn = nullptr;
 
@@ -116,7 +120,15 @@ struct Client {
     sockaddr_storage remote_ss{};
     socklen_t        remote_ss_len = 0;
 
+    seastar::condition_variable timer_cv;
+
+    // Used to give signal after sending datagram and wake up timer_loop.
+    void reschedule() {
+        timer_cv.signal();
+    }
+
     ~Client() {
+        timer_cv.broken();
         if (conn) ngtcp2_conn_del(conn);
         if (tls)  gnutls_deinit(tls);
         if (cred) gnutls_certificate_free_credentials(cred);
@@ -131,7 +143,7 @@ struct Client {
 using client_ptr = seastar::lw_shared_ptr<Client>;
 using sock_ptr   = seastar::lw_shared_ptr<SeastarDgramSocket>;
 
-// Callbacks etc. for ngtcp2
+// ---------------- Callbacks ----------------
 static ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* conn_ref) {
     return (ngtcp2_conn*)conn_ref->user_data;
 }
@@ -156,21 +168,21 @@ static int get_path_challenge_data_cb(ngtcp2_conn*, uint8_t *data, void*) {
 static int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
     auto* c = static_cast<Client*>(user_data);
     c->handshake_done = true;
-    LOG("[client] Handshake completed. Pisz tekst i wciśnij ENTER:");
+    LOG("[Client] Handshake completed. Write text and press ENTER:");
     return 0;
 }
 
 static int recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t,
                                uint64_t, const uint8_t* data, size_t datalen,
                                void*, void*) {
-    std::cout << "[Serwer]: ";
+    std::cout << "[Server]: ";
     std::cout.write((const char*)data, (std::streamsize)datalen);
     std::cout << "\n";
     std::cout.flush();
     return 0;
 }
 
-// Function initialising gnutls.
+// Function initializing gnutls.
 static void init_tls(Client& c) {
     int grv = gnutls_certificate_allocate_credentials(&c.cred);
     if (grv < 0) throw std::runtime_error(gnutls_strerror(grv));
@@ -207,23 +219,23 @@ static void make_rand_cid(ngtcp2_cid& cid, size_t len) {
     for (size_t i = 0; i < len; ++i) cid.data[i] = (uint8_t)std::rand();
 }
 
-// Initialization of ngtcp2.
+// Function initializing ngtcp2.
 static void init_ngtcp2(Client& c) {
     ngtcp2_callbacks callbacks{};
-    callbacks.client_initial           = ngtcp2_crypto_client_initial_cb;
-    callbacks.recv_retry               = ngtcp2_crypto_recv_retry_cb;
-    callbacks.recv_crypto_data         = ngtcp2_crypto_recv_crypto_data_cb;
-    callbacks.encrypt                  = ngtcp2_crypto_encrypt_cb;
-    callbacks.decrypt                  = ngtcp2_crypto_decrypt_cb;
-    callbacks.hp_mask                  = ngtcp2_crypto_hp_mask_cb;
-    callbacks.update_key               = ngtcp2_crypto_update_key_cb;
-    callbacks.delete_crypto_aead_ctx   = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+    callbacks.client_initial = ngtcp2_crypto_client_initial_cb;
+    callbacks.recv_retry = ngtcp2_crypto_recv_retry_cb;
+    callbacks.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
+    callbacks.encrypt = ngtcp2_crypto_encrypt_cb;
+    callbacks.decrypt = ngtcp2_crypto_decrypt_cb;
+    callbacks.hp_mask = ngtcp2_crypto_hp_mask_cb;
+    callbacks.update_key = ngtcp2_crypto_update_key_cb;
+    callbacks.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
     callbacks.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
-    callbacks.rand                     = rand_cb;
-    callbacks.get_new_connection_id    = get_new_connection_id_cb;
-    callbacks.get_path_challenge_data  = get_path_challenge_data_cb;
-    callbacks.recv_stream_data         = recv_stream_data_cb;
-    callbacks.handshake_completed      = handshake_completed_cb;
+    callbacks.rand = rand_cb;
+    callbacks.get_new_connection_id = get_new_connection_id_cb;
+    callbacks.get_path_challenge_data = get_path_challenge_data_cb;
+    callbacks.recv_stream_data = recv_stream_data_cb;
+    callbacks.handshake_completed = handshake_completed_cb;
 
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
@@ -231,11 +243,11 @@ static void init_ngtcp2(Client& c) {
 
     ngtcp2_transport_params params;
     ngtcp2_transport_params_default(&params);
-    params.initial_max_stream_data_bidi_local  = 256 * 1024;
+    params.initial_max_stream_data_bidi_local = 256 * 1024;
     params.initial_max_stream_data_bidi_remote = 256 * 1024;
-    params.initial_max_data                    = 4 * 1024 * 1024;
-    params.initial_max_streams_bidi            = 128;
-    params.max_idle_timeout                    = 60 * 1000;
+    params.initial_max_data = 4 * 1024 * 1024;
+    params.initial_max_streams_bidi = 128;
+    params.max_idle_timeout = 60 * 1000;
 
     ngtcp2_cid dcid{}, scid{};
     make_rand_cid(dcid, 8);
@@ -254,98 +266,123 @@ static void init_ngtcp2(Client& c) {
     c.conn_ref.user_data = c.conn;
 }
 
-// Function used to send pending data in ngtcp2.
+// Checking if there are any data to send by ngtcp2_conn_write_pkt and sending it if needed.
 static seastar::future<> send_pending_pkts(client_ptr c, sock_ptr sock) {
-    if (!c || !sock || !c->conn || c->closing) return seastar::make_ready_future<>();
+    if (!c || !sock || !c->conn || c->closing) co_return;
 
-    return seastar::do_with(std::array<uint8_t, MAX_UDP_OUT>{}, [c, sock](auto& outbuf) {
-        return seastar::repeat([c, sock, &outbuf]() -> seastar::future<seastar::stop_iteration> {
-            ngtcp2_path path{};
-            ngtcp2_pkt_info pi{};
-            std::memset(&pi, 0, sizeof(pi));
-            c->fill_path(path);
-
-            ngtcp2_ssize nwrite =
-                ngtcp2_conn_write_pkt(c->conn, &path, &pi, outbuf.data(), outbuf.size(), now_ns());
-
-            if (nwrite == 0) {
-                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-            }
-            if (nwrite < 0) {
-                if (nwrite != NGTCP2_ERR_DRAINING && nwrite != NGTCP2_ERR_WRITE_MORE) {
-                    LOG("[client] write_pkt: " << ngtcp2_strerror((int)nwrite));
-                }
-                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-            }
-
-            auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
-            std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
-
-            return sock->send_to(sock->remote_address(), std::move(tb)).then([] {
-                return seastar::stop_iteration::no;
-            });
-        });
-    });
-}
-
-// Used to opening stream.
-static void try_open_stream(Client& c) {
-    if (c.stream_opened) return;
-    int rv = ngtcp2_conn_open_bidi_stream(c.conn, &c.stream_id, nullptr);
-    if (rv == 0) {
-        c.stream_opened = true;
-        LOG("[client] opened stream id=" << c.stream_id);
-        return;
-    }
-    if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) {
-        return;
-    }
-    LOG("[client] open_bidi_stream failed: " << ngtcp2_strerror(rv));
-}
-
-// Used to send msg string.
-static seastar::future<> send_message(client_ptr c, sock_ptr sock, std::string msg) {
-    if (!c->handshake_done || !c->conn || c->closing) return seastar::make_ready_future<>();
-
-    try_open_stream(*c);
-    if (!c->stream_opened) {
-        LOG("[client] Brak otwartego strumienia, nie można wysłać.");
-        return seastar::make_ready_future<>();
-    }
-
-    return seastar::do_with(std::move(msg), std::array<uint8_t, MAX_UDP_OUT>{}, [c, sock](auto& msg, auto& outbuf) {
+    std::array<uint8_t, MAX_UDP_OUT> outbuf{};
+    
+    while (true) {
         ngtcp2_path path{};
         ngtcp2_pkt_info pi{};
         std::memset(&pi, 0, sizeof(pi));
         c->fill_path(path);
 
-        ngtcp2_vec vec;
-        vec.base = (uint8_t*)msg.data();
-        vec.len  = msg.size();
+        ngtcp2_ssize nwrite =
+            ngtcp2_conn_write_pkt(c->conn, &path, &pi, outbuf.data(), outbuf.size(), now_ns());
 
-        ngtcp2_ssize ndatalen = 0;
-        ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(
-            c->conn, &path, &pi,
-            outbuf.data(), outbuf.size(),
-            &ndatalen, 0, c->stream_id,
-            &vec, 1, now_ns()
-        );
-
-        if (nwrite <= 0) return seastar::make_ready_future<>();
+        if (nwrite == 0) co_return;
         
+        if (nwrite < 0) {
+            if (nwrite != NGTCP2_ERR_DRAINING && nwrite != NGTCP2_ERR_WRITE_MORE) {
+                LOG("[client] write_pkt: " << ngtcp2_strerror((int)nwrite));
+            }
+            co_return;
+        }
+
         auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
         std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
-        
-        return sock->send_to(sock->remote_address(), std::move(tb)).then([c, sock] {
-            return send_pending_pkts(c, sock);
-        });
-    });
+        co_await sock->send_to(sock->remote_address(), std::move(tb));
+    }
 }
 
-// Listening loop for sent data.
+// Opening stream.
+static void try_open_stream(Client& c) {
+    if (c.stream_opened) return;
+    int rv = ngtcp2_conn_open_bidi_stream(c.conn, &c.stream_id, nullptr);
+    if (rv == 0) {
+        c.stream_opened = true;
+        LOG("[Client] opened stream id=" << c.stream_id);
+        return;
+    }
+    if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) {
+        return;
+    }
+    LOG("[Client] open_bidi_stream failed: " << ngtcp2_strerror(rv));
+}
+
+static seastar::future<> send_message(client_ptr c, sock_ptr sock, std::string msg) {
+    if (!c->handshake_done || !c->conn || c->closing) co_return;
+
+    try_open_stream(*c);
+    if (!c->stream_opened) {
+        LOG("[Client] Stream not opened");
+        co_return;
+    }
+
+    std::array<uint8_t, MAX_UDP_OUT> outbuf{};
+
+    ngtcp2_path path{};
+    ngtcp2_pkt_info pi{};
+    std::memset(&pi, 0, sizeof(pi));
+    c->fill_path(path);
+
+    ngtcp2_vec vec;
+    vec.base = (uint8_t*)msg.data();
+    vec.len  = msg.size();
+
+    ngtcp2_ssize ndatalen = 0;
+    ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(
+        c->conn, &path, &pi,
+        outbuf.data(), outbuf.size(),
+        &ndatalen, 0, c->stream_id,
+        &vec, 1, now_ns()
+    );
+
+    if (nwrite <= 0) co_return;
+
+    auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
+    std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
+
+    co_await sock->send_to(sock->remote_address(), std::move(tb));
+    
+    co_await send_pending_pkts(c, sock);
+}
+
+
+// Sending connection close to server after pressing CTRL+D.
+static seastar::future<> send_connection_close(client_ptr c, sock_ptr sock) {
+    if (!c || !sock || !c->conn) co_return;
+
+    std::array<uint8_t, MAX_UDP_OUT> outbuf{};
+    ngtcp2_path path{};
+    ngtcp2_pkt_info pi{};
+    std::memset(&pi, 0, sizeof(pi));
+    c->fill_path(path);
+
+    ngtcp2_ccerr err;
+    ngtcp2_ccerr_default(&err);
+
+    ngtcp2_ssize nwrite = ngtcp2_conn_write_connection_close(
+        c->conn, &path, &pi,
+        outbuf.data(), outbuf.size(),
+        &err,
+        now_ns()
+    );
+
+    if (nwrite > 0) {
+        auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
+        std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
+        co_await sock->send_to(sock->remote_address(), std::move(tb));
+        LOG("[Client] Sending CONNECTION_CLOSE.");
+    }
+}
+
+// Loop getting data from server.
 static seastar::future<> net_loop(client_ptr c, sock_ptr sock) {
-    return seastar::repeat([c, sock]() -> seastar::future<seastar::stop_iteration> {
-        return sock->recv_one().then([c, sock](seastar::net::datagram d) -> seastar::future<seastar::stop_iteration> {
+    while (true) {
+        try {
+            auto d = co_await sock->recv_one();
             auto& pkt = d.get_data();
             auto tb = packet_to_tb(pkt);
 
@@ -366,63 +403,84 @@ static seastar::future<> net_loop(client_ptr c, sock_ptr sock) {
             );
 
             if (rv < 0) {
-                LOG("[client] read_pkt error: " << ngtcp2_strerror(rv));
-                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
+                LOG("[Client] read_pkt error: " << ngtcp2_strerror(rv));
+                continue;
             }
 
-            return send_pending_pkts(c, sock).then([] {
-                return seastar::stop_iteration::no;
-            });
-        });
-    });
+            c->reschedule();
+
+            co_await send_pending_pkts(c, sock);
+        } catch (...) {
+            if (c->closing) break;
+        }
+    }
 }
 
-// Waiting for input data and sending it.
+// Loop getting data from input.
 static seastar::future<> input_loop(client_ptr c, sock_ptr sock) {
     int flags = fcntl(0, F_GETFL, 0);
     fcntl(0, F_SETFL, flags | O_NONBLOCK);
 
-    return seastar::repeat([c, sock] {
-        char buf[1024];
+    char buf[1024];
+
+    while (!c->closing) {
         ssize_t n = ::read(0, buf, sizeof(buf));
 
         if (n > 0) {
             std::string msg(buf, n);
-            return send_message(c, sock, msg).then([] {
-                return seastar::stop_iteration::no;
-            });
-        } else if (n == 0) {
-            // EOF
+
+            co_await send_message(c, sock, msg);
+            
+            c->reschedule();
+        } 
+        else if (n == 0) {
+            co_await send_connection_close(c, sock);
             c->closing = true;
-            return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-        } else {
+            c->reschedule();
+            sock->shutdown();
+            break;
+        } 
+        else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return seastar::sleep(std::chrono::milliseconds(50)).then([] {
-                    return seastar::stop_iteration::no;
-                });
+                co_await seastar::sleep(std::chrono::milliseconds(50));
+            } else {
+                LOG("[client] stdin error: " << strerror(errno));
+                c->closing = true;
+                c->reschedule();
+                break;
             }
-            LOG("[client] stdin error: " << strerror(errno));
-            c->closing = true;
-            return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
         }
-    });
+    }
 }
 
-// Used to handle expired data.
+// Handling retransmission if needed.
 static seastar::future<> timer_loop(client_ptr c, sock_ptr sock) {
-    return seastar::repeat([c, sock]() -> seastar::future<seastar::stop_iteration> {
-        return seastar::sleep(std::chrono::milliseconds(100)).then([c, sock] {
-            if (c->closing) {
-                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
+    while (!c->closing) {
+        auto now = now_ns();
+        auto expiry = ngtcp2_conn_get_expiry(c->conn);
+
+        try {
+            if (expiry == UINT64_MAX) {
+                co_await c->timer_cv.wait();
+            } 
+            else if (expiry > now) {
+                co_await c->timer_cv.wait(std::chrono::nanoseconds(expiry - now));
             }
-            
-            ngtcp2_conn_handle_expiry(c->conn, now_ns());
-            
-            return send_pending_pkts(c, sock).then([] {
-                return seastar::stop_iteration::no;
-            });
-        });
-    });
+        }
+        catch (const seastar::condition_variable_timed_out&) {}
+        catch (seastar::broken_condition_variable&) {
+            break;
+        }
+        
+        if (c->closing) break;
+
+        now = now_ns();
+        if (ngtcp2_conn_get_expiry(c->conn) <= now) {
+            ngtcp2_conn_handle_expiry(c->conn, now);
+        }
+
+        co_await send_pending_pkts(c, sock);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -459,22 +517,23 @@ int main(int argc, char** argv) {
             init_ngtcp2(*c);
 
             LOG("[client] sending Initial");
-            return send_pending_pkts(c, sock)
-                .then([c, sock] {
-                    return seastar::when_all_succeed(
-                        net_loop(c, sock),
-                        input_loop(c, sock),
-                        timer_loop(c, sock)
-                    ).discard_result();
-                })
-                .then([] { return 0; });
+            co_await send_pending_pkts(c, sock);
+            
+            co_await seastar::when_all_succeed(
+                net_loop(c, sock),
+                input_loop(c, sock),
+                timer_loop(c, sock)
+            ).discard_result();
+            
+            co_return 0;
 
         } catch (const std::exception& e) {
             LOG("[client] fatal: " << e.what());
-            return seastar::make_ready_future<int>(1);
+            co_return 1;
         }
     });
 
+    // Cleanup.
     gnutls_global_deinit();
     return rc;
 }
