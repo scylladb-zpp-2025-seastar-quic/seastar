@@ -11,3 +11,11 @@
 In case of `ninja: error: loading 'build.ninja': No such file or directory` just type `ninja any_other_demo`
 
 I had to remove dpdk submodule.
+
+
+## Useful commands to kill remaining seastar processes and check if they are occupying your resources.
+cat /proc/sys/fs/aio-max-nr
+
+cat /proc/sys/fs/aio-nr
+
+ps -ef | grep -E "demo|seastar|ngtcp2"

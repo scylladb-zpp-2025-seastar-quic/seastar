@@ -399,6 +399,10 @@ set(ENABLE_SHARED_LIB  OFF CACHE BOOL "Disable shared lib"   FORCE)
 set(ENABLE_GNUTLS      ON  CACHE BOOL "Enable GnuTLS"        FORCE)
 set(ENABLE_OPENSSL     OFF CACHE BOOL "Disable OpenSSL"      FORCE)
 
+# Przekazanie zmiennych do ngtcp2, aby uniknąć błędu HexVersion wewnątrz submodułu
+set(PROJECT_VERSION_MAJOR 1)
+set(PROJECT_VERSION_MINOR 18)
+set(PROJECT_VERSION_PATCH 90)
 add_subdirectory(external/ngtcp2)
 
 foreach(_ng_target ngtcp2_static ngtcp2_crypto_gnutls_static)
