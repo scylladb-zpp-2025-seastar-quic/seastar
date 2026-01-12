@@ -147,4 +147,4 @@ target_link_libraries (demo_ngtcp2_server
 target_link_libraries (demo_ngtcp2_client
   PRIVATE 
     ngtcp2::ngtcp2
-    ngtcp2::ngtcp2_crypto)]]
+    ngtcp2::ngtcp2_crypto)

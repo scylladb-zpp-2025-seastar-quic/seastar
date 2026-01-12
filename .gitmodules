@@ -2,6 +2,3 @@
 	path = external/ngtcp2
 	url = https://github.com/ngtcp2/ngtcp2.git
 	
-[submodule "dpdk"]
-	path = dpdk
-	url = https://github.com/scylladb/dpdk/
