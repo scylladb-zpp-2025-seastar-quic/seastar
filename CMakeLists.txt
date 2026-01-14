@@ -45,7 +45,7 @@ set (Seastar_DPDK_MACHINE
 
 project (Seastar
   VERSION 1.0
-  LANGUAGES CXX)
+  LANGUAGES CXX C)
 
 set (Seastar_ALLOC_FAILURE_INJECTION
   "DEFAULT"
@@ -378,6 +378,65 @@ set (Seastar_GEN_BINARY_DIR ${Seastar_BINARY_DIR}/gen)
 
 include (SeastarDependencies)
 seastar_find_dependencies ()
+
+# Build options for ngtcp2 library (Force static lib, disable shared, use GnuTLS)
+set(ENABLE_LIB_ONLY    ON  CACHE BOOL "Build libngtcp2 only" FORCE)
+set(ENABLE_STATIC_LIB  ON  CACHE BOOL "Build static lib"     FORCE)
+set(ENABLE_SHARED_LIB  OFF CACHE BOOL "Disable shared lib"   FORCE)
+set(ENABLE_GNUTLS      ON  CACHE BOOL "Enable GnuTLS"        FORCE)
+set(ENABLE_OPENSSL     OFF CACHE BOOL "Disable OpenSSL"      FORCE)
+
+# Passing variables to ngtcp2 to disable HexVersion errors.
+set(PROJECT_VERSION_MAJOR 1)
+set(PROJECT_VERSION_MINOR 18)
+set(PROJECT_VERSION_PATCH 90)
+add_subdirectory(external/ngtcp2)
+
+# Fixing paths.
+foreach(_ng_target ngtcp2_static ngtcp2_crypto_gnutls_static)
+    if(TARGET ${_ng_target})
+        get_target_property(_current_includes ${_ng_target} INTERFACE_INCLUDE_DIRECTORIES)
+        
+        if(_current_includes)
+            set_target_properties(${_ng_target} PROPERTIES 
+                INTERFACE_INCLUDE_DIRECTORIES "$<BUILD_INTERFACE:${_current_includes}>")
+            
+            message(STATUS "[ngtcp2-fix] Changed paths: ${_ng_target}")
+        endif()
+    endif()
+endforeach()
+
+# Alias and Export Configuration
+if(TARGET ngtcp2_static)
+    if(NOT TARGET ngtcp2::ngtcp2)
+        add_library(ngtcp2::ngtcp2 ALIAS ngtcp2_static)
+        message(STATUS "[ngtcp2] Aliased ngtcp2::ngtcp2 -> ngtcp2_static")
+    endif()
+
+    install(TARGETS ngtcp2_static 
+            EXPORT seastar-export
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+else()
+    message(FATAL_ERROR "[ngtcp2] CRITICAL: target ngtcp2_static haven't been found!")
+endif()
+
+if(TARGET ngtcp2_crypto_gnutls_static)
+    if(NOT TARGET ngtcp2::ngtcp2_crypto)
+        add_library(ngtcp2::ngtcp2_crypto ALIAS ngtcp2_crypto_gnutls_static)
+        message(STATUS "[ngtcp2] Aliased ngtcp2::ngtcp2_crypto -> ngtcp2_crypto_gnutls_static")
+    endif()
+
+    install(TARGETS ngtcp2_crypto_gnutls_static 
+            EXPORT seastar-export
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+else()
+    message(FATAL_ERROR "[ngtcp2] CRITICAL: target ngtcp2_crypto_gnutls_static haven't been found!")
+endif()
+
 
 # Private build dependencies not visible to consumers
 find_package (ragel 6.10 REQUIRED)
@@ -831,6 +890,8 @@ endif ()
 
 target_link_libraries (seastar
   PUBLIC
+    ngtcp2::ngtcp2
+    ngtcp2::ngtcp2_crypto
     Boost::boost
     Boost::program_options
     c-ares::cares

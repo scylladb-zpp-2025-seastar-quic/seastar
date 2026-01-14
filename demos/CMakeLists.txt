@@ -132,3 +132,13 @@ if (Seastar_MODULE)
     PRIVATE
       seastar-module)
 endif ()
+
+target_link_libraries (demo_ngtcp2_server
+  PRIVATE 
+    ngtcp2::ngtcp2
+    ngtcp2::ngtcp2_crypto)
+
+target_link_libraries (demo_ngtcp2_client
+  PRIVATE 
+    ngtcp2::ngtcp2
+    ngtcp2::ngtcp2_crypto)
