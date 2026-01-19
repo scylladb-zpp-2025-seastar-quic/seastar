@@ -28,8 +28,8 @@ set (NGTCP2_ENABLE_OPENSSL
   BOOL 
   "Disable OpenSSL")
 
-set (NGTCP2_DISABLE_TESTS      
-  ON
+set (BUILD_TESTING      
+  OFF
   CACHE
   BOOL 
   "Disable tests")
