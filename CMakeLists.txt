@@ -384,6 +384,7 @@ find_package (ragel 6.10 REQUIRED)
 find_package (Threads REQUIRED)
 find_package (PthreadSetName REQUIRED)
 find_package (Valgrind REQUIRED)
+find_package (ngtcp2 REQUIRED)
 
 cmake_dependent_option (Seastar_LOGGER_COMPILE_TIME_FMT
   "Enable the compile-time {fmt} check when formatting logging messages" ON
@@ -847,6 +848,7 @@ target_link_libraries (seastar
     lz4::lz4
   PRIVATE
     ${CMAKE_DL_LIBS}
+    ngtcp2::ngtcp2
     GnuTLS::gnutls
     StdAtomic::atomic
     lksctp-tools::lksctp-tools
