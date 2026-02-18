@@ -54,7 +54,7 @@
 #include <fmt/core.h>
 #include <fmt/ostream.h>
 
-#include "../../seastar/apps/lib/stop_signal.hh"
+#include "../../bazinga/apps/lib/stop_signal.hh"
 #include <seastar/quic/quic.hh>
 #include <seastar/quic/quic_server.hh>
 #include <seastar/quic/quic_error.hh>
