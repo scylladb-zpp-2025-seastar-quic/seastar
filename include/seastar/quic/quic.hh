@@ -517,7 +517,7 @@ struct fmt::formatter<seastar::quic::experimental::quic_cid> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
 
     template <typename FormatContext>
-    auto format(const seastar::quic::experimental::quic_cid& c, FormatContext& ctx) {
+    auto format(const seastar::quic::experimental::quic_cid& c, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{}", c.to_string());
     }
 };
