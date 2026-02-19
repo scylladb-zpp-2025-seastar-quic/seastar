@@ -340,6 +340,16 @@ seastar::future<int> Connection::handle_packet(const uint8_t* data, size_t len, 
 // Functions using ngtcp2 functions.
 
 void Connection::init_client(const QuicConfig& config, void* user_data) {
+    // QUIC clients must provide non-empty CIDs for Initial packets.
+    // If caller did not preconfigure them, generate defaults to avoid
+    // collisions between multiple client processes.
+    if (_dcid.empty()) {
+        _dcid = quic_cid::random(8);
+    }
+    if (_scid.empty()) {
+        _scid = quic_cid::random(8);
+    }
+
     ngtcp2_path path{};
     fill_path(path);
 
