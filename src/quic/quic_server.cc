@@ -22,6 +22,9 @@
 #include <vector>
 #include <stdexcept>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/coroutine.hh>
+#include <arpa/inet.h>
 
 #include <gnutls/gnutls.h>
 #include <ngtcp2/ngtcp2.h>
@@ -75,6 +78,54 @@ gnutls_session_t server_crypto_config::make_session(ngtcp2_crypto_conn_ref* ref)
     gnutls_session_set_ptr(tls, ref);
 
     return tls;
+}
+
+listener::listener(udp_channel_ptr channel, seastar::socket_address local_address,
+        seastar::lw_shared_ptr<server_crypto_config> crypto)
+    : _channel(std::move(channel))
+    , _local_address(local_address)
+    , _crypto(std::move(crypto)) {}
+
+udp_channel_ptr listener::channel() const {
+    return _channel;
+}
+
+const seastar::socket_address& listener::local_address() const {
+    return _local_address;
+}
+
+seastar::lw_shared_ptr<server_crypto_config> listener::crypto() const {
+    return _crypto;
+}
+
+void listener::stop() {
+    if (_channel) {
+        _channel->close();
+    }
+}
+
+seastar::future<seastar::lw_shared_ptr<listener>> listen(listen_options options) {
+    if (options.cert_file.empty() || options.key_file.empty()) {
+        throw std::runtime_error("listen requires cert_file and key_file");
+    }
+    if (options.alpns.empty()) {
+        options.alpns.push_back("h3");
+    }
+
+    sockaddr_in6 a{};
+    a.sin6_family = AF_INET6;
+    a.sin6_port = htons(options.port);
+    if (inet_pton(AF_INET6, options.ip.c_str(), &a.sin6_addr) != 1) {
+        throw std::runtime_error("inet_pton failed for listen ip: " + options.ip);
+    }
+
+    auto channel = seastar::make_lw_shared<udp_channel>(
+            seastar::engine().net().make_bound_datagram_channel(seastar::socket_address(a)));
+    auto crypto = seastar::make_lw_shared<server_crypto_config>(
+            options.cert_file, options.key_file, options.alpns);
+
+    co_return seastar::make_lw_shared<listener>(
+            std::move(channel), seastar::socket_address(a), std::move(crypto));
 }
 
 using server_crypto_config_ptr = seastar::lw_shared_ptr<server::server_crypto_config>;

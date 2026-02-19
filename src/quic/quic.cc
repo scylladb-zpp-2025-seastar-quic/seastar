@@ -150,6 +150,12 @@ QuicConfig& QuicConfig::withCallbacks(CallbacksConfigurator func) {
     return *this;
 }
 
+QuicConfig& QuicConfig::withOriginalDcid(const uint8_t* data, size_t len) {
+    params_.original_dcid_present = 1;
+    ngtcp2_cid_init(&params_.original_dcid, data, std::min(len, (size_t)NGTCP2_MAX_CIDLEN));
+    return *this;
+}
+
 
 udp_channel::udp_channel(seastar::net::datagram_channel ch)
     : _ch(std::move(ch)) {}
@@ -172,6 +178,26 @@ void udp_channel::close() {
 
 seastar::socket_address udp_channel::local_address() const {
     return _ch.local_address();
+}
+
+seastar::temporary_buffer<char> datagram_to_temporary_buffer(seastar::net::datagram& d) {
+    auto bufs = d.get_buffers();
+
+    size_t total_len = 0;
+    for (const auto& b : bufs) {
+        total_len += b.size();
+    }
+
+    seastar::temporary_buffer<char> tb(total_len);
+    char* dst = tb.get_write();
+    size_t off = 0;
+
+    for (const auto& b : bufs) {
+        std::memcpy(dst + off, b.get(), b.size());
+        off += b.size();
+    }
+
+    return tb;
 }
 
 
@@ -518,6 +544,72 @@ void Connection::set_dcid(const quic_cid& cid) {
 
 void Connection::set_dcid(const uint8_t* data, size_t len) {
     _dcid = quic_cid(data, len);
+}
+
+void Connection::on_handshake_completed(HandshakeHandler handler) {
+    _on_handshake_completed = std::move(handler);
+}
+
+void Connection::on_stream_data(StreamDataHandler handler) {
+    _on_stream_data = std::move(handler);
+}
+
+void Connection::on_dcid_status(DcidStatusHandler handler) {
+    _on_dcid_status = std::move(handler);
+}
+
+void Connection::apply_default_callbacks(QuicConfig& config) {
+    config.withCallbacks([] (auto& callbacks) {
+        callbacks.get_new_connection_id = &Connection::get_new_connection_id_cb;
+        callbacks.get_path_challenge_data = &Connection::get_path_challenge_data_cb;
+        callbacks.handshake_completed = &Connection::handshake_completed_cb;
+        callbacks.recv_stream_data = &Connection::recv_stream_data_cb;
+        callbacks.dcid_status = &Connection::dcid_status_cb;
+    });
+}
+
+int Connection::get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid *cid, uint8_t *token, size_t cidlen, void*) {
+    cid->datalen = cidlen;
+    rand_bytes(cid->data, cidlen);
+    rand_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
+    return 0;
+}
+
+int Connection::get_path_challenge_data_cb(ngtcp2_conn*, uint8_t *data, void*) {
+    rand_bytes(data, 8);
+    return 0;
+}
+
+int Connection::handshake_completed_cb(ngtcp2_conn*, void* user_data) {
+    auto* c = static_cast<Connection*>(user_data);
+    if (c && c->_on_handshake_completed) {
+        c->_on_handshake_completed(*c);
+    }
+    return 0;
+}
+
+int Connection::recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t,
+        const uint8_t* data, size_t datalen, void* user_data, void*) {
+    auto* c = static_cast<Connection*>(user_data);
+    if (c && c->_on_stream_data) {
+        c->_on_stream_data(*c, sid, std::string_view(reinterpret_cast<const char*>(data), datalen));
+    }
+    return 0;
+}
+
+int Connection::dcid_status_cb(ngtcp2_conn*, ngtcp2_connection_id_status_type type, uint64_t,
+        const ngtcp2_cid* cid, const uint8_t*, void* user_data) {
+    auto* c = static_cast<Connection*>(user_data);
+    if (!c || !cid || !c->_on_dcid_status) {
+        return 0;
+    }
+
+    if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_ACTIVATE) {
+        c->_on_dcid_status(*c, quic_cid(*cid), true);
+    } else if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_DEACTIVATE) {
+        c->_on_dcid_status(*c, quic_cid(*cid), false);
+    }
+    return 0;
 }
 
 init_gnutls::init_gnutls() {

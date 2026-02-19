@@ -49,7 +49,6 @@
 
 #include "../../bazinga/apps/lib/stop_signal.hh"
 #include <seastar/quic/quic.hh>
-#include <seastar/quic/quic_client.hh>
 #include <seastar/quic/quic_error.hh>
 
 static constexpr const char* SERVER_HOST = "localhost";
@@ -62,25 +61,6 @@ static seastar::logger qlog("quic-client");
 using udp_channel_ptr = seastar::quic::experimental::udp_channel_ptr;
 
 
-seastar::temporary_buffer<char> datagram_to_tb(seastar::net::datagram& d) {
-    auto bufs = d.get_buffers();
-    
-    size_t total_len = 0;
-    for (const auto& b : bufs) {
-        total_len += b.size();
-    }
-
-    seastar::temporary_buffer<char> tb(total_len);
-    char* dst = tb.get_write();
-    size_t off = 0;
-    
-    for (const auto& b : bufs) {
-        std::memcpy(dst + off, b.get(), b.size());
-        off += b.size();
-    }
-    return tb;
-}
-
 struct conn_data : public seastar::quic::experimental::Connection {
     bool closing = false;
     bool handshake_done = false;
@@ -91,42 +71,16 @@ struct conn_data : public seastar::quic::experimental::Connection {
 
 using conn_data_ptr = seastar::lw_shared_ptr<conn_data>;
 
-// Callbacks.
-
-static int get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid *cid, uint8_t *token, size_t cidlen, void*) {
-    cid->datalen = cidlen;
-    seastar::quic::experimental::rand_bytes(cid->data, cidlen);
-    seastar::quic::experimental::rand_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
-    return 0;
-}
-
-static int get_path_challenge_data_cb(ngtcp2_conn*, uint8_t *data, void*) {
-    seastar::quic::experimental::rand_bytes(data, 8);
-    return 0;
-}
-
-static int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
-    auto* c = static_cast<conn_data*>(user_data);
-    c->handshake_done = true;
-    qlog.info("Handshake completed. Write text and press ENTER:");
-    return 0;
-}
-
-static int recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t,
-                               uint64_t, const uint8_t* data, size_t datalen,
-                               void*, void*) {
-    fmt::print("[Server]: {:.{}}", (const char*)data, datalen);
-    return 0;
-}
-
-static seastar::quic::experimental::QuicConfig create_config() {
+static seastar::quic::experimental::QuicConfig create_config(const conn_data_ptr& c) {
     seastar::quic::experimental::QuicConfig conf;
-    conf.withCallbacks([](auto& callbacks) {
-        callbacks.get_new_connection_id = get_new_connection_id_cb;
-        callbacks.get_path_challenge_data = get_path_challenge_data_cb;
-        callbacks.recv_stream_data = recv_stream_data_cb;
-        callbacks.handshake_completed = handshake_completed_cb;
+    c->on_handshake_completed([c](seastar::quic::experimental::Connection&) {
+        c->handshake_done = true;
+        qlog.info("Handshake completed. Write text and press ENTER:");
     });
+    c->on_stream_data([](seastar::quic::experimental::Connection&, int64_t, std::string_view data) {
+        fmt::print("[Server]: {:.{}}", data.data(), data.size());
+    });
+    c->apply_default_callbacks(conf);
 
     return conf;
 }
@@ -150,7 +104,7 @@ seastar::future<> net_loop(conn_data_ptr c, udp_channel_ptr sock) {
     try {
         while (!c->closing) {
             auto d = co_await sock->recv_datagram();
-            auto tb = datagram_to_tb(d);
+            auto tb = seastar::quic::experimental::datagram_to_temporary_buffer(d);
 
             int rv = co_await c->handle_packet((const uint8_t*)tb.get(), tb.size(), sock);
             if (rv < 0) {
@@ -248,7 +202,7 @@ int main(int argc, char** argv) {
             auto crypto = seastar::make_lw_shared<seastar::quic::experimental::client::client_crypto_config>
                                                 (std::vector<std::string>{"h3"});
             auto sock = co_await seastar::quic::experimental::client::setup_quic_client(
-                *c, SERVER_HOST, SERVER_IP, SERVER_PORT, create_config(), crypto);
+                *c, SERVER_HOST, SERVER_IP, SERVER_PORT, create_config(c), crypto);
             
             auto net_fut = net_loop(c, sock);
             auto in_fut  = input_loop(c, sock);

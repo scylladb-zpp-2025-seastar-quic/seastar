@@ -51,7 +51,6 @@
 
 #include "../../bazinga/apps/lib/stop_signal.hh"
 #include <seastar/quic/quic.hh>
-#include <seastar/quic/quic_server.hh>
 #include <seastar/quic/quic_error.hh>
 
 static constexpr const char *LISTEN_IP = "::1";
@@ -65,25 +64,6 @@ static seastar::logger qlog("quic-server");
 
 using udp_channel_ptr = seastar::quic::experimental::udp_channel_ptr;
 
-
-seastar::temporary_buffer<char> datagram_to_tb(seastar::net::datagram& d) {
-    auto bufs = d.get_buffers();
-    
-    size_t total_len = 0;
-    for (const auto& b : bufs) {
-        total_len += b.size();
-    }
-
-    seastar::temporary_buffer<char> tb(total_len);
-    char* dst = tb.get_write();
-    size_t off = 0;
-    
-    for (const auto& b : bufs) {
-        std::memcpy(dst + off, b.get(), b.size());
-        off += b.size();
-    }
-    return tb;
-}
 
 static std::string g_cert_path = CERT_FILE;
 static std::string g_key_path = KEY_FILE;
@@ -259,59 +239,53 @@ static conn_data_ptr find_conn_ptr(server_state &st, conn_data *raw) {
     return {};
 }
 
-// Callbacks.
-static int get_new_connection_id_cb(ngtcp2_conn *, ngtcp2_cid *cid,
-                                    uint8_t *token, size_t cidlen, void *) {
-    cid->datalen = cidlen;
-    seastar::quic::experimental::rand_bytes(cid->data, cidlen);
-    seastar::quic::experimental::rand_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
-    return 0;
-}
+static seastar::quic::experimental::QuicConfig create_server_config(
+        const conn_data_ptr& c, const seastar::quic::experimental::quic_cid& client_odcid) {
+    c->on_handshake_completed([](seastar::quic::experimental::Connection& base) {
+        auto* cd = static_cast<conn_data*>(&base);
+        qlog.info("Handshake completed with {}", ip_port_key_v6(cd->peer()));
+    });
 
-static int get_path_challenge_data_cb(ngtcp2_conn *, uint8_t *data, void *) {
-    seastar::quic::experimental::rand_bytes(data, 8);
-    return 0;
-}
+    c->on_dcid_status([](seastar::quic::experimental::Connection& base,
+                const seastar::quic::experimental::quic_cid& cid, bool active) {
+        auto* cd = static_cast<conn_data*>(&base);
+        if (!cd || !cd->st) {
+            return;
+        }
+        auto cp = find_conn_ptr(*cd->st, cd);
+        if (!cp) {
+            return;
+        }
 
-static int handshake_completed_cb(ngtcp2_conn *, void *user_data) {
-    auto *c = static_cast<conn_data *>(user_data);
-    qlog.info("Handshake completed with {}", ip_port_key_v6(c->peer()));
-    return 0;
-}
+        if (active) {
+            map_dcid(*cd->st, cp, cid);
+            qlog.info("DCID activate peer={} dcid={}", ip_port_key_v6(cd->peer()), cid);
+        } else {
+            unmap_dcid(*cd->st, cp, cid);
+            qlog.info("DCID deactivate peer={} dcid={}", ip_port_key_v6(cd->peer()), cid);
+        }
+    });
 
-static int dcid_status_cb(ngtcp2_conn *, ngtcp2_connection_id_status_type type,
-                          uint64_t, const ngtcp2_cid *cid, const uint8_t *,
-                          void *user_data) {
-    auto *c = static_cast<conn_data *>(user_data);
-    if (!c || !c->st || !cid) return 0;
-    auto cp = find_conn_ptr(*c->st, c);
-    if (!cp) return 0;
+    c->on_stream_data([](seastar::quic::experimental::Connection& base, int64_t sid, std::string_view data) {
+        auto* cd = static_cast<conn_data*>(&base);
+        if (cd->closing) {
+            return;
+        }
+        std::string s(data);
 
-if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_ACTIVATE) {
-        map_dcid(*c->st, cp, seastar::quic::experimental::quic_cid(*cid)); 
-        qlog.info("DCID activate peer={} dcid={}", 
-                  ip_port_key_v6(c->peer()), seastar::quic::experimental::quic_cid(*cid));
-    } else if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_DEACTIVATE) {
-        unmap_dcid(*c->st, cp, seastar::quic::experimental::quic_cid(*cid));
-        qlog.info("DCID deactivate peer={} dcid={}", 
-                  ip_port_key_v6(c->peer()), seastar::quic::experimental::quic_cid(*cid));
-    }
-    return 0;
-}
+        fmt::print("[Client {}]: {}", ip_port_key_v6(cd->peer()), s);
+        if (!s.empty() && s.back() != '\n') {
+            fmt::print("\n");
+        }
+        std::cout.flush();
 
-static int recv_stream_data_cb(ngtcp2_conn *, uint32_t, int64_t sid, uint64_t,
-                               const uint8_t *data, size_t datalen,
-                               void *user_data, void *) {
-    auto *c = static_cast<conn_data *>(user_data);
-    if (c->closing) return 0;
-    std::string s(reinterpret_cast<const char *>(data), datalen);
+        cd->pending_echo.push_back(conn_data::Pending{sid, std::move(s)});
+    });
 
-    fmt::print("[Client {}]: {}", ip_port_key_v6(c->peer()), s);
-    if (!s.empty() && s.back() != '\n') fmt::print("\n");
-    std::cout.flush();
-
-    c->pending_echo.push_back(conn_data::Pending{sid, std::move(s)});
-    return 0;
+    seastar::quic::experimental::QuicConfig conf;
+    c->apply_default_callbacks(conf);
+    conf.withOriginalDcid(client_odcid.data(), client_odcid.size());
+    return conf;
 }
 
 static seastar::future<> flush_echo_and_packets(const conn_data_ptr &c_base,
@@ -463,7 +437,7 @@ static seastar::future<> handle_datagram(
     const seastar::lw_shared_ptr<server_state> &st, seastar::net::datagram d) {
     if (st->stopping) co_return;
     auto peer = d.get_src();
-    auto tb = datagram_to_tb(d);
+    auto tb = seastar::quic::experimental::datagram_to_temporary_buffer(d);
     const uint8_t *p = reinterpret_cast<const uint8_t *>(tb.get());
     size_t n = tb.size();
 
@@ -496,21 +470,7 @@ static seastar::future<> handle_datagram(
 
             nc->generate_scid(SERVER_CID_LEN);
 
-            seastar::quic::experimental::QuicConfig conf;
-
-            conf.withCallbacks([](auto& callbacks){
-                callbacks.recv_stream_data = recv_stream_data_cb;
-                callbacks.handshake_completed = handshake_completed_cb;
-                callbacks.dcid_status = dcid_status_cb;
-                callbacks.get_new_connection_id = get_new_connection_id_cb;
-                callbacks.get_path_challenge_data = get_path_challenge_data_cb;
-            });
-
-            conf.withTransportParams([&](auto& params){
-                params.original_dcid_present = 1;
-                params.original_dcid = *client_odcid.get();
-            });
-
+            auto conf = create_server_config(nc, client_odcid);
             nc->init_server(conf, nc.get());
 
         } catch (const std::exception &e) {

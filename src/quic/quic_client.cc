@@ -21,7 +21,11 @@
 #include <string>
 #include <vector>
 #include <stdexcept>
+#include <cstring>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/coroutine.hh>
+#include <arpa/inet.h>
 
 #include <gnutls/gnutls.h>
 #include <ngtcp2/ngtcp2.h>
@@ -96,6 +100,94 @@ seastar::future<udp_channel_ptr> setup_quic_client(
     co_await c.flush_pending(sock, remote);
 
     co_return sock;
+}
+
+session::session(seastar::lw_shared_ptr<Connection> connection, udp_channel_ptr channel)
+    : _connection(std::move(connection))
+    , _channel(std::move(channel)) {}
+
+Connection& session::connection() {
+    if (!_connection) {
+        throw std::runtime_error("client session has no connection");
+    }
+    return *_connection;
+}
+
+const Connection& session::connection() const {
+    if (!_connection) {
+        throw std::runtime_error("client session has no connection");
+    }
+    return *_connection;
+}
+
+udp_channel_ptr session::channel() const {
+    return _channel;
+}
+
+seastar::future<> session::send(std::string_view data) {
+    if (!_connection || !_channel || data.empty()) {
+        co_return;
+    }
+
+    if (_stream_id < 0) {
+        int64_t sid = -1;
+        int rv = _connection->open_bidi_stream(sid);
+        if (rv != 0) {
+            throw std::runtime_error("open_bidi_stream failed: " + std::string(ngtcp2_strerror(rv)));
+        }
+        _stream_id = sid;
+    }
+
+    co_await _connection->send(_stream_id, data, _channel, _connection->peer());
+}
+
+seastar::future<int> session::receive_once() {
+    if (!_connection || !_channel) {
+        co_return NGTCP2_ERR_INTERNAL;
+    }
+
+    auto d = co_await _channel->recv_datagram();
+    auto tb = datagram_to_temporary_buffer(d);
+    co_return co_await _connection->handle_packet(
+            reinterpret_cast<const uint8_t*>(tb.get()), tb.size(), _channel);
+}
+
+seastar::future<> session::close() {
+    if (!_channel) {
+        co_return;
+    }
+
+    if (_connection && _connection->conn()) {
+        std::vector<uint8_t> outbuf(_connection->max_tx_udp_payload_size());
+        ssize_t nwrite = _connection->write_connection_close(outbuf.data(), outbuf.size());
+        if (nwrite > 0) {
+            auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
+            std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
+            co_await _channel->send_to(_connection->peer(), std::move(tb));
+        }
+        _connection->reschedule();
+    }
+
+    _channel->close();
+}
+
+seastar::future<seastar::lw_shared_ptr<session>> connect(connect_options options) {
+    if (options.alpns.empty()) {
+        options.alpns.push_back("h3");
+    }
+
+    auto connection = seastar::make_lw_shared<Connection>();
+    auto crypto = seastar::make_lw_shared<client_crypto_config>(options.alpns);
+
+    auto sock = co_await setup_quic_client(
+            *connection,
+            std::move(options.host),
+            std::move(options.ip),
+            options.port,
+            std::move(options.config),
+            std::move(crypto));
+
+    co_return seastar::make_lw_shared<session>(std::move(connection), std::move(sock));
 }
 
 using client_crypto_config_ptr = seastar::lw_shared_ptr<client::client_crypto_config>;

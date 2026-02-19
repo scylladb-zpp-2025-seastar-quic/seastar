@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <chrono>
 #include <optional>
+#include <functional>
 
 #include <gnutls/gnutls.h>
 #include <gnutls/crypto.h>
@@ -99,6 +100,8 @@ public:
 
     QuicConfig& withCallbacks(CallbacksConfigurator func);
 
+    QuicConfig& withOriginalDcid(const uint8_t* data, size_t len);
+
     // Getters.
     const ngtcp2_settings* getSettingsPtr() const { return &settings_; }
     const ngtcp2_transport_params* getTransportParamsPtr() const { return &params_; }
@@ -131,6 +134,8 @@ private:
 };
 
 using udp_channel_ptr = seastar::lw_shared_ptr<udp_channel>;
+
+seastar::temporary_buffer<char> datagram_to_temporary_buffer(seastar::net::datagram& d);
 
 // Class used to represent connection id.
 class quic_cid {
@@ -171,6 +176,10 @@ struct crypto_context {
 // Main class used for connection purposes - sending and receiving data etc.
 class Connection {
 public:
+    using HandshakeHandler = std::function<void(Connection&)>;
+    using StreamDataHandler = std::function<void(Connection&, int64_t, std::string_view)>;
+    using DcidStatusHandler = std::function<void(Connection&, const quic_cid&, bool)>;
+
     Connection() = default;
 
     explicit Connection(const seastar::socket_address& local, const seastar::socket_address& remote);
@@ -242,6 +251,14 @@ public:
     
     void set_dcid(const uint8_t* data, size_t len);
 
+    void on_handshake_completed(HandshakeHandler handler);
+
+    void on_stream_data(StreamDataHandler handler);
+
+    void on_dcid_status(DcidStatusHandler handler);
+
+    void apply_default_callbacks(QuicConfig& config);
+
     seastar::condition_variable& timer_cv() { return _timer_cv; }
 
     void reschedule();
@@ -257,6 +274,18 @@ private:
     socklen_t        _local_ss_len = 0;
     sockaddr_storage _remote_ss{};
     socklen_t        _remote_ss_len = 0;
+
+    HandshakeHandler _on_handshake_completed;
+    StreamDataHandler _on_stream_data;
+    DcidStatusHandler _on_dcid_status;
+
+    static int get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid *cid, uint8_t *token, size_t cidlen, void*);
+    static int get_path_challenge_data_cb(ngtcp2_conn*, uint8_t *data, void*);
+    static int handshake_completed_cb(ngtcp2_conn*, void* user_data);
+    static int recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t,
+            const uint8_t* data, size_t datalen, void* user_data, void*);
+    static int dcid_status_cb(ngtcp2_conn*, ngtcp2_connection_id_status_type type, uint64_t,
+            const ngtcp2_cid* cid, const uint8_t*, void* user_data);
 
     quic_cid _scid{};
     quic_cid _dcid{};
@@ -274,6 +303,112 @@ public:
     init_gnutls& operator=(const init_gnutls&) = delete;
 
 };
+
+namespace client {
+
+class client_crypto_config : public seastar::quic::experimental::crypto_context {
+public:
+    explicit client_crypto_config(const std::vector<std::string>& alpns);
+    ~client_crypto_config();
+
+    void add_alpn(const std::string& protocol);
+
+    gnutls_session_t make_session(const std::string& sni_hostname, ngtcp2_crypto_conn_ref* ref);
+
+private:
+    gnutls_certificate_credentials_t _cred = nullptr;
+    std::vector<std::string> _alpns;
+};
+
+struct connect_options {
+    std::string host = "localhost";
+    std::string ip = "::1";
+    uint16_t port = 4433;
+    std::vector<std::string> alpns = {"h3"};
+    QuicConfig config;
+};
+
+class session {
+public:
+    session(seastar::lw_shared_ptr<Connection> connection, udp_channel_ptr channel);
+
+    Connection& connection();
+    const Connection& connection() const;
+
+    udp_channel_ptr channel() const;
+
+    seastar::future<> send(std::string_view data);
+    seastar::future<int> receive_once();
+    seastar::future<> close();
+
+private:
+    seastar::lw_shared_ptr<Connection> _connection;
+    udp_channel_ptr _channel;
+    int64_t _stream_id = -1;
+};
+
+seastar::future<udp_channel_ptr> setup_quic_client(
+    Connection& c,
+    std::string host,
+    std::string ip,
+    uint16_t port,
+    QuicConfig config,
+    seastar::lw_shared_ptr<client_crypto_config> crypto);
+
+seastar::future<seastar::lw_shared_ptr<session>> connect(connect_options options);
+
+} // namespace client
+
+using client_crypto_config_ptr = seastar::lw_shared_ptr<client::client_crypto_config>;
+
+namespace server {
+
+class server_crypto_config {
+public:
+    explicit server_crypto_config(const std::string& cert_file, const std::string& key_file,
+            const std::vector<std::string>& alpns);
+
+    ~server_crypto_config();
+
+    void add_alpn(const std::string& protocol);
+
+    gnutls_session_t make_session(ngtcp2_crypto_conn_ref* ref);
+
+private:
+    gnutls_certificate_credentials_t _cred = nullptr;
+    std::vector<std::string> _alpns;
+};
+
+struct listen_options {
+    std::string ip = "::1";
+    uint16_t port = 4433;
+    std::string cert_file;
+    std::string key_file;
+    std::vector<std::string> alpns = {"h3"};
+};
+
+class listener {
+public:
+    listener(udp_channel_ptr channel, seastar::socket_address local_address,
+            seastar::lw_shared_ptr<server_crypto_config> crypto);
+
+    udp_channel_ptr channel() const;
+    const seastar::socket_address& local_address() const;
+    seastar::lw_shared_ptr<server_crypto_config> crypto() const;
+
+    void stop();
+
+private:
+    udp_channel_ptr _channel;
+    seastar::socket_address _local_address;
+    seastar::lw_shared_ptr<server_crypto_config> _crypto;
+};
+
+seastar::future<seastar::lw_shared_ptr<listener>> listen(listen_options options);
+
+} // namespace server
+
+using server_crypto_config_ptr = seastar::lw_shared_ptr<server::server_crypto_config>;
 
 } // namespace seastar::quic::experimental
 

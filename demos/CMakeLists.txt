@@ -134,6 +134,7 @@ add_library (seastar_quic_experimental STATIC
 target_link_libraries (seastar_quic_experimental
   PRIVATE
     seastar_private
+  PUBLIC
     ngtcp2::ngtcp2
     gnutls) 
 
@@ -159,13 +160,8 @@ endif ()
 
 target_link_libraries (demo_ngtcp2_server
   PRIVATE 
-    ngtcp2::ngtcp2
-    seastar_quic_experimental
-    gnutls)
+    seastar_quic_experimental)
 
 target_link_libraries (demo_ngtcp2_client
   PRIVATE 
-    ngtcp2::ngtcp2
-    seastar_quic_experimental
-    gnutls)
-
+    seastar_quic_experimental)
