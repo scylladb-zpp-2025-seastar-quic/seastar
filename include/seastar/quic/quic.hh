@@ -220,6 +220,18 @@ private:
     quic_cid _dcid{};
 
 };
+
+class init_gnutls {
+public:
+    init_gnutls();
+    ~init_gnutls();
+
+
+    init_gnutls(const init_gnutls&) = delete;
+    init_gnutls& operator=(const init_gnutls&) = delete;
+
+};
+
 } // namespace seastar::quic::experimental
 
 

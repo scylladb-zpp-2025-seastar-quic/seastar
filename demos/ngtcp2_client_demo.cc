@@ -31,11 +31,6 @@
 #include <seastar/core/condition-variable.hh>
 #include <seastar/net/api.hh>
 
-#include <gnutls/gnutls.h>
-#include <gnutls/crypto.h>
-#include <ngtcp2/ngtcp2.h>
-#include <ngtcp2/ngtcp2_crypto.h>
-
 #include <arpa/inet.h>
 #include <chrono>
 #include <cstdlib>
@@ -383,10 +378,7 @@ static seastar::future<> connection_timer_loop(conn_data_ptr c, sock_ptr sock) {
 int main(int argc, char** argv) {
     std::srand((unsigned)time(nullptr));
 
-    if (gnutls_global_init() < 0) {
-        std::cerr << "gnutls_global_init failed\n";
-        return 1;
-    }
+    seastar::quic::experimental::init_gnutls gnutls;
 
     seastar::app_template app;
     int rc = app.run(argc, argv, []() -> seastar::future<int> {
@@ -451,6 +443,5 @@ int main(int argc, char** argv) {
         }
     });
 
-    gnutls_global_deinit();
     return rc;
 }

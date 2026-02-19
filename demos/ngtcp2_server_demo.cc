@@ -30,11 +30,6 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/net/api.hh>
 
-#include <gnutls/gnutls.h>
-#include <gnutls/crypto.h>
-#include <ngtcp2/ngtcp2.h>
-#include <ngtcp2/ngtcp2_crypto.h>
-
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <algorithm>
@@ -602,7 +597,9 @@ static seastar::future<> server_loop(seastar::lw_shared_ptr<ServerState> st) {
 
 int main(int argc, char **argv) {
     std::srand((unsigned)time(nullptr));
-    if (gnutls_global_init() < 0) return 1;
+    
+    seastar::quic::experimental::init_gnutls gnutls;
+
     parse_tls_args(argc, argv);
     if (!validate_config()) return 1;
 
@@ -647,6 +644,5 @@ int main(int argc, char **argv) {
         }
     });
 
-    gnutls_global_deinit();
     return rc;
 }

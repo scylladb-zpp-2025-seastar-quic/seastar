@@ -25,11 +25,19 @@
 #include <ngtcp2/ngtcp2.h>
 
 namespace seastar::quic::experimental {
-    bool is_draining(int code);
+    inline bool is_draining(int code) { 
+        return code == NGTCP2_ERR_DRAINING; 
+    }
+    
+    inline bool should_write_more(int code) {
+        return code == NGTCP2_ERR_WRITE_MORE;
+    }
 
-    bool should_write_more(int code);
-
-    bool is_idle_close(int code);
-
-    std::string error_to_string(int code);
+    inline bool is_idle_close(int code) {
+        return code == NGTCP2_ERR_IDLE_CLOSE;
+    }
+    
+    inline std::string error_to_string(int code) {
+        return ngtcp2_strerror(code);
+    }
 }

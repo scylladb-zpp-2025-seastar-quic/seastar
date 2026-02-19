@@ -403,4 +403,14 @@ void Connection::set_dcid(const uint8_t* data, size_t len) {
     _dcid = quic_cid(data, len);
 }
 
+init_gnutls::init_gnutls() {
+    if (gnutls_global_init() < 0) {
+        throw std::runtime_error("Failed to initialize GnuTLS");
+    }
+}
+
+init_gnutls::~init_gnutls() {
+    gnutls_global_deinit();
+}
+
 }
