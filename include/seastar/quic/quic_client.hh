@@ -24,18 +24,21 @@
 #include <string>
 #include <vector>
 #include <stdexcept>
-#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/coroutine.hh>
+#include <arpa/inet.h>
 
 #include <gnutls/gnutls.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_gnutls.h>
+#include <seastar/quic/quic.hh>
 
 namespace seastar::quic::experimental {
 
 namespace client {
         
-class client_crypto_config {
+class client_crypto_config : public seastar::quic::experimental::crypto_context {
 public:
     explicit client_crypto_config(const std::vector<std::string>& alpns);    
 
@@ -50,6 +53,13 @@ private:
     std::vector<std::string> _alpns;
 };
 
+seastar::future<udp_channel_ptr> setup_quic_client(
+    Connection& c, 
+    std::string host, 
+    std::string ip, 
+    uint16_t port,
+    QuicConfig config,
+    seastar::lw_shared_ptr<client_crypto_config> crypto);
 } // namespace client
 
 using client_crypto_config_ptr = seastar::lw_shared_ptr<client::client_crypto_config>;

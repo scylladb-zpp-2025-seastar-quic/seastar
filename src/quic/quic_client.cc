@@ -71,6 +71,33 @@ gnutls_session_t client_crypto_config::make_session(const std::string& sni_hostn
     return tls;
 }
 
+seastar::future<udp_channel_ptr> setup_quic_client(
+    Connection& c, 
+    std::string host, std::string ip, uint16_t port, QuicConfig config,
+    seastar::lw_shared_ptr<client_crypto_config> crypto) 
+{
+    c.set_tls(crypto->make_session(host, c.conn_ref_ptr()));
+
+    auto ch = seastar::engine().net().make_bound_datagram_channel(
+        seastar::socket_address(seastar::ipv6_addr{0}));
+    auto sock = seastar::make_lw_shared<udp_channel>(std::move(ch));
+
+    sockaddr_in6 r{};
+    r.sin6_family = AF_INET6;
+    r.sin6_port = htons(port);
+    inet_pton(AF_INET6, ip.c_str(), &r.sin6_addr);
+    seastar::socket_address remote{r};
+
+    c.set_peer(remote);
+    c.set_remote_addr(remote);
+    c.set_local_addr(sock->local_address());
+
+    c.init_client(config, &c);
+    co_await c.flush_pending(sock, remote);
+
+    co_return sock;
+}
+
 using client_crypto_config_ptr = seastar::lw_shared_ptr<client::client_crypto_config>;
 
 } // namespace seastar::quic::experimental

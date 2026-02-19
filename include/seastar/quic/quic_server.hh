@@ -25,11 +25,16 @@
 #include <vector>
 #include <stdexcept>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/coroutine.hh>
+#include <arpa/inet.h>
 
 #include <gnutls/gnutls.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_gnutls.h>
+#include <seastar/quic/quic.hh>
+
 
 namespace seastar::quic::experimental {
 

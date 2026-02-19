@@ -27,6 +27,7 @@
 #include <cstring>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/net/api.hh>
+#include <seastar/core/condition-variable.hh>
 #include <cstdint>
 #include <chrono>
 #include <optional>
@@ -112,6 +113,25 @@ private:
     ngtcp2_callbacks callbacks_;
 };
 
+class udp_channel {
+public:
+    explicit udp_channel(seastar::net::datagram_channel ch);
+
+    seastar::future<> send_to(const seastar::socket_address& to, seastar::net::packet p);
+    seastar::future<> send_to(const seastar::socket_address& to, seastar::temporary_buffer<char> tb);
+    
+    seastar::future<seastar::net::datagram> recv_datagram();
+    
+    void close();
+    
+    seastar::socket_address local_address() const;
+
+private:
+    seastar::net::datagram_channel _ch;
+};
+
+using udp_channel_ptr = seastar::lw_shared_ptr<udp_channel>;
+
 // Class used to represent connection id.
 class quic_cid {
 public:
@@ -144,6 +164,9 @@ private:
     ngtcp2_cid _cid;
 };
 
+struct crypto_context {
+    virtual ~crypto_context() = default;
+};
 
 // Main class used for connection purposes - sending and receiving data etc.
 class Connection {
@@ -156,6 +179,7 @@ public:
     
     // Getters.
     ngtcp2_conn* conn() const { return _conn; }   
+    seastar::socket_address peer() const { return _peer; }
     gnutls_session_t tls() const { return _tls; }
     const ngtcp2_cid* scid_ptr() const { return _scid.get(); }
     const ngtcp2_cid* dcid_ptr() const { return _dcid.get(); }
@@ -169,7 +193,19 @@ public:
 
     void set_remote_addr(const seastar::socket_address& sa);
 
+    void set_peer(seastar::socket_address p);
+
     void fill_path(ngtcp2_path& p);
+
+
+    seastar::future<> flush_pending(udp_channel_ptr sock,
+                                                const seastar::socket_address& peer);
+
+    seastar::future<> send(int64_t stream_id, std::string_view data, 
+                           udp_channel_ptr sock, const seastar::socket_address& peer);
+
+    seastar::future<int> handle_packet(const uint8_t* data, size_t len, 
+                                udp_channel_ptr sock);
 
     // Functions using ngtcp2 functions.
 
@@ -206,10 +242,16 @@ public:
     
     void set_dcid(const uint8_t* data, size_t len);
 
+    seastar::condition_variable& timer_cv() { return _timer_cv; }
+
+    void reschedule();
+
 private:
     ngtcp2_conn* _conn = nullptr;
     gnutls_session_t _tls = nullptr;
     ngtcp2_crypto_conn_ref _conn_ref{};
+
+    seastar::socket_address _peer;
 
     sockaddr_storage _local_ss{};
     socklen_t        _local_ss_len = 0;
@@ -219,6 +261,7 @@ private:
     quic_cid _scid{};
     quic_cid _dcid{};
 
+    seastar::condition_variable _timer_cv;
 };
 
 class init_gnutls {

@@ -151,6 +151,30 @@ QuicConfig& QuicConfig::withCallbacks(CallbacksConfigurator func) {
 }
 
 
+udp_channel::udp_channel(seastar::net::datagram_channel ch)
+    : _ch(std::move(ch)) {}
+
+seastar::future<> udp_channel::send_to(const seastar::socket_address& to, seastar::net::packet p) {
+    return _ch.send(to, std::move(p));
+}
+
+seastar::future<> udp_channel::send_to(const seastar::socket_address& to, seastar::temporary_buffer<char> tb) {
+    return _ch.send(to, std::move(tb));
+}
+
+seastar::future<seastar::net::datagram> udp_channel::recv_datagram() {
+    return _ch.receive();
+}
+
+void udp_channel::close() {
+    _ch.close();
+}
+
+seastar::socket_address udp_channel::local_address() const {
+    return _ch.local_address();
+}
+
+
 quic_cid::quic_cid() {
     ngtcp2_cid_init(&_cid, nullptr, 0);
 }
@@ -215,6 +239,11 @@ Connection::~Connection() {
         gnutls_deinit(_tls);
         _tls = nullptr;
     }
+    _timer_cv.broken();
+}
+
+void Connection::reschedule() {
+    _timer_cv.signal();
 }
 
 void Connection::set_local_addr(const seastar::socket_address& sa) {
@@ -225,9 +254,87 @@ void Connection::set_remote_addr(const seastar::socket_address& sa) {
     internal::sa_to_storage_v6(sa, _remote_ss, _remote_ss_len);
 }
 
+void Connection::set_peer(seastar::socket_address p) {
+    _peer = p;
+}
+
 void Connection::fill_path(ngtcp2_path& p) {
     internal::init_ngtcp2_addr(&p.local,  (sockaddr*)&_local_ss,  _local_ss_len);
     internal::init_ngtcp2_addr(&p.remote, (sockaddr*)&_remote_ss, _remote_ss_len);
+}
+
+
+seastar::future<> Connection::flush_pending(udp_channel_ptr sock, const seastar::socket_address& peer) {
+    if (!_conn || !sock) co_return;
+
+    std::vector<uint8_t> outbuf(max_tx_udp_payload_size());
+
+    while (true) {
+        ssize_t nwrite = write_pending_packet(outbuf.data(), outbuf.size());
+        
+        if (nwrite <= 0) break; 
+
+        auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
+        std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
+        
+        co_await sock->send_to(peer, std::move(tb));
+    }
+}
+
+seastar::future<> Connection::send(int64_t stream_id, std::string_view data, 
+                                   udp_channel_ptr sock, const seastar::socket_address& peer) {
+    if (!_conn || !sock) co_return;
+
+    if (stream_id < 0) {
+        int64_t new_id;
+        int rv = open_bidi_stream(new_id);
+        if (rv != 0) {
+            co_return;
+        }
+        stream_id = new_id;
+    }
+
+    size_t total_sent = 0;
+    std::vector<uint8_t> outbuf(max_tx_udp_payload_size());
+
+    while (total_sent < data.size()) {
+        ssize_t consumed = 0;
+        const uint8_t* current_ptr = reinterpret_cast<const uint8_t*>(data.data()) + total_sent;
+        size_t current_len = data.size() - total_sent;
+
+        ssize_t nwrite = write_stream_packet(stream_id, current_ptr, current_len, 
+                                             consumed, outbuf.data(), outbuf.size());
+
+        if (nwrite < 0) {
+            break;
+        }
+
+        if (nwrite == 0) break;
+
+        auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
+        std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
+        co_await sock->send_to(peer, std::move(tb));
+
+        total_sent += (size_t)consumed;
+    }
+
+    co_await flush_pending(sock, peer);
+
+    reschedule();
+}
+
+
+seastar::future<int> Connection::handle_packet(const uint8_t* data, size_t len, udp_channel_ptr sock) {
+    int rv = read_packet(data, len);
+    
+    if (rv < 0) {
+        co_return rv;
+    }
+
+    co_await flush_pending(sock, _peer);
+
+    reschedule();
+    co_return 0;
 }
 
 // Functions using ngtcp2 functions.

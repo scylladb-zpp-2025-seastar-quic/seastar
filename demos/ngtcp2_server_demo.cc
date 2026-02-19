@@ -63,6 +63,27 @@ static constexpr const char *KEY_FILE = "server.key";
 
 static seastar::logger qlog("quic-server");
 
+using udp_channel_ptr = seastar::quic::experimental::udp_channel_ptr;
+
+
+seastar::temporary_buffer<char> datagram_to_tb(seastar::net::datagram& d) {
+    auto bufs = d.get_buffers();
+    
+    size_t total_len = 0;
+    for (const auto& b : bufs) {
+        total_len += b.size();
+    }
+
+    seastar::temporary_buffer<char> tb(total_len);
+    char* dst = tb.get_write();
+    size_t off = 0;
+    
+    for (const auto& b : bufs) {
+        std::memcpy(dst + off, b.get(), b.size());
+        off += b.size();
+    }
+    return tb;
+}
 
 static std::string g_cert_path = CERT_FILE;
 static std::string g_key_path = KEY_FILE;
@@ -166,34 +187,12 @@ static DcidParseResult parse_dcid_quic_v1(const uint8_t *pkt, size_t len,
     return r;
 }
 
-class SeastarDgramSocket {
-   public:
-    explicit SeastarDgramSocket(seastar::net::datagram_channel ch)
-        : ch_(std::move(ch)) {}
-
-    seastar::future<> send_to(const seastar::socket_address &to,
-                              seastar::net::packet p) {
-        return ch_.send(to, std::move(p));
-    }
-    seastar::future<seastar::net::datagram> recv_one() { return ch_.receive(); }
-    void shutdown() { ch_.close(); }
-    seastar::socket_address local_address() const {
-        return ch_.local_address();
-    }
-
-   private:
-    seastar::net::datagram_channel ch_;
-};
-
-struct ServerState;
+struct server_state;
 
 struct conn_data : public seastar::quic::experimental::Connection {
-    ServerState *st = nullptr;
-
-    seastar::socket_address peer{};
+    server_state *st = nullptr;
 
     bool closing = false;
-    seastar::condition_variable timer_cv;
 
     std::unordered_set<seastar::quic::experimental::quic_cid> mapped_dcids;
     seastar::quic::experimental::quic_cid last_rx_dcid;
@@ -203,22 +202,12 @@ struct conn_data : public seastar::quic::experimental::Connection {
         std::string data;
     };
     std::vector<Pending> pending_echo;
-
-    ~conn_data() {
-        timer_cv.broken();
-    }
-
-    // Gives signal to start iteration of connection_timer_loop.
-    void reschedule() {
-        timer_cv.signal();
-    }
 };
 
 using conn_data_ptr = seastar::lw_shared_ptr<conn_data>;
-using sock_ptr = seastar::lw_shared_ptr<SeastarDgramSocket>;
 
-struct ServerState {
-    sock_ptr sock;
+struct server_state {
+    udp_channel_ptr sock;
     seastar::socket_address listen_addr;
     seastar::quic::experimental::server_crypto_config_ptr crypto;
     bool stopping = false;
@@ -231,12 +220,12 @@ static std::string dcid_or_unknown(const conn_data *c) {
     return c->last_rx_dcid.to_string();
 }
 
-static void map_dcid(ServerState &st, const conn_data_ptr &c, const seastar::quic::experimental::quic_cid& cid) {
+static void map_dcid(server_state &st, const conn_data_ptr &c, const seastar::quic::experimental::quic_cid& cid) {
     st.by_dcid[cid] = c;
     c->mapped_dcids.insert(cid);
 }
 
-static void unmap_all_dcids(ServerState &st, const conn_data_ptr &c) {
+static void unmap_all_dcids(server_state &st, const conn_data_ptr &c) {
     for (const auto &cid : c->mapped_dcids) {
         auto it = st.by_dcid.find(cid);
         if (it != st.by_dcid.end() && it->second == c) {
@@ -246,7 +235,7 @@ static void unmap_all_dcids(ServerState &st, const conn_data_ptr &c) {
     c->mapped_dcids.clear();
 }
 
-static void unmap_dcid(ServerState &st, const conn_data_ptr &c, const seastar::quic::experimental::quic_cid &cid) {
+static void unmap_dcid(server_state &st, const conn_data_ptr &c, const seastar::quic::experimental::quic_cid &cid) {
     auto it = st.by_dcid.find(cid);
     if (it != st.by_dcid.end() && it->second == c) {
         st.by_dcid.erase(it);
@@ -254,16 +243,16 @@ static void unmap_dcid(ServerState &st, const conn_data_ptr &c, const seastar::q
     c->mapped_dcids.erase(cid);
 }
 
-static void remove_conn(ServerState &st, const conn_data_ptr &c) {
+static void remove_conn(server_state &st, const conn_data_ptr &c) {
     if (c) {
-        qlog.info("Removing connection peer={} dcids={}", ip_port_key_v6(c->peer), c->mapped_dcids.size());
+        qlog.info("Removing connection peer={} dcids={}", ip_port_key_v6(c->peer()), c->mapped_dcids.size());
     }
     unmap_all_dcids(st, c);
     auto &v = st.conns;
     v.erase(std::remove(v.begin(), v.end(), c), v.end());
 }
 
-static conn_data_ptr find_conn_ptr(ServerState &st, conn_data *raw) {
+static conn_data_ptr find_conn_ptr(server_state &st, conn_data *raw) {
     for (auto &c : st.conns) {
         if (c.get() == raw) return c;
     }
@@ -286,7 +275,7 @@ static int get_path_challenge_data_cb(ngtcp2_conn *, uint8_t *data, void *) {
 
 static int handshake_completed_cb(ngtcp2_conn *, void *user_data) {
     auto *c = static_cast<conn_data *>(user_data);
-    qlog.info("Handshake completed with {}", ip_port_key_v6(c->peer));
+    qlog.info("Handshake completed with {}", ip_port_key_v6(c->peer()));
     return 0;
 }
 
@@ -301,11 +290,11 @@ static int dcid_status_cb(ngtcp2_conn *, ngtcp2_connection_id_status_type type,
 if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_ACTIVATE) {
         map_dcid(*c->st, cp, seastar::quic::experimental::quic_cid(*cid)); 
         qlog.info("DCID activate peer={} dcid={}", 
-                  ip_port_key_v6(c->peer), seastar::quic::experimental::quic_cid(*cid));
+                  ip_port_key_v6(c->peer()), seastar::quic::experimental::quic_cid(*cid));
     } else if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_DEACTIVATE) {
         unmap_dcid(*c->st, cp, seastar::quic::experimental::quic_cid(*cid));
         qlog.info("DCID deactivate peer={} dcid={}", 
-                  ip_port_key_v6(c->peer), seastar::quic::experimental::quic_cid(*cid));
+                  ip_port_key_v6(c->peer()), seastar::quic::experimental::quic_cid(*cid));
     }
     return 0;
 }
@@ -317,7 +306,7 @@ static int recv_stream_data_cb(ngtcp2_conn *, uint32_t, int64_t sid, uint64_t,
     if (c->closing) return 0;
     std::string s(reinterpret_cast<const char *>(data), datalen);
 
-    fmt::print("[Client {}]: {}", ip_port_key_v6(c->peer), s);
+    fmt::print("[Client {}]: {}", ip_port_key_v6(c->peer()), s);
     if (!s.empty() && s.back() != '\n') fmt::print("\n");
     std::cout.flush();
 
@@ -325,21 +314,8 @@ static int recv_stream_data_cb(ngtcp2_conn *, uint32_t, int64_t sid, uint64_t,
     return 0;
 }
 
-static seastar::temporary_buffer<char> packet_to_tb(seastar::net::packet &pkt) {
-    const size_t n = pkt.len();
-    seastar::temporary_buffer<char> tb(n);
-    char *dst = tb.get_write();
-    size_t off = 0;
-    for (auto &frag : pkt.fragments()) {
-        std::memcpy(dst + off, frag.base, frag.size);
-        off += frag.size;
-    }
-    return tb;
-}
-
-
 static seastar::future<> flush_echo_and_packets(const conn_data_ptr &c_base,
-                                                const sock_ptr &sock) {
+                                                const udp_channel_ptr &sock) {
     auto *c = static_cast<conn_data*>(c_base.get());                                                
     if (!c || !sock || !c->conn() || c->closing) co_return;
 
@@ -393,13 +369,13 @@ static seastar::future<> flush_echo_and_packets(const conn_data_ptr &c_base,
             auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
             std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
             
-            co_await sock->send_to(c->peer, std::move(tb));
+            co_await sock->send_to(c->peer(), std::move(tb));
             
             did_write_something = true;
         }
     } catch (const std::exception &e) {
         c->closing = true;
-        qlog.error("flush exception peer={}: {}", ip_port_key_v6(c->peer), e.what());
+        qlog.error("flush exception peer={}: {}", ip_port_key_v6(c->peer()), e.what());
     }
 
     if (did_write_something && !c->closing) {
@@ -408,7 +384,7 @@ static seastar::future<> flush_echo_and_packets(const conn_data_ptr &c_base,
 }
 
 static seastar::future<> send_connection_close(const conn_data_ptr &c,
-                                               const sock_ptr &sock) {
+                                               const udp_channel_ptr &sock) {
     if (!c || !sock || !c->conn()) co_return;
 
     std::vector<uint8_t> outbuf(c->max_tx_udp_payload_size());
@@ -418,14 +394,14 @@ static seastar::future<> send_connection_close(const conn_data_ptr &c,
 
     auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
     std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
-    co_await sock->send_to(c->peer, seastar::net::packet(std::move(tb)));
+    co_await sock->send_to(c->peer(), seastar::net::packet(std::move(tb)));
     qlog.info("Sent CONNECTION_CLOSE peer={} dcid={}", 
-              ip_port_key_v6(c->peer), dcid_or_unknown(c.get()));
+              ip_port_key_v6(c->peer()), dcid_or_unknown(c.get()));
 }
 
 // For each connection there is created loop.
-static seastar::future<> connection_timer_loop(conn_data_ptr c, sock_ptr sock) {
-    qlog.info("Timer loop start peer={}", ip_port_key_v6(c->peer));
+static seastar::future<> connection_timer_loop(conn_data_ptr c, udp_channel_ptr sock) {
+    qlog.info("Timer loop start peer={}", ip_port_key_v6(c->peer()));
     while (!c->closing && !(c->st && c->st->stopping)) {
         co_await flush_echo_and_packets(c, sock);
         if (c->closing) break;
@@ -435,9 +411,9 @@ static seastar::future<> connection_timer_loop(conn_data_ptr c, sock_ptr sock) {
 
         try {
             if (expiry == UINT64_MAX) {
-                co_await c->timer_cv.wait();
+                co_await c->timer_cv().wait();
             } else if (expiry > now) {
-                co_await c->timer_cv.wait(
+                co_await c->timer_cv().wait(
                     std::chrono::nanoseconds(expiry - now));
             }
         } catch (...) {
@@ -449,10 +425,10 @@ static seastar::future<> connection_timer_loop(conn_data_ptr c, sock_ptr sock) {
             int rv = c->handle_expiry();
             if (rv < 0) {
                 if (seastar::quic::experimental::is_idle_close(rv)) {
-                    qlog.info("Client {} disconnected (idle timeout).", ip_port_key_v6(c->peer));
+                    qlog.info("Client {} disconnected (idle timeout).", ip_port_key_v6(c->peer()));
                 } else if (!seastar::quic::experimental::is_draining(rv)) {
                     qlog.error("handle_expiry error peer={} dcid={}: {}", 
-                                ip_port_key_v6(c->peer), dcid_or_unknown(c.get()), 
+                                ip_port_key_v6(c->peer()), dcid_or_unknown(c.get()), 
                                 seastar::quic::experimental::error_to_string(rv));
                 }
                 c->closing = true;
@@ -465,7 +441,7 @@ static seastar::future<> connection_timer_loop(conn_data_ptr c, sock_ptr sock) {
     }
 }
 
-static seastar::lw_shared_ptr<ServerState> init_server_state(
+static seastar::lw_shared_ptr<server_state> init_server_state(
     seastar::quic::experimental::server_crypto_config_ptr crypto) {
     sockaddr_in6 a{};
     a.sin6_family = AF_INET6;
@@ -473,10 +449,10 @@ static seastar::lw_shared_ptr<ServerState> init_server_state(
     if (inet_pton(AF_INET6, LISTEN_IP, &a.sin6_addr) != 1) {
         throw std::runtime_error("inet_pton failed for LISTEN_IP");
     }
-    auto sock = seastar::make_lw_shared<SeastarDgramSocket>(
+    auto sock = seastar::make_lw_shared<seastar::quic::experimental::udp_channel>(
         seastar::engine().net().make_bound_datagram_channel(
             seastar::socket_address(a)));
-    auto st = seastar::make_lw_shared<ServerState>();
+    auto st = seastar::make_lw_shared<server_state>();
     st->sock = sock;
     st->listen_addr = seastar::socket_address(a);
     st->crypto = std::move(crypto);
@@ -484,11 +460,10 @@ static seastar::lw_shared_ptr<ServerState> init_server_state(
 }
 
 static seastar::future<> handle_datagram(
-    const seastar::lw_shared_ptr<ServerState> &st, seastar::net::datagram d) {
+    const seastar::lw_shared_ptr<server_state> &st, seastar::net::datagram d) {
     if (st->stopping) co_return;
     auto peer = d.get_src();
-    auto &pkt = d.get_data();
-    auto tb = packet_to_tb(pkt);
+    auto tb = datagram_to_tb(d);
     const uint8_t *p = reinterpret_cast<const uint8_t *>(tb.get());
     size_t n = tb.size();
 
@@ -509,7 +484,7 @@ static seastar::future<> handle_datagram(
 
         auto nc = seastar::make_lw_shared<conn_data>();
         nc->st = st.get();
-        nc->peer = peer;
+        nc->set_peer(peer);
         nc->set_local_addr(st->listen_addr);
         nc->set_remote_addr(peer);
 
@@ -556,8 +531,8 @@ static seastar::future<> handle_datagram(
     }
 
     if (!c || !c->conn() || c->closing) co_return;
-    if (c->peer != peer) {
-        c->peer = peer;
+    if (c->peer() != peer) {
+        c->set_peer(peer);
         c->set_remote_addr(peer);
         qlog.info("Peer address updated for dcid={} peer={}", 
                   key_cid, ip_port_key_v6(peer));
@@ -567,10 +542,10 @@ static seastar::future<> handle_datagram(
     int rv = c->read_packet(p, n);
     if (rv < 0) {
         if (seastar::quic::experimental::is_draining(rv)) {
-            qlog.info("Client {} disconnected.", ip_port_key_v6(c->peer));
+            qlog.info("Client {} disconnected.", ip_port_key_v6(c->peer()));
         } else {
             qlog.error("Read error peer={} dcid={}: {}", 
-                       ip_port_key_v6(c->peer), dcid_or_unknown(c.get()), 
+                       ip_port_key_v6(c->peer()), dcid_or_unknown(c.get()), 
                         seastar::quic::experimental::error_to_string(rv));
         }
         c->closing = true;
@@ -579,11 +554,11 @@ static seastar::future<> handle_datagram(
     c->reschedule();
 }
 
-static seastar::future<> server_loop(seastar::lw_shared_ptr<ServerState> st) {
+static seastar::future<> server_loop(seastar::lw_shared_ptr<server_state> st) {
     while (true) {
         if (st->stopping) co_return;
         try {
-            auto d = co_await st->sock->recv_one();
+            auto d = co_await st->sock->recv_datagram();
             co_await handle_datagram(st, std::move(d));
         } catch (const std::exception &e) {
             if (st->stopping) co_return;
@@ -633,7 +608,7 @@ int main(int argc, char **argv) {
                     .discard_result();
             }
             co_await seastar::sleep(std::chrono::milliseconds(200));
-            st->sock->shutdown();
+            st->sock->close();
 
             co_await std::move(server_f);
             qlog.info("Shutdown complete");
