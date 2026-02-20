@@ -6,7 +6,7 @@
  *
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -21,4 +21,40 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
+
+#include <seastar/core/sstring.hh>
 #include <seastar/quic/quic.hh>
+
+namespace seastar::quic::experimental {
+
+struct quic_server_config {
+    socket_address listen_address;
+    sstring cert_file;
+    sstring key_file;
+    std::vector<sstring> alpns = {sstring("hq-interop"), sstring("h3")};
+    quic_session_options session_options{};
+};
+
+class quic_server final {
+public:
+    quic_server();
+    ~quic_server();
+
+    quic_server(quic_server&&) noexcept;
+    quic_server& operator=(quic_server&&) noexcept;
+
+    quic_server(const quic_server&) = delete;
+    quic_server& operator=(const quic_server&) = delete;
+
+    future<> start(quic_server_config config);
+    future<quic_session> accept();
+    future<> stop();
+
+private:
+    class impl;
+    std::unique_ptr<impl> _impl;
+};
+
+} // namespace seastar::quic::experimental

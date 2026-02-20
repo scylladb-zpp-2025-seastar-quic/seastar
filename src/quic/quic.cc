@@ -6,7 +6,7 @@
  *
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -18,608 +18,240 @@
 /*
  * Copyright (C) 2026 ScyllaDB Ltd.
  */
-#include <string>
-#include <vector>
-#include <stdexcept>
-#include <cstring>
-#include <seastar/core/shared_ptr.hh>
-#include <seastar/net/api.hh>
-#include <cstdint>
-#include <chrono>
-#include <optional>
 
-#include <gnutls/gnutls.h>
-#include <gnutls/crypto.h>
-#include <ngtcp2/ngtcp2.h>
-#include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_gnutls.h>
 #include <seastar/quic/quic.hh>
 
+#include <cstring>
+#include <deque>
+#include <string>
+#include <utility>
+
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/coroutine.hh>
 
 namespace seastar::quic::experimental {
 
-    ngtcp2_tstamp now_ns() {
-        using namespace std::chrono;
-        return duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+namespace {
+
+class basic_session_runtime final : public internal::session_runtime {
+public:
+    explicit basic_session_runtime(quic_session_options options)
+        : _options(std::move(options))
+        , _default_stream(_options.initial_stream_id) {
     }
 
-    void rand_bytes(uint8_t* dst, size_t len) {
-        if (gnutls_rnd(GNUTLS_RND_RANDOM, dst, len) == 0) return;
-        for (size_t i = 0; i < len; ++i) dst[i] = (uint8_t)std::rand();
+    bool is_open() const noexcept override {
+        return !_closed && _error == quic_error::none;
     }
 
-    // Helper functions are hidden in internal namespace.
-namespace internal {
-    void sa_to_storage_v6(const seastar::socket_address& sa, sockaddr_storage& out, socklen_t& outlen) {
-        std::memset(&out, 0, sizeof(out));
-        auto in6 = sa.as_posix_sockaddr_in6();
-        outlen = sizeof(sockaddr_in6);
-        std::memcpy(&out, &in6, sizeof(sockaddr_in6));
+    stream_id default_stream() const noexcept override {
+        return _default_stream;
     }
 
-    const ngtcp2_mem* get_ngtcp2_allocator() {
-        thread_local static const ngtcp2_mem mem = {
-            nullptr,
-            seastar_malloc,
-            seastar_free,
-            seastar_calloc,
-            seastar_realloc
-        };
-        return &mem;
+    future<> send(quic_message msg) override {
+        auto msg_size = msg.payload.size();
+
+        if (msg.stream == invalid_stream_id) {
+            msg.stream = _default_stream;
+        }
+
+        while (is_open() && _options.max_pending_send_bytes &&
+               _pending_tx_bytes + msg_size > _options.max_pending_send_bytes) {
+            co_await _tx_space_cv.wait();
+        }
+
+        throw_if_terminal("send");
+
+        _pending_tx_bytes += msg_size;
+        _txq.push_back(std::move(msg));
+        _tx_cv.signal();
+        co_return;
     }
 
-    void fill_transport_params(ngtcp2_transport_params& params, const connection_config& config) {
-        ngtcp2_transport_params_default(&params);
-        params.initial_max_stream_data_bidi_local  = config.initial_max_stream_data_bidi_local;
-        params.initial_max_stream_data_bidi_remote = config.initial_max_stream_data_bidi_remote;
-        params.initial_max_data                    = config.initial_max_data;
-        params.initial_max_streams_bidi            = config.initial_max_streams_bidi;
-        params.max_idle_timeout                    = config.max_idle_timeout_ns;
+    future<quic_message> receive() override {
+        while (_rxq.empty()) {
+            throw_if_terminal("receive");
+            co_await _rx_cv.wait();
+        }
+
+        auto msg = std::move(_rxq.front());
+        _rxq.pop_front();
+        _pending_rx_bytes -= msg.payload.size();
+        _rx_space_cv.signal();
+
+        co_return msg;
     }
 
-    ngtcp2_callbacks get_default_callbacks() {
-        ngtcp2_callbacks callbacks{};
-        callbacks.client_initial = ngtcp2_crypto_client_initial_cb;
-        callbacks.recv_client_initial = ngtcp2_crypto_recv_client_initial_cb;
-        callbacks.recv_retry = ngtcp2_crypto_recv_retry_cb;
-        callbacks.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
-        callbacks.encrypt = ngtcp2_crypto_encrypt_cb;
-        callbacks.decrypt = ngtcp2_crypto_decrypt_cb;
-        callbacks.hp_mask = ngtcp2_crypto_hp_mask_cb;
-        callbacks.update_key = ngtcp2_crypto_update_key_cb;
-        callbacks.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
-        callbacks.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
-        callbacks.rand = [](uint8_t *dest, size_t len, const ngtcp2_rand_ctx*) {
-            rand_bytes(dest, len);
-        };
-        return callbacks;
-    }
-
-    ngtcp2_settings get_default_settings() {
-        ngtcp2_settings settings;
-        ngtcp2_settings_default(&settings);
-        settings.initial_ts = now_ns();
-        return settings;
-    }
-
-    size_t max_tx_udp_payload(ngtcp2_conn* conn) {
-        if (!conn) return default_udp_payload;
-        auto max_sz = ngtcp2_conn_get_path_max_tx_udp_payload_size(conn);
-        if (max_sz == 0) return default_udp_payload;
-        if (max_sz > max_udp_payload) max_sz = max_udp_payload;
-        return static_cast<size_t>(max_sz);
-    }
-} // namespace internal
-
-using SettingsConfigurator = std::function<void(ngtcp2_settings&)>;
-using ParamsConfigurator = std::function<void(ngtcp2_transport_params&)>;
-using CallbacksConfigurator = std::function<void(ngtcp2_callbacks&)>;
-
-QuicConfig::QuicConfig() {
-    std::memset(&settings_, 0, sizeof(settings_));
-    std::memset(&params_, 0, sizeof(params_));
-    std::memset(&callbacks_, 0, sizeof(callbacks_));
-
-    settings_ = internal::get_default_settings();
-
-    internal::connection_config config;
-    internal::fill_transport_params(params_, config);
-    
-    callbacks_ = internal::get_default_callbacks();
-}
-
-// Possible to use lambdas to set settings, params or callbacks.
-QuicConfig& QuicConfig::withSettings(SettingsConfigurator func) {
-    if (func) {
-        func(settings_);
-    }
-    return *this;
-}
-
-QuicConfig& QuicConfig::withTransportParams(ParamsConfigurator func) {
-    if (func) {
-        func(params_);
-    }
-    return *this;
-}
-
-QuicConfig& QuicConfig::withCallbacks(CallbacksConfigurator func) {
-    if (func) {
-        func(callbacks_);
-    }
-    return *this;
-}
-
-QuicConfig& QuicConfig::withOriginalDcid(const uint8_t* data, size_t len) {
-    params_.original_dcid_present = 1;
-    ngtcp2_cid_init(&params_.original_dcid, data, std::min(len, (size_t)NGTCP2_MAX_CIDLEN));
-    return *this;
-}
-
-
-udp_channel::udp_channel(seastar::net::datagram_channel ch)
-    : _ch(std::move(ch)) {}
-
-seastar::future<> udp_channel::send_to(const seastar::socket_address& to, seastar::net::packet p) {
-    return _ch.send(to, std::move(p));
-}
-
-seastar::future<> udp_channel::send_to(const seastar::socket_address& to, seastar::temporary_buffer<char> tb) {
-    return _ch.send(to, std::move(tb));
-}
-
-seastar::future<seastar::net::datagram> udp_channel::recv_datagram() {
-    return _ch.receive();
-}
-
-void udp_channel::close() {
-    _ch.close();
-}
-
-seastar::socket_address udp_channel::local_address() const {
-    return _ch.local_address();
-}
-
-seastar::temporary_buffer<char> datagram_to_temporary_buffer(seastar::net::datagram& d) {
-    auto bufs = d.get_buffers();
-
-    size_t total_len = 0;
-    for (const auto& b : bufs) {
-        total_len += b.size();
-    }
-
-    seastar::temporary_buffer<char> tb(total_len);
-    char* dst = tb.get_write();
-    size_t off = 0;
-
-    for (const auto& b : bufs) {
-        std::memcpy(dst + off, b.get(), b.size());
-        off += b.size();
-    }
-
-    return tb;
-}
-
-
-quic_cid::quic_cid() {
-    ngtcp2_cid_init(&_cid, nullptr, 0);
-}
-
-quic_cid::quic_cid(const uint8_t* data, size_t len) {
-    ngtcp2_cid_init(&_cid, data, std::min(len, (size_t)NGTCP2_MAX_CIDLEN));
-}
-
-quic_cid quic_cid::random(size_t len) {
-    quic_cid c;
-    c._cid.datalen = std::min(len, (size_t)NGTCP2_MAX_CIDLEN);
-    rand_bytes(c._cid.data, c._cid.datalen);
-    return c;
-}
-
-std::string quic_cid::to_string() const {
-    if (_cid.datalen == 0) return "unknown";
-    
-    static const char hex_chars[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(_cid.datalen * 2);
-    for (size_t i = 0; i < _cid.datalen; ++i) {
-        result.push_back(hex_chars[(_cid.data[i] >> 4) & 0x0F]);
-        result.push_back(hex_chars[_cid.data[i] & 0x0F]);
-    }
-    return result;
-}
-
-bool quic_cid::operator==(const quic_cid& other) const {
-    return _cid.datalen == other._cid.datalen &&
-        std::memcmp(_cid.data, other._cid.data, _cid.datalen) == 0;
-}
-
-bool quic_cid::operator!=(const quic_cid& other) const {
-    return !(*this == other);
-}
-
-quic_cid& quic_cid::operator=(const quic_cid& other) {
-    if (this != &other) {
-        _cid = other._cid;
-    }
-    return *this;
-}
-
-quic_cid& quic_cid::operator=(const ngtcp2_cid& other) {
-    _cid = other;
-    return *this;
-}
-
-
-Connection::Connection(const seastar::socket_address& local, const seastar::socket_address& remote) {
-    set_local_addr(local);
-    set_remote_addr(remote);
-}
-
-Connection::~Connection() {
-    if (_conn) {
-        ngtcp2_conn_del(_conn);
-        _conn = nullptr;
-    }
-    if (_tls) {
-        gnutls_deinit(_tls);
-        _tls = nullptr;
-    }
-    _timer_cv.broken();
-}
-
-void Connection::reschedule() {
-    _timer_cv.signal();
-}
-
-void Connection::set_local_addr(const seastar::socket_address& sa) {
-    internal::sa_to_storage_v6(sa, _local_ss, _local_ss_len);
-}
-
-void Connection::set_remote_addr(const seastar::socket_address& sa) {
-    internal::sa_to_storage_v6(sa, _remote_ss, _remote_ss_len);
-}
-
-void Connection::set_peer(seastar::socket_address p) {
-    _peer = p;
-}
-
-void Connection::fill_path(ngtcp2_path& p) {
-    internal::init_ngtcp2_addr(&p.local,  (sockaddr*)&_local_ss,  _local_ss_len);
-    internal::init_ngtcp2_addr(&p.remote, (sockaddr*)&_remote_ss, _remote_ss_len);
-}
-
-
-seastar::future<> Connection::flush_pending(udp_channel_ptr sock, const seastar::socket_address& peer) {
-    if (!_conn || !sock) co_return;
-
-    std::vector<uint8_t> outbuf(max_tx_udp_payload_size());
-
-    while (true) {
-        ssize_t nwrite = write_pending_packet(outbuf.data(), outbuf.size());
-        
-        if (nwrite <= 0) break; 
-
-        auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
-        std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
-        
-        co_await sock->send_to(peer, std::move(tb));
-    }
-}
-
-seastar::future<> Connection::send(int64_t stream_id, std::string_view data, 
-                                   udp_channel_ptr sock, const seastar::socket_address& peer) {
-    if (!_conn || !sock) co_return;
-
-    if (stream_id < 0) {
-        int64_t new_id;
-        int rv = open_bidi_stream(new_id);
-        if (rv != 0) {
+    future<> close() override {
+        if (_closed) {
             co_return;
         }
-        stream_id = new_id;
+
+        _closed = true;
+        _tx_cv.signal();
+        _rx_cv.signal();
+        _tx_space_cv.signal();
+        _rx_space_cv.signal();
+        co_return;
     }
 
-    size_t total_sent = 0;
-    std::vector<uint8_t> outbuf(max_tx_udp_payload_size());
-
-    while (total_sent < data.size()) {
-        ssize_t consumed = 0;
-        const uint8_t* current_ptr = reinterpret_cast<const uint8_t*>(data.data()) + total_sent;
-        size_t current_len = data.size() - total_sent;
-
-        ssize_t nwrite = write_stream_packet(stream_id, current_ptr, current_len, 
-                                             consumed, outbuf.data(), outbuf.size());
-
-        if (nwrite < 0) {
-            break;
+    future<quic_message> pop_outgoing() override {
+        while (_txq.empty()) {
+            throw_if_terminal("pop_outgoing");
+            co_await _tx_cv.wait();
         }
 
-        if (nwrite == 0) break;
+        auto msg = std::move(_txq.front());
+        _txq.pop_front();
+        _pending_tx_bytes -= msg.payload.size();
+        _tx_space_cv.signal();
 
-        auto tb = seastar::temporary_buffer<char>((size_t)nwrite);
-        std::memcpy(tb.get_write(), outbuf.data(), (size_t)nwrite);
-        co_await sock->send_to(peer, std::move(tb));
-
-        total_sent += (size_t)consumed;
+        co_return msg;
     }
 
-    co_await flush_pending(sock, peer);
-
-    reschedule();
-}
-
-
-seastar::future<int> Connection::handle_packet(const uint8_t* data, size_t len, udp_channel_ptr sock) {
-    int rv = read_packet(data, len);
-    
-    if (rv < 0) {
-        co_return rv;
-    }
-
-    co_await flush_pending(sock, _peer);
-
-    reschedule();
-    co_return 0;
-}
-
-// Functions using ngtcp2 functions.
-
-void Connection::init_client(const QuicConfig& config, void* user_data) {
-    // QUIC clients must provide non-empty CIDs for Initial packets.
-    // If caller did not preconfigure them, generate defaults to avoid
-    // collisions between multiple client processes.
-    if (_dcid.empty()) {
-        _dcid = quic_cid::random(8);
-    }
-    if (_scid.empty()) {
-        _scid = quic_cid::random(8);
-    }
-
-    ngtcp2_path path{};
-    fill_path(path);
-
-    int rv = ngtcp2_conn_client_new(&_conn,
-                                _dcid.get(),
-                                _scid.get(),
-                                &path,
-                                NGTCP2_PROTO_VER_V1,
-                                config.getCallbacksPtr(), 
-                                config.getSettingsPtr(), 
-                                config.getTransportParamsPtr(),
-                                internal::get_ngtcp2_allocator(),
-                                user_data);
-
-    if (rv != 0) {
-        throw std::runtime_error("ngtcp2_conn_client_new failed: " + std::string(ngtcp2_strerror(rv)));
-    }
-
-    if (_tls) {
-        ngtcp2_conn_set_tls_native_handle(_conn, _tls);
-    }
-    
-    _conn_ref.user_data = _conn;
-}
-
-void Connection::init_server(const QuicConfig& config, void* user_data) {
-    ngtcp2_path path{};
-    fill_path(path);
-
-    int rv = ngtcp2_conn_server_new(&_conn, 
-                                _dcid.get(), 
-                                _scid.get(), 
-                                &path,
-                                NGTCP2_PROTO_VER_V1, 
-                                config.getCallbacksPtr(), 
-                                config.getSettingsPtr(),
-                                config.getTransportParamsPtr(), 
-                                internal::get_ngtcp2_allocator(), 
-                                user_data);
-
-    if (rv != 0) throw std::runtime_error(std::string("server_new: ") + ngtcp2_strerror(rv));
-
-    if (_tls) {
-        ngtcp2_conn_set_tls_native_handle(_conn, _tls);
-    }
-    
-    _conn_ref.user_data = _conn;
-}
-
-int64_t Connection::open_bidi_stream(int64_t& stream_id) {
-    if (!_conn) return NGTCP2_ERR_INTERNAL;
-    return ngtcp2_conn_open_bidi_stream(_conn, &stream_id, nullptr);
-}
-
-quic_cid Connection::parse_initial_packet(const uint8_t* data, size_t len) {
-    ngtcp2_version_cid vc;
-    int rv = ngtcp2_pkt_decode_version_cid(&vc, data, len, NGTCP2_MAX_CIDLEN);
-    
-    if (rv < 0) {
-        throw std::runtime_error("Failed to decode version CID");
-    }
-
-    _dcid = quic_cid(vc.scid, vc.scidlen);
-
-    return quic_cid(vc.dcid, vc.dcidlen);
-}
-
-ssize_t Connection::write_pending_packet(uint8_t* dest, size_t dest_len) {
-    if (!_conn) return NGTCP2_ERR_INTERNAL;
-
-    ngtcp2_path path;
-    fill_path(path);
-
-    ngtcp2_pkt_info pi;
-    std::memset(&pi, 0, sizeof(pi));
-
-    ssize_t nwrite = ngtcp2_conn_write_pkt(_conn, &path, &pi, dest, dest_len, now_ns());
-    
-    return nwrite;
-}
-
-ssize_t Connection::write_stream_packet(int64_t stream_id,
-                                const uint8_t* data, size_t datalen, 
-                                ssize_t& bytes_consumed, 
-                                uint8_t* dest, size_t dest_len) {
-    
-    if (!_conn) return NGTCP2_ERR_INTERNAL;
-
-    ngtcp2_path path;
-    fill_path(path);
-    
-    ngtcp2_pkt_info pi;
-    std::memset(&pi, 0, sizeof(pi));
-
-    ngtcp2_vec vec;
-    vec.base = const_cast<uint8_t*>(data);
-    vec.len = datalen;
-
-    return ngtcp2_conn_writev_stream(_conn, &path, &pi, 
-                                    dest, dest_len, 
-                                    &bytes_consumed, 
-                                    0, 
-                                    stream_id,
-                                    &vec, 1, 
-                                    now_ns());
-}
-
-int Connection::read_packet(const uint8_t* data, size_t len) {
-    if (!_conn) return NGTCP2_ERR_INTERNAL;
-
-    ngtcp2_path path;
-    fill_path(path);
-
-    ngtcp2_pkt_info pi;
-    std::memset(&pi, 0, sizeof(pi));
-
-    return ngtcp2_conn_read_pkt(_conn, &path, &pi, data, len, now_ns());
-}
-
-ssize_t Connection::write_connection_close(uint8_t* dest, size_t dest_len) {
-    if (!_conn) return NGTCP2_ERR_INTERNAL;
-
-    ngtcp2_path path;
-    fill_path(path);
-
-    ngtcp2_pkt_info pi;
-    std::memset(&pi, 0, sizeof(pi));
-
-    ngtcp2_ccerr err;
-    ngtcp2_ccerr_default(&err); 
-
-    return ngtcp2_conn_write_connection_close(
-        _conn, &path, &pi,
-        dest, dest_len,
-        &err,
-        now_ns()
-    );
-}
-
-ngtcp2_tstamp Connection::get_expiry() const {
-    if (!_conn) return UINT64_MAX;
-    return ngtcp2_conn_get_expiry(_conn);
-}
-
-int Connection::handle_expiry() {
-    if (!_conn) return NGTCP2_ERR_INTERNAL;
-    return ngtcp2_conn_handle_expiry(_conn, now_ns());
-}
-
-size_t Connection::max_tx_udp_payload_size() {
-    return internal::max_tx_udp_payload(_conn);
-}
-
-void Connection::generate_random_cids(size_t len) {
-    _scid = quic_cid::random(len);
-    _dcid = quic_cid::random(len);
-}
-
-void Connection::generate_scid(size_t len) {
-    _scid = quic_cid::random(len);
-}
-
-void Connection::set_dcid(const quic_cid& cid) {
-            _dcid = cid;
+    void push_incoming(quic_message msg) override {
+        if (!is_open()) {
+            return;
         }
 
-void Connection::set_dcid(const uint8_t* data, size_t len) {
-    _dcid = quic_cid(data, len);
-}
+        auto msg_size = msg.payload.size();
+        if (_options.max_pending_receive_bytes &&
+            _pending_rx_bytes + msg_size > _options.max_pending_receive_bytes) {
+            mark_error(quic_error::io, "receive queue limit exceeded");
+            return;
+        }
 
-void Connection::on_handshake_completed(HandshakeHandler handler) {
-    _on_handshake_completed = std::move(handler);
-}
-
-void Connection::on_stream_data(StreamDataHandler handler) {
-    _on_stream_data = std::move(handler);
-}
-
-void Connection::on_dcid_status(DcidStatusHandler handler) {
-    _on_dcid_status = std::move(handler);
-}
-
-void Connection::apply_default_callbacks(QuicConfig& config) {
-    config.withCallbacks([] (auto& callbacks) {
-        callbacks.get_new_connection_id = &Connection::get_new_connection_id_cb;
-        callbacks.get_path_challenge_data = &Connection::get_path_challenge_data_cb;
-        callbacks.handshake_completed = &Connection::handshake_completed_cb;
-        callbacks.recv_stream_data = &Connection::recv_stream_data_cb;
-        callbacks.dcid_status = &Connection::dcid_status_cb;
-    });
-}
-
-int Connection::get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid *cid, uint8_t *token, size_t cidlen, void*) {
-    cid->datalen = cidlen;
-    rand_bytes(cid->data, cidlen);
-    rand_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
-    return 0;
-}
-
-int Connection::get_path_challenge_data_cb(ngtcp2_conn*, uint8_t *data, void*) {
-    rand_bytes(data, 8);
-    return 0;
-}
-
-int Connection::handshake_completed_cb(ngtcp2_conn*, void* user_data) {
-    auto* c = static_cast<Connection*>(user_data);
-    if (c && c->_on_handshake_completed) {
-        c->_on_handshake_completed(*c);
-    }
-    return 0;
-}
-
-int Connection::recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t,
-        const uint8_t* data, size_t datalen, void* user_data, void*) {
-    auto* c = static_cast<Connection*>(user_data);
-    if (c && c->_on_stream_data) {
-        c->_on_stream_data(*c, sid, std::string_view(reinterpret_cast<const char*>(data), datalen));
-    }
-    return 0;
-}
-
-int Connection::dcid_status_cb(ngtcp2_conn*, ngtcp2_connection_id_status_type type, uint64_t,
-        const ngtcp2_cid* cid, const uint8_t*, void* user_data) {
-    auto* c = static_cast<Connection*>(user_data);
-    if (!c || !cid || !c->_on_dcid_status) {
-        return 0;
+        _pending_rx_bytes += msg_size;
+        _rxq.push_back(std::move(msg));
+        _rx_cv.signal();
     }
 
-    if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_ACTIVATE) {
-        c->_on_dcid_status(*c, quic_cid(*cid), true);
-    } else if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_DEACTIVATE) {
-        c->_on_dcid_status(*c, quic_cid(*cid), false);
+    void mark_ready(stream_id sid) override {
+        _default_stream = sid;
     }
-    return 0;
+
+    void mark_transport_closed() override {
+        if (_closed) {
+            return;
+        }
+
+        _closed = true;
+        _tx_cv.signal();
+        _rx_cv.signal();
+        _tx_space_cv.signal();
+        _rx_space_cv.signal();
+    }
+
+    void mark_error(quic_error error, sstring detail) override {
+        if (_error != quic_error::none) {
+            return;
+        }
+
+        _error = error;
+        _error_detail = std::string(detail);
+        _closed = true;
+        _tx_cv.signal();
+        _rx_cv.signal();
+        _tx_space_cv.signal();
+        _rx_space_cv.signal();
+    }
+
+private:
+    void throw_if_terminal(const char* op) const {
+        if (_error != quic_error::none) {
+            throw quic_exception(_error, std::string(op) + ": " + _error_detail);
+        }
+        if (_closed) {
+            throw quic_exception(quic_error::closed, std::string(op) + ": session closed");
+        }
+    }
+
+    quic_session_options _options;
+    stream_id _default_stream = 0;
+    bool _closed = false;
+    quic_error _error = quic_error::none;
+    std::string _error_detail;
+
+    std::deque<quic_message> _txq;
+    std::deque<quic_message> _rxq;
+    size_t _pending_tx_bytes = 0;
+    size_t _pending_rx_bytes = 0;
+
+    condition_variable _tx_cv;
+    condition_variable _rx_cv;
+    condition_variable _tx_space_cv;
+    condition_variable _rx_space_cv;
+};
+
+} // namespace
+
+namespace internal {
+
+session_runtime_ptr make_session_runtime(quic_session_options options) {
+    return std::make_shared<basic_session_runtime>(std::move(options));
 }
 
-init_gnutls::init_gnutls() {
-    if (gnutls_global_init() < 0) {
-        throw std::runtime_error("Failed to initialize GnuTLS");
+} // namespace internal
+
+quic_session::quic_session()
+    : _runtime(internal::make_session_runtime()) {
+}
+
+quic_session::quic_session(internal::session_runtime_ptr runtime)
+    : _runtime(std::move(runtime)) {
+    if (!_runtime) {
+        _runtime = internal::make_session_runtime();
     }
 }
 
-init_gnutls::~init_gnutls() {
-    gnutls_global_deinit();
+quic_session::~quic_session() = default;
+quic_session::quic_session(quic_session&&) noexcept = default;
+quic_session& quic_session::operator=(quic_session&&) noexcept = default;
+
+bool quic_session::is_open() const noexcept {
+    return _runtime && _runtime->is_open();
 }
 
+stream_id quic_session::default_stream() const noexcept {
+    if (!_runtime) {
+        return invalid_stream_id;
+    }
+    return _runtime->default_stream();
 }
+
+future<> quic_session::send(quic_message msg) {
+    if (!_runtime) {
+        throw_quic_error(quic_error::invalid_state, "session runtime is null");
+    }
+    return _runtime->send(std::move(msg));
+}
+
+future<> quic_session::send(stream_id sid, temporary_buffer<char> payload, bool fin) {
+    return send(quic_message(sid, std::move(payload), fin));
+}
+
+future<> quic_session::send(stream_id sid, sstring payload, bool fin) {
+    temporary_buffer<char> tb(payload.size());
+    std::memcpy(tb.get_write(), payload.data(), payload.size());
+    return send(quic_message(sid, std::move(tb), fin));
+}
+
+future<quic_message> quic_session::receive() {
+    if (!_runtime) {
+        throw_quic_error(quic_error::invalid_state, "session runtime is null");
+    }
+    return _runtime->receive();
+}
+
+future<> quic_session::close() {
+    if (!_runtime) {
+        co_return;
+    }
+    co_await _runtime->close();
+}
+
+internal::session_runtime_ptr quic_session::runtime() const noexcept {
+    return _runtime;
+}
+
+} // namespace seastar::quic::experimental

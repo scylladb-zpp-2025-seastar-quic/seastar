@@ -6,7 +6,7 @@
  *
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -21,23 +21,70 @@
 
 #pragma once
 
+#include <stdexcept>
 #include <string>
-#include <ngtcp2/ngtcp2.h>
+#include <string_view>
 
 namespace seastar::quic::experimental {
-    inline bool is_draining(int code) { 
-        return code == NGTCP2_ERR_DRAINING; 
+
+enum class quic_error {
+    none = 0,
+    invalid_argument,
+    invalid_state,
+    io,
+    timeout,
+    protocol,
+    closed,
+    unsupported,
+    internal,
+    backend,
+};
+
+inline const char* to_string(quic_error error) noexcept {
+    switch (error) {
+    case quic_error::none:
+        return "none";
+    case quic_error::invalid_argument:
+        return "invalid_argument";
+    case quic_error::invalid_state:
+        return "invalid_state";
+    case quic_error::io:
+        return "io";
+    case quic_error::timeout:
+        return "timeout";
+    case quic_error::protocol:
+        return "protocol";
+    case quic_error::closed:
+        return "closed";
+    case quic_error::unsupported:
+        return "unsupported";
+    case quic_error::internal:
+        return "internal";
+    case quic_error::backend:
+        return "backend";
     }
-    
-    inline bool should_write_more(int code) {
-        return code == NGTCP2_ERR_WRITE_MORE;
+    return "unknown";
+}
+
+class quic_exception final : public std::runtime_error {
+public:
+    explicit quic_exception(quic_error error, std::string detail = {})
+        : std::runtime_error(detail.empty()
+                  ? std::string(to_string(error))
+                  : std::string(to_string(error)) + ": " + detail)
+        , _error(error) {
     }
 
-    inline bool is_idle_close(int code) {
-        return code == NGTCP2_ERR_IDLE_CLOSE;
+    quic_error code() const noexcept {
+        return _error;
     }
-    
-    inline std::string error_to_string(int code) {
-        return ngtcp2_strerror(code);
-    }
+
+private:
+    quic_error _error;
+};
+
+[[noreturn]] inline void throw_quic_error(quic_error error, std::string_view detail = {}) {
+    throw quic_exception(error, std::string(detail));
 }
+
+} // namespace seastar::quic::experimental
