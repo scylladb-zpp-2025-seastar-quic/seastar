@@ -21,9 +21,912 @@
 
 #include <seastar/quic/quic_server.hh>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <limits>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include <gnutls/crypto.h>
+#include <gnutls/gnutls.h>
+
+#include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h>
+#include <ngtcp2/ngtcp2_crypto_gnutls.h>
+
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/semaphore.hh>
+
 namespace seastar::quic::experimental {
 
-class quic_server::impl {
+namespace {
+
+constexpr size_t max_cid_len = 20;
+constexpr size_t server_short_cid_len = 8;
+constexpr size_t max_udp_payload_size = 65527;
+constexpr size_t default_udp_payload_size = 1200;
+
+class gnutls_global_guard {
+public:
+    gnutls_global_guard() {
+        gnutls_global_init();
+    }
+    ~gnutls_global_guard() {
+        gnutls_global_deinit();
+    }
+};
+
+void ensure_gnutls_global() {
+    static gnutls_global_guard guard;
+}
+
+ngtcp2_tstamp now_ns() {
+    using namespace std::chrono;
+    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void rand_bytes(uint8_t* dst, size_t len) {
+    if (gnutls_rnd(GNUTLS_RND_RANDOM, dst, len) == 0) {
+        return;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        dst[i] = static_cast<uint8_t>(std::rand());
+    }
+}
+
+void* mem_malloc(size_t size, void*) {
+    return std::malloc(size);
+}
+
+void mem_free(void* ptr, void*) {
+    std::free(ptr);
+}
+
+void* mem_calloc(size_t n, size_t s, void*) {
+    return std::calloc(n, s);
+}
+
+void* mem_realloc(void* ptr, size_t s, void*) {
+    return std::realloc(ptr, s);
+}
+
+const ngtcp2_mem* ngtcp2_mem_for_thread() {
+    thread_local const ngtcp2_mem mem = {
+      nullptr,
+      mem_malloc,
+      mem_free,
+      mem_calloc,
+      mem_realloc,
+    };
+    return &mem;
+}
+
+void init_ngtcp2_addr(ngtcp2_addr* addr, const sockaddr* sa, size_t len) {
+    addr->addr = const_cast<sockaddr*>(sa);
+    addr->addrlen = static_cast<socklen_t>(len);
+}
+
+void to_sockaddr_storage_v6(const socket_address& sa, sockaddr_storage& out, socklen_t& outlen) {
+    std::memset(&out, 0, sizeof(out));
+    auto in6 = sa.as_posix_sockaddr_in6();
+    std::memcpy(&out, &in6, sizeof(in6));
+    outlen = sizeof(in6);
+}
+
+temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) {
+    size_t total = 0;
+    for (const auto& b : bufs) {
+        total += b.size();
+    }
+
+    temporary_buffer<char> result(total);
+    char* dst = result.get_write();
+    size_t offset = 0;
+    for (const auto& b : bufs) {
+        std::memcpy(dst + offset, b.get(), b.size());
+        offset += b.size();
+    }
+    return result;
+}
+
+future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, const uint8_t* data, size_t len) {
+    if (len == 0) {
+        co_return;
+    }
+    temporary_buffer<char> tb(len);
+    std::memcpy(tb.get_write(), data, len);
+    std::array<temporary_buffer<char>, 1> bufs{std::move(tb)};
+    co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
+}
+
+std::string cid_key(const uint8_t* data, size_t len) {
+    return std::string(reinterpret_cast<const char*>(data), len);
+}
+
+enum class quic_long_type : uint8_t {
+    initial = 0,
+    zero_rtt = 1,
+    handshake = 2,
+    retry = 3,
+};
+
+struct dcid_parse_result {
+    bool ok = false;
+    bool long_header = false;
+    quic_long_type long_type = quic_long_type::initial;
+    std::array<uint8_t, max_cid_len> dcid{};
+    size_t dcid_len = 0;
+};
+
+dcid_parse_result parse_dcid(const uint8_t* pkt, size_t len, size_t short_dcid_len) {
+    dcid_parse_result result{};
+    if (len < 1) {
+        return result;
+    }
+
+    const bool long_header = (pkt[0] & 0x80u) != 0;
+    result.long_header = long_header;
+    if (long_header) {
+        if (len < 1 + 4 + 1) {
+            return result;
+        }
+
+        result.long_type = static_cast<quic_long_type>((pkt[0] >> 4) & 0x03u);
+        size_t off = 1 + 4;
+        const uint8_t cid_len = pkt[off++];
+        if (cid_len > result.dcid.size() || off + cid_len > len) {
+            return result;
+        }
+
+        std::memcpy(result.dcid.data(), pkt + off, cid_len);
+        result.dcid_len = cid_len;
+        result.ok = true;
+        return result;
+    }
+
+    if (len < 1 + short_dcid_len) {
+        return result;
+    }
+    std::memcpy(result.dcid.data(), pkt + 1, short_dcid_len);
+    result.dcid_len = short_dcid_len;
+    result.ok = true;
+    return result;
+}
+
+class quic_server_impl;
+
+struct server_connection : public std::enable_shared_from_this<server_connection> {
+    quic_server_impl* server = nullptr;
+    internal::session_runtime_ptr runtime;
+
+    ngtcp2_conn* conn = nullptr;
+    ngtcp2_crypto_conn_ref conn_ref{};
+    gnutls_session_t tls = nullptr;
+
+    socket_address peer{};
+    sockaddr_storage local_ss{};
+    socklen_t local_ss_len = 0;
+    sockaddr_storage peer_ss{};
+    socklen_t peer_ss_len = 0;
+
+    semaphore conn_sem{1};
+    condition_variable wake_cv;
+
+    bool closing = false;
+    size_t tx_payload_limit = default_udp_payload_size;
+    std::unordered_set<std::string> mapped_dcids;
+
+    ~server_connection() {
+        wake_cv.broken();
+        if (conn) {
+            ngtcp2_conn_del(conn);
+            conn = nullptr;
+        }
+        if (tls) {
+            gnutls_deinit(tls);
+            tls = nullptr;
+        }
+    }
+
+    void fill_path(ngtcp2_path& path) {
+        init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&local_ss), local_ss_len);
+        init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&peer_ss), peer_ss_len);
+    }
+
+    bool active() const noexcept;
+    void stop_transport();
+    void fail(quic_error error, const sstring& detail);
+};
+
+using conn_ptr = std::shared_ptr<server_connection>;
+
+class quic_server_impl {
+public:
+    future<> start(quic_server_config cfg) {
+        if (_started) {
+            throw_quic_error(quic_error::invalid_state, "server already started");
+        }
+        ensure_gnutls_global();
+
+        _cfg = std::move(cfg);
+        int rv = gnutls_certificate_allocate_credentials(&_cred);
+        if (rv < 0) {
+            throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
+        }
+
+        rv = gnutls_certificate_set_x509_key_file(
+          _cred, _cfg.cert_file.c_str(), _cfg.key_file.c_str(), GNUTLS_X509_FMT_PEM);
+        if (rv < 0) {
+            throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
+        }
+
+        _channel = engine().net().make_bound_datagram_channel(_cfg.listen_address);
+        _channel_ready = true;
+        _listen_address = _channel.local_address();
+        _started = true;
+        _stopping = false;
+
+        (void)with_gate(_task_gate, [this] { return receive_loop(); })
+          .handle_exception([this](std::exception_ptr) {
+              if (!_stopping) {
+                  _stopping = true;
+                  _accept_cv.signal();
+              }
+          })
+          .or_terminate();
+        co_return;
+    }
+
+    future<internal::session_runtime_ptr> accept() {
+        if (!_started) {
+            throw_quic_error(quic_error::invalid_state, "server is not started");
+        }
+
+        while (_accepted.empty()) {
+            if (_stopping) {
+                throw_quic_error(quic_error::closed, "server stopped");
+            }
+            co_await _accept_cv.wait();
+        }
+
+        auto runtime = std::move(_accepted.front());
+        _accepted.pop_front();
+        co_return runtime;
+    }
+
+    future<> stop() {
+        if (!_started) {
+            co_return;
+        }
+
+        _stopping = true;
+        _accept_cv.signal();
+
+        auto conns_copy = _conns;
+        for (auto& conn : conns_copy) {
+            conn->stop_transport();
+        }
+
+        if (_channel_ready && !_channel.is_closed()) {
+            _channel.shutdown_input();
+            _channel.shutdown_output();
+        }
+
+        co_await _task_gate.close();
+
+        if (_channel_ready && !_channel.is_closed()) {
+            _channel.close();
+        }
+
+        _conns.clear();
+        _by_dcid.clear();
+        _accepted.clear();
+        if (_cred) {
+            gnutls_certificate_free_credentials(_cred);
+            _cred = nullptr;
+        }
+
+        _started = false;
+        _stopping = false;
+        _channel_ready = false;
+    }
+
+    bool stopping() const noexcept {
+        return _stopping;
+    }
+
+    net::datagram_channel& channel() {
+        return _channel;
+    }
+
+    void map_dcid(const conn_ptr& conn, const uint8_t* cid, size_t len) {
+        auto key = cid_key(cid, len);
+        _by_dcid[key] = conn;
+        conn->mapped_dcids.insert(std::move(key));
+    }
+
+    void unmap_dcid(const conn_ptr& conn, const uint8_t* cid, size_t len) {
+        auto key = cid_key(cid, len);
+        auto it = _by_dcid.find(key);
+        if (it != _by_dcid.end() && it->second == conn) {
+            _by_dcid.erase(it);
+        }
+        conn->mapped_dcids.erase(key);
+    }
+
+    void unregister_connection(const conn_ptr& conn) {
+        for (const auto& key : conn->mapped_dcids) {
+            auto it = _by_dcid.find(key);
+            if (it != _by_dcid.end() && it->second == conn) {
+                _by_dcid.erase(it);
+            }
+        }
+        conn->mapped_dcids.clear();
+
+        _conns.erase(std::remove(_conns.begin(), _conns.end(), conn), _conns.end());
+    }
+
+    void enqueue_accepted_session(const internal::session_runtime_ptr& runtime) {
+        _accepted.push_back(runtime);
+        _accept_cv.signal();
+    }
+
+    gnutls_certificate_credentials_t credentials() const {
+        return _cred;
+    }
+
+    const quic_server_config& config() const {
+        return _cfg;
+    }
+
+    const socket_address& listen_address() const {
+        return _listen_address;
+    }
+
+private:
+    friend struct server_connection;
+
+    static ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref) {
+        return static_cast<ngtcp2_conn*>(ref->user_data);
+    }
+
+    static void rand_cb(uint8_t* dest, size_t len, const ngtcp2_rand_ctx*) {
+        rand_bytes(dest, len);
+    }
+
+    static int get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* token, size_t cidlen, void*) {
+        cid->datalen = cidlen;
+        rand_bytes(cid->data, cidlen);
+        rand_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
+        return 0;
+    }
+
+    static int get_path_challenge_data_cb(ngtcp2_conn*, uint8_t* data, void*) {
+        rand_bytes(data, 8);
+        return 0;
+    }
+
+    static int handshake_completed_cb(ngtcp2_conn*, void*) {
+        return 0;
+    }
+
+    static int dcid_status_cb(ngtcp2_conn*, ngtcp2_connection_id_status_type type, uint64_t, const ngtcp2_cid* cid, const uint8_t*, void* user_data) {
+        auto* conn = static_cast<server_connection*>(user_data);
+        if (!conn || !conn->server || !cid) {
+            return 0;
+        }
+        auto self = conn->shared_from_this();
+        if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_ACTIVATE) {
+            conn->server->map_dcid(self, cid->data, cid->datalen);
+        } else if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_DEACTIVATE) {
+            conn->server->unmap_dcid(self, cid->data, cid->datalen);
+        }
+        return 0;
+    }
+
+    static int recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t, const uint8_t* data, size_t datalen, void* user_data, void*) {
+        auto* conn = static_cast<server_connection*>(user_data);
+        if (!conn || !conn->runtime || !conn->runtime->is_open()) {
+            return 0;
+        }
+        conn->runtime->mark_ready(sid);
+        temporary_buffer<char> tb(datalen);
+        if (datalen) {
+            std::memcpy(tb.get_write(), data, datalen);
+        }
+        conn->runtime->push_incoming(quic_message(sid, std::move(tb), false));
+        return 0;
+    }
+
+    gnutls_session_t make_tls_session(server_connection& conn) const {
+        gnutls_session_t tls = nullptr;
+        int rv = gnutls_init(&tls, GNUTLS_SERVER | GNUTLS_ENABLE_EARLY_DATA);
+        if (rv < 0) {
+            throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
+        }
+        rv = gnutls_credentials_set(tls, GNUTLS_CRD_CERTIFICATE, _cred);
+        if (rv < 0) {
+            gnutls_deinit(tls);
+            throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
+        }
+        rv = gnutls_priority_set_direct(tls, "NORMAL:-VERS-ALL:+VERS-TLS1.3", nullptr);
+        if (rv < 0) {
+            gnutls_deinit(tls);
+            throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
+        }
+
+        std::vector<gnutls_datum_t> alpns;
+        alpns.reserve(_cfg.alpns.size());
+        for (const auto& alpn : _cfg.alpns) {
+            alpns.push_back(gnutls_datum_t{
+              reinterpret_cast<unsigned char*>(const_cast<char*>(alpn.data())),
+              static_cast<unsigned int>(alpn.size()),
+            });
+        }
+        if (!alpns.empty()) {
+            rv = gnutls_alpn_set_protocols(tls, alpns.data(), alpns.size(), 0);
+            if (rv < 0) {
+                gnutls_deinit(tls);
+                throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
+            }
+        }
+
+        rv = ngtcp2_crypto_gnutls_configure_server_session(tls);
+        if (rv != 0) {
+            gnutls_deinit(tls);
+            throw_quic_error(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+        }
+
+        conn.conn_ref.get_conn = get_conn;
+        conn.conn_ref.user_data = nullptr;
+        gnutls_session_set_ptr(tls, &conn.conn_ref);
+        return tls;
+    }
+
+    conn_ptr init_connection(const socket_address& peer, const uint8_t* pkt, size_t pkt_len) {
+        auto conn = std::make_shared<server_connection>();
+        conn->server = this;
+        conn->runtime = internal::make_session_runtime(_cfg.session_options);
+        conn->peer = peer;
+        to_sockaddr_storage_v6(_listen_address, conn->local_ss, conn->local_ss_len);
+        to_sockaddr_storage_v6(peer, conn->peer_ss, conn->peer_ss_len);
+        conn->tls = make_tls_session(*conn);
+
+        ngtcp2_version_cid vc{};
+        int rv = ngtcp2_pkt_decode_version_cid(&vc, pkt, pkt_len, NGTCP2_MAX_CIDLEN);
+        if (rv < 0) {
+            throw_quic_error(quic_error::protocol, "failed to decode Initial CID");
+        }
+
+        ngtcp2_cid dcid{};
+        dcid.datalen = vc.scidlen;
+        std::memcpy(dcid.data, vc.scid, vc.scidlen);
+
+        ngtcp2_cid odcid{};
+        odcid.datalen = vc.dcidlen;
+        std::memcpy(odcid.data, vc.dcid, vc.dcidlen);
+
+        ngtcp2_cid scid{};
+        scid.datalen = server_short_cid_len;
+        rand_bytes(scid.data, scid.datalen);
+
+        ngtcp2_callbacks callbacks{};
+        callbacks.recv_client_initial = ngtcp2_crypto_recv_client_initial_cb;
+        callbacks.recv_retry = ngtcp2_crypto_recv_retry_cb;
+        callbacks.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
+        callbacks.encrypt = ngtcp2_crypto_encrypt_cb;
+        callbacks.decrypt = ngtcp2_crypto_decrypt_cb;
+        callbacks.hp_mask = ngtcp2_crypto_hp_mask_cb;
+        callbacks.update_key = ngtcp2_crypto_update_key_cb;
+        callbacks.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+        callbacks.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+        callbacks.rand = rand_cb;
+        callbacks.get_new_connection_id = get_new_connection_id_cb;
+        callbacks.get_path_challenge_data = get_path_challenge_data_cb;
+        callbacks.handshake_completed = handshake_completed_cb;
+        callbacks.dcid_status = dcid_status_cb;
+        callbacks.recv_stream_data = recv_stream_data_cb;
+
+        ngtcp2_settings settings{};
+        ngtcp2_settings_default(&settings);
+        settings.initial_ts = now_ns();
+
+        ngtcp2_transport_params params{};
+        ngtcp2_transport_params_default(&params);
+        params.original_dcid_present = 1;
+        params.original_dcid = odcid;
+        params.initial_max_stream_data_bidi_local =
+          _cfg.session_options.transport.initial_max_stream_data_bidi_local;
+        params.initial_max_stream_data_bidi_remote =
+          _cfg.session_options.transport.initial_max_stream_data_bidi_remote;
+        params.initial_max_data = _cfg.session_options.transport.initial_max_data;
+        params.initial_max_streams_bidi = _cfg.session_options.transport.initial_max_streams_bidi;
+        params.max_idle_timeout = _cfg.session_options.transport.max_idle_timeout_ns;
+
+        ngtcp2_path path{};
+        conn->fill_path(path);
+        rv = ngtcp2_conn_server_new(
+          &conn->conn,
+          &dcid,
+          &scid,
+          &path,
+          NGTCP2_PROTO_VER_V1,
+          &callbacks,
+          &settings,
+          &params,
+          ngtcp2_mem_for_thread(),
+          conn.get());
+        if (rv != 0) {
+            throw_quic_error(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+        }
+
+        ngtcp2_conn_set_tls_native_handle(conn->conn, conn->tls);
+        conn->conn_ref.user_data = conn->conn;
+
+        auto payload = ngtcp2_conn_get_path_max_tx_udp_payload_size(conn->conn);
+        if (payload == 0) {
+            payload = default_udp_payload_size;
+        }
+        if (payload > max_udp_payload_size) {
+            payload = max_udp_payload_size;
+        }
+        conn->tx_payload_limit = payload;
+
+        map_dcid(conn, odcid.data, odcid.datalen);
+        map_dcid(conn, scid.data, scid.datalen);
+        _conns.push_back(conn);
+        enqueue_accepted_session(conn->runtime);
+
+        (void)with_gate(_task_gate, [conn] { return conn_tx_loop(conn); })
+          .handle_exception([conn](std::exception_ptr) {
+              conn->fail(quic_error::io, "server tx loop failed");
+          })
+          .or_terminate();
+        (void)with_gate(_task_gate, [conn] { return conn_timer_loop(conn); })
+          .handle_exception([conn](std::exception_ptr) {
+              conn->fail(quic_error::io, "server timer loop failed");
+          })
+          .or_terminate();
+
+        return conn;
+    }
+
+    static future<> flush_pending_packets_locked(conn_ptr conn) {
+        if (!conn->conn || !conn->server) {
+            co_return;
+        }
+        std::vector<uint8_t> outbuf(conn->tx_payload_limit);
+        while (conn->active()) {
+            ngtcp2_path path{};
+            conn->fill_path(path);
+            ngtcp2_pkt_info pkt_info{};
+
+            ngtcp2_ssize nwrite =
+              ngtcp2_conn_write_pkt(conn->conn, &path, &pkt_info, outbuf.data(), outbuf.size(), now_ns());
+            if (nwrite == 0) {
+                co_return;
+            }
+            if (nwrite < 0) {
+                if (ngtcp2_is_write_more(nwrite)) {
+                    continue;
+                }
+                if (ngtcp2_is_draining(nwrite)) {
+                    conn->stop_transport();
+                    conn->server->unregister_connection(conn);
+                    co_return;
+                }
+                conn->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
+                conn->server->unregister_connection(conn);
+                co_return;
+            }
+            co_await send_datagram(conn->server->channel(), conn->peer, outbuf.data(), static_cast<size_t>(nwrite));
+        }
+    }
+
+    static future<> send_stream_message_locked(conn_ptr conn, quic_message msg) {
+        if (!conn->conn || msg.stream == invalid_stream_id) {
+            co_return;
+        }
+
+        size_t offset = 0;
+        bool send_fin = msg.fin;
+        std::vector<uint8_t> outbuf(conn->tx_payload_limit);
+
+        while (conn->active()) {
+            const bool remaining = offset < msg.payload.size();
+            if (!remaining && !send_fin) {
+                break;
+            }
+
+            ngtcp2_path path{};
+            conn->fill_path(path);
+            ngtcp2_pkt_info pkt_info{};
+            ngtcp2_vec vec{};
+            ngtcp2_ssize consumed = 0;
+
+            const uint8_t* ptr = remaining ? reinterpret_cast<const uint8_t*>(msg.payload.get() + offset) : nullptr;
+            const size_t len = remaining ? (msg.payload.size() - offset) : 0;
+            if (remaining) {
+                vec.base = const_cast<uint8_t*>(ptr);
+                vec.len = len;
+            }
+
+            uint32_t flags = (!remaining && send_fin) ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
+            ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(
+              conn->conn,
+              &path,
+              &pkt_info,
+              outbuf.data(),
+              outbuf.size(),
+              &consumed,
+              flags,
+              msg.stream,
+              remaining ? &vec : nullptr,
+              remaining ? 1 : 0,
+              now_ns());
+
+            if (nwrite < 0) {
+                if (ngtcp2_is_write_more(nwrite)) {
+                    if (consumed > 0) {
+                        offset += static_cast<size_t>(consumed);
+                    }
+                    co_await flush_pending_packets_locked(conn);
+                    continue;
+                }
+                if (ngtcp2_is_draining(nwrite)) {
+                    conn->stop_transport();
+                    conn->server->unregister_connection(conn);
+                    co_return;
+                }
+                conn->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
+                conn->server->unregister_connection(conn);
+                co_return;
+            }
+            if (nwrite == 0) {
+                co_await flush_pending_packets_locked(conn);
+                continue;
+            }
+
+            if (consumed > 0) {
+                offset += static_cast<size_t>(consumed);
+            }
+            if (!remaining && send_fin) {
+                send_fin = false;
+            }
+            co_await send_datagram(conn->server->channel(), conn->peer, outbuf.data(), static_cast<size_t>(nwrite));
+
+            if (offset >= msg.payload.size() && !send_fin) {
+                break;
+            }
+        }
+
+        co_await flush_pending_packets_locked(conn);
+    }
+
+    static future<> conn_tx_send_locked(conn_ptr conn, quic_message msg) {
+        if (!conn->active()) {
+            co_return;
+        }
+        co_await send_stream_message_locked(conn, std::move(msg));
+    }
+
+    static future<uint64_t> conn_read_expiry_locked(conn_ptr conn) {
+        if (!conn->conn) {
+            co_return std::numeric_limits<uint64_t>::max();
+        }
+        co_return ngtcp2_conn_get_expiry(conn->conn);
+    }
+
+    static future<> conn_handle_timer_locked(conn_ptr conn) {
+        if (!conn->active() || !conn->conn) {
+            co_return;
+        }
+        auto now_local = now_ns();
+        if (ngtcp2_conn_get_expiry(conn->conn) <= now_local) {
+            int rv = ngtcp2_conn_handle_expiry(conn->conn, now_local);
+            if (rv < 0) {
+                if (ngtcp2_is_idle_close(rv) || ngtcp2_is_draining(rv)) {
+                    conn->stop_transport();
+                    conn->server->unregister_connection(conn);
+                    co_return;
+                }
+                conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+                conn->server->unregister_connection(conn);
+                co_return;
+            }
+        }
+        co_await flush_pending_packets_locked(conn);
+    }
+
+    static future<> handle_conn_datagram_locked(conn_ptr conn, temporary_buffer<char> pkt) {
+        if (!conn->active() || !conn->conn) {
+            co_return;
+        }
+
+        ngtcp2_path path{};
+        conn->fill_path(path);
+        ngtcp2_pkt_info pkt_info{};
+
+        int rv = ngtcp2_conn_read_pkt(
+          conn->conn, &path, &pkt_info, reinterpret_cast<const uint8_t*>(pkt.get()), pkt.size(), now_ns());
+        if (rv < 0) {
+            if (ngtcp2_is_draining(rv)) {
+                conn->stop_transport();
+                conn->server->unregister_connection(conn);
+                co_return;
+            }
+            conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+            conn->server->unregister_connection(conn);
+            co_return;
+        }
+
+        co_await flush_pending_packets_locked(conn);
+        conn->wake_cv.signal();
+    }
+
+    static future<> conn_tx_loop(conn_ptr conn) {
+        while (conn->active()) {
+            quic_message msg;
+            try {
+                msg = co_await conn->runtime->pop_outgoing();
+            } catch (const quic_exception& e) {
+                if (e.code() == quic_error::closed) {
+                    co_return;
+                }
+                conn->fail(e.code(), e.what());
+                conn->server->unregister_connection(conn);
+                co_return;
+            } catch (...) {
+                conn->fail(quic_error::internal, "server pop_outgoing failed");
+                conn->server->unregister_connection(conn);
+                co_return;
+            }
+
+            co_await with_semaphore(conn->conn_sem, 1, [conn, msg = std::move(msg)]() mutable {
+                return conn_tx_send_locked(conn, std::move(msg));
+            });
+            conn->wake_cv.signal();
+        }
+    }
+
+    static future<> conn_timer_loop(conn_ptr conn) {
+        while (conn->active()) {
+            auto expiry = co_await with_semaphore(conn->conn_sem, 1, [conn] {
+                return conn_read_expiry_locked(conn);
+            });
+
+            auto wait_dur = std::chrono::milliseconds(200);
+            auto now = now_ns();
+            if (expiry != std::numeric_limits<uint64_t>::max() && expiry > now) {
+                auto until_expiry = std::chrono::nanoseconds(expiry - now);
+                if (until_expiry < wait_dur) {
+                    wait_dur = std::chrono::duration_cast<std::chrono::milliseconds>(until_expiry);
+                }
+            }
+
+            try {
+                co_await conn->wake_cv.wait(wait_dur);
+            } catch (const condition_variable_timed_out&) {
+            } catch (const broken_condition_variable&) {
+                co_return;
+            }
+
+            if (!conn->active()) {
+                co_return;
+            }
+
+            co_await with_semaphore(conn->conn_sem, 1, [conn] {
+                return conn_handle_timer_locked(conn);
+            });
+        }
+    }
+
+    future<> handle_datagram(net::datagram d) {
+        auto src = d.get_src();
+        auto pkt = linearize_packet(d.get_buffers());
+        const auto* data = reinterpret_cast<const uint8_t*>(pkt.get());
+        const size_t len = pkt.size();
+
+        auto parsed = parse_dcid(data, len, server_short_cid_len);
+        if (!parsed.ok) {
+            co_return;
+        }
+
+        conn_ptr conn;
+        auto it = _by_dcid.find(cid_key(parsed.dcid.data(), parsed.dcid_len));
+        if (it != _by_dcid.end()) {
+            conn = it->second;
+        }
+
+        if (!conn) {
+            if (!parsed.long_header || parsed.long_type != quic_long_type::initial) {
+                co_return;
+            }
+            try {
+                conn = init_connection(src, data, len);
+            } catch (...) {
+                co_return;
+            }
+        }
+
+        if (!conn || conn->closing) {
+            co_return;
+        }
+
+        if (conn->peer != src) {
+            conn->peer = src;
+            to_sockaddr_storage_v6(src, conn->peer_ss, conn->peer_ss_len);
+        }
+
+        co_await with_semaphore(conn->conn_sem, 1, [conn, pkt = std::move(pkt)]() mutable {
+            return handle_conn_datagram_locked(conn, std::move(pkt));
+        });
+    }
+
+    future<> receive_loop() {
+        while (!_stopping) {
+            try {
+                auto d = co_await _channel.receive();
+                co_await handle_datagram(std::move(d));
+            } catch (...) {
+                if (_stopping) {
+                    co_return;
+                }
+            }
+        }
+    }
+
+    quic_server_config _cfg{};
+    gnutls_certificate_credentials_t _cred = nullptr;
+    net::datagram_channel _channel{};
+    bool _channel_ready = false;
+    socket_address _listen_address{};
+
+    bool _started = false;
+    bool _stopping = false;
+
+    gate _task_gate;
+    condition_variable _accept_cv;
+    std::deque<internal::session_runtime_ptr> _accepted;
+    std::unordered_map<std::string, conn_ptr> _by_dcid;
+    std::vector<conn_ptr> _conns;
+};
+
+bool server_connection::active() const noexcept {
+    return !closing && runtime && runtime->is_open() && server && !server->stopping();
+}
+
+void server_connection::stop_transport() {
+    closing = true;
+    if (runtime) {
+        runtime->mark_transport_closed();
+    }
+    wake_cv.signal();
+}
+
+void server_connection::fail(quic_error error, const sstring& detail) {
+    closing = true;
+    if (runtime) {
+        runtime->mark_error(error, detail);
+    }
+    wake_cv.signal();
+}
+
+} // namespace
+
+class quic_server::impl final : public quic_server_impl {
 };
 
 quic_server::quic_server()
@@ -34,18 +937,17 @@ quic_server::~quic_server() = default;
 quic_server::quic_server(quic_server&&) noexcept = default;
 quic_server& quic_server::operator=(quic_server&&) noexcept = default;
 
-future<> quic_server::start(quic_server_config) {
-    return make_exception_future<>(
-        quic_exception(quic_error::unsupported, "quic_server backend is not implemented yet"));
+future<> quic_server::start(quic_server_config config) {
+    co_await _impl->start(std::move(config));
 }
 
 future<quic_session> quic_server::accept() {
-    return make_exception_future<quic_session>(
-        quic_exception(quic_error::unsupported, "quic_server backend is not implemented yet"));
+    auto runtime = co_await _impl->accept();
+    co_return quic_session(std::move(runtime));
 }
 
 future<> quic_server::stop() {
-    return make_ready_future<>();
+    co_await _impl->stop();
 }
 
 } // namespace seastar::quic::experimental

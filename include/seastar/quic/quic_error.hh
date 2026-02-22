@@ -87,4 +87,14 @@ private:
     throw quic_exception(error, std::string(detail));
 }
 
+quic_error classify_ngtcp2_error(int code) noexcept;
+quic_error classify_gnutls_error(int code) noexcept;
+
+bool ngtcp2_is_write_more(int code) noexcept;
+bool ngtcp2_is_draining(int code) noexcept;
+bool ngtcp2_is_idle_close(int code) noexcept;
+
+std::string ngtcp2_error_message(int code);
+std::string gnutls_error_message(int code);
+
 } // namespace seastar::quic::experimental
