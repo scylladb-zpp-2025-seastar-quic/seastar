@@ -33,8 +33,8 @@ struct quic_server_config {
     socket_address listen_address;
     sstring cert_file;
     sstring key_file;
-    std::vector<sstring> alpns = {sstring("hq-interop"), sstring("h3")};
-    quic_session_options session_options{};
+    std::vector<sstring> alpns = {sstring("h3")};
+    connection_options session_options{};
 };
 
 class quic_server final {
@@ -49,7 +49,7 @@ public:
     quic_server& operator=(const quic_server&) = delete;
 
     future<> start(quic_server_config config);
-    future<quic_session> accept();
+    future<connection> accept();
     future<> stop();
 
 private:

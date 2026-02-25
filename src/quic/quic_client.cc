@@ -6,7 +6,7 @@
  *
  * You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -46,6 +46,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_ptr.hh>
 
 namespace seastar::quic::experimental {
 
@@ -147,7 +148,7 @@ future<> send_datagram(net::datagram_channel& channel, const socket_address& dst
     co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
 }
 
-struct client_state : public std::enable_shared_from_this<client_state> {
+struct client_state : public enable_lw_shared_from_this<client_state> {
     quic_client_config cfg{};
     internal::session_runtime_ptr runtime;
 
@@ -408,7 +409,7 @@ void init_client_connection(client_state& st) {
     st.tx_payload_limit = payload;
 }
 
-future<> flush_pending_packets_locked(std::shared_ptr<client_state> st) {
+future<> flush_pending_packets_locked(lw_shared_ptr<client_state> st) {
     if (!st->conn) {
         co_return;
     }
@@ -439,7 +440,7 @@ future<> flush_pending_packets_locked(std::shared_ptr<client_state> st) {
     }
 }
 
-future<> send_stream_message_locked(std::shared_ptr<client_state> st, quic_message msg) {
+future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message msg) {
     if (!st->conn) {
         co_return;
     }
@@ -534,7 +535,7 @@ future<> send_stream_message_locked(std::shared_ptr<client_state> st, quic_messa
     co_await flush_pending_packets_locked(st);
 }
 
-future<> recv_datagram_locked(std::shared_ptr<client_state> st, temporary_buffer<char> pkt) {
+future<> recv_datagram_locked(lw_shared_ptr<client_state> st, temporary_buffer<char> pkt) {
     if (!st->active() || !st->conn) {
         co_return;
     }
@@ -557,21 +558,21 @@ future<> recv_datagram_locked(std::shared_ptr<client_state> st, temporary_buffer
     st->wake_cv.signal();
 }
 
-future<> tx_send_locked(std::shared_ptr<client_state> st, quic_message msg) {
+future<> tx_send_locked(lw_shared_ptr<client_state> st, quic_message msg) {
     if (!st->active()) {
         co_return;
     }
     co_await send_stream_message_locked(st, std::move(msg));
 }
 
-future<uint64_t> read_expiry_locked(std::shared_ptr<client_state> st) {
+future<uint64_t> read_expiry_locked(lw_shared_ptr<client_state> st) {
     if (!st->conn) {
         co_return std::numeric_limits<uint64_t>::max();
     }
     co_return ngtcp2_conn_get_expiry(st->conn);
 }
 
-future<> handle_timer_locked(std::shared_ptr<client_state> st) {
+future<> handle_timer_locked(lw_shared_ptr<client_state> st) {
     if (!st->active() || !st->conn) {
         co_return;
     }
@@ -591,7 +592,7 @@ future<> handle_timer_locked(std::shared_ptr<client_state> st) {
     co_await flush_pending_packets_locked(st);
 }
 
-future<> recv_loop(std::shared_ptr<client_state> st) {
+future<> recv_loop(lw_shared_ptr<client_state> st) {
     while (st->active()) {
         net::datagram d(std::unique_ptr<net::datagram_impl>{});
         try {
@@ -614,7 +615,7 @@ future<> recv_loop(std::shared_ptr<client_state> st) {
     }
 }
 
-future<> tx_loop(std::shared_ptr<client_state> st) {
+future<> tx_loop(lw_shared_ptr<client_state> st) {
     while (st->active()) {
         while (!st->handshake_done && st->active()) {
             try {
@@ -649,7 +650,7 @@ future<> tx_loop(std::shared_ptr<client_state> st) {
     }
 }
 
-future<> timer_loop(std::shared_ptr<client_state> st) {
+future<> timer_loop(lw_shared_ptr<client_state> st) {
     while (st->active()) {
         auto expiry = co_await with_semaphore(st->conn_sem, 1, [st] {
             return read_expiry_locked(st);
@@ -681,7 +682,7 @@ future<> timer_loop(std::shared_ptr<client_state> st) {
     }
 }
 
-void start_background_tasks(const std::shared_ptr<client_state>& st) {
+void start_background_tasks(const lw_shared_ptr<client_state>& st) {
     (void)with_gate(st->task_gate, [st] { return recv_loop(st); })
       .handle_exception([st](std::exception_ptr) {
           if (st->active()) {
@@ -713,7 +714,7 @@ public:
         }
         ensure_gnutls_global();
 
-        auto st = std::make_shared<client_state>();
+        auto st = make_lw_shared<client_state>();
         st->cfg = std::move(config);
         st->runtime = internal::make_session_runtime(st->cfg.session_options);
         st->remote_address = st->cfg.remote_address;
@@ -761,7 +762,7 @@ public:
     }
 
 private:
-    std::shared_ptr<client_state> _state;
+    lw_shared_ptr<client_state> _state;
 };
 
 } // namespace
@@ -777,9 +778,9 @@ quic_client::~quic_client() = default;
 quic_client::quic_client(quic_client&&) noexcept = default;
 quic_client& quic_client::operator=(quic_client&&) noexcept = default;
 
-future<quic_session> quic_client::connect(quic_client_config config) {
+future<connection> quic_client::connect(quic_client_config config) {
     auto runtime = co_await _impl->connect(std::move(config));
-    co_return quic_session(std::move(runtime));
+    co_return connection(std::move(runtime));
 }
 
 future<> quic_client::stop() {

@@ -35,7 +35,7 @@ namespace {
 
 class basic_session_runtime final : public internal::session_runtime {
 public:
-    explicit basic_session_runtime(quic_session_options options)
+    explicit basic_session_runtime(connection_options options)
         : _options(std::move(options))
         , _default_stream(_options.initial_stream_id) {
     }
@@ -166,7 +166,7 @@ private:
         }
     }
 
-    quic_session_options _options;
+    connection_options _options;
     stream_id _default_stream = 0;
     bool _closed = false;
     quic_error _error = quic_error::none;
@@ -187,70 +187,70 @@ private:
 
 namespace internal {
 
-session_runtime_ptr make_session_runtime(quic_session_options options) {
-    return std::make_shared<basic_session_runtime>(std::move(options));
+session_runtime_ptr make_session_runtime(connection_options options) {
+    return make_lw_shared<basic_session_runtime>(std::move(options));
 }
 
 } // namespace internal
 
-quic_session::quic_session()
+connection::connection()
     : _runtime(internal::make_session_runtime()) {
 }
 
-quic_session::quic_session(internal::session_runtime_ptr runtime)
+connection::connection(internal::session_runtime_ptr runtime)
     : _runtime(std::move(runtime)) {
     if (!_runtime) {
         _runtime = internal::make_session_runtime();
     }
 }
 
-quic_session::~quic_session() = default;
-quic_session::quic_session(quic_session&&) noexcept = default;
-quic_session& quic_session::operator=(quic_session&&) noexcept = default;
+connection::~connection() = default;
+connection::connection(connection&&) noexcept = default;
+connection& connection::operator=(connection&&) noexcept = default;
 
-bool quic_session::is_open() const noexcept {
+bool connection::is_open() const noexcept {
     return _runtime && _runtime->is_open();
 }
 
-stream_id quic_session::default_stream() const noexcept {
+stream_id connection::default_stream() const noexcept {
     if (!_runtime) {
         return invalid_stream_id;
     }
     return _runtime->default_stream();
 }
 
-future<> quic_session::send(quic_message msg) {
+future<> connection::send(quic_message msg) {
     if (!_runtime) {
         throw_quic_error(quic_error::invalid_state, "session runtime is null");
     }
     return _runtime->send(std::move(msg));
 }
 
-future<> quic_session::send(stream_id sid, temporary_buffer<char> payload, bool fin) {
+future<> connection::send(stream_id sid, temporary_buffer<char> payload, bool fin) {
     return send(quic_message(sid, std::move(payload), fin));
 }
 
-future<> quic_session::send(stream_id sid, sstring payload, bool fin) {
+future<> connection::send(stream_id sid, sstring payload, bool fin) {
     temporary_buffer<char> tb(payload.size());
     std::memcpy(tb.get_write(), payload.data(), payload.size());
     return send(quic_message(sid, std::move(tb), fin));
 }
 
-future<quic_message> quic_session::receive() {
+future<quic_message> connection::receive() {
     if (!_runtime) {
         throw_quic_error(quic_error::invalid_state, "session runtime is null");
     }
     return _runtime->receive();
 }
 
-future<> quic_session::close() {
+future<> connection::close() {
     if (!_runtime) {
         co_return;
     }
     co_await _runtime->close();
 }
 
-internal::session_runtime_ptr quic_session::runtime() const noexcept {
+internal::session_runtime_ptr connection::runtime() const noexcept {
     return _runtime;
 }
 

@@ -82,7 +82,7 @@ private:
     bool _active = false;
 };
 
-static future<> receive_loop(std::shared_ptr<quic_session> session) {
+static future<> receive_loop(lw_shared_ptr<connection> session) {
     while (session->is_open()) {
         try {
             auto msg = co_await session->receive();
@@ -100,7 +100,7 @@ static future<> receive_loop(std::shared_ptr<quic_session> session) {
     }
 }
 
-static future<> input_loop(std::shared_ptr<quic_session> session, std::chrono::milliseconds poll_interval, bool verbose) {
+static future<> input_loop(lw_shared_ptr<connection> session, std::chrono::milliseconds poll_interval, bool verbose) {
     char buf[2048];
     while (session->is_open()) {
         auto n = ::read(STDIN_FILENO, buf, sizeof(buf));
@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
 
     return app.run(argc, argv, [&app]() -> future<int> {
         quic_client client;
-        std::shared_ptr<quic_session> session;
+        lw_shared_ptr<connection> session;
         std::exception_ptr error;
 
         try {
@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
             client_cfg.remote_address = parse_ipv6_address(address, port);
             client_cfg.server_name = server_name;
 
-            session = std::make_shared<quic_session>(co_await client.connect(std::move(client_cfg)));
+            session = make_lw_shared<connection>(co_await client.connect(std::move(client_cfg)));
             stdin_flag_guard guard(STDIN_FILENO);
 
             if (verbose) {

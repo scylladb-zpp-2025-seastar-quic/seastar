@@ -49,7 +49,7 @@ static socket_address parse_ipv6_address(const std::string& ip, uint16_t port) {
     return socket_address(sa);
 }
 
-static future<> handle_session(quic_session session, bool verbose) {
+static future<> handle_session(connection session, bool verbose) {
     try {
         while (session.is_open()) {
             auto msg = co_await session.receive();
@@ -82,7 +82,7 @@ static future<> handle_session(quic_session session, bool verbose) {
 
 static future<> accept_loop(quic_server& server, gate& sessions, bool verbose) {
     while (true) {
-        quic_session session;
+        connection session;
         try {
             session = co_await server.accept();
         } catch (const quic_exception& e) {

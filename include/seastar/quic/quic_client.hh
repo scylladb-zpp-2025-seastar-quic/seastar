@@ -34,8 +34,8 @@ struct quic_client_config {
     socket_address remote_address;
     std::optional<socket_address> local_address{};
     sstring server_name = "localhost";
-    std::vector<sstring> alpns = {sstring("hq-interop"), sstring("h3")};
-    quic_session_options session_options{};
+    std::vector<sstring> alpns = {sstring("h3")};
+    connection_options session_options{};
 };
 
 class quic_client final {
@@ -49,7 +49,7 @@ public:
     quic_client(const quic_client&) = delete;
     quic_client& operator=(const quic_client&) = delete;
 
-    future<quic_session> connect(quic_client_config config);
+    future<connection> connect(quic_client_config config);
     future<> stop();
 
 private:

@@ -50,7 +50,7 @@ struct quic_message {
     }
 };
 
-struct quic_transport_config {
+struct transport_config {
     uint64_t max_idle_timeout_ns = 60ULL * 1000 * 1000 * 1000;
     uint64_t initial_max_stream_data_bidi_local = 256 * 1024;
     uint64_t initial_max_stream_data_bidi_remote = 256 * 1024;
@@ -58,29 +58,29 @@ struct quic_transport_config {
     uint64_t initial_max_streams_bidi = 128;
 };
 
-struct quic_session_options {
+struct connection_options {
     stream_id initial_stream_id = 0;
     size_t max_pending_send_bytes = 4 * 1024 * 1024;
     size_t max_pending_receive_bytes = 4 * 1024 * 1024;
-    quic_transport_config transport{};
+    transport_config transport{};
 };
 
 namespace internal {
 class session_runtime;
-using session_runtime_ptr = std::shared_ptr<session_runtime>;
-session_runtime_ptr make_session_runtime(quic_session_options options = {});
+using session_runtime_ptr = lw_shared_ptr<session_runtime>;
+session_runtime_ptr make_session_runtime(connection_options options = {});
 }
 
-class quic_session final {
+class connection final {
 public:
-    quic_session();
-    ~quic_session();
+    connection();
+    ~connection();
 
-    quic_session(quic_session&&) noexcept;
-    quic_session& operator=(quic_session&&) noexcept;
+    connection(connection&&) noexcept;
+    connection& operator=(connection&&) noexcept;
 
-    quic_session(const quic_session&) = delete;
-    quic_session& operator=(const quic_session&) = delete;
+    connection(const connection&) = delete;
+    connection& operator=(const connection&) = delete;
 
     bool is_open() const noexcept;
     stream_id default_stream() const noexcept;
@@ -96,7 +96,7 @@ public:
     internal::session_runtime_ptr runtime() const noexcept;
 
 private:
-    explicit quic_session(internal::session_runtime_ptr runtime);
+    explicit connection(internal::session_runtime_ptr runtime);
 
     internal::session_runtime_ptr _runtime;
 

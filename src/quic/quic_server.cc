@@ -6,7 +6,7 @@
  *
  * You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -48,6 +48,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_ptr.hh>
 
 namespace seastar::quic::experimental {
 
@@ -176,7 +177,7 @@ dcid_parse_result parse_dcid(const uint8_t* pkt, size_t len, size_t short_dcid_l
         return result;
     }
 
-    const bool long_header = (pkt[0] & 0x80u) != 0;
+    const uint8_t long_header = (pkt[0] & 0x80u) != 0;
     result.long_header = long_header;
     if (long_header) {
         if (len < 1 + 4 + 1) {
@@ -207,7 +208,7 @@ dcid_parse_result parse_dcid(const uint8_t* pkt, size_t len, size_t short_dcid_l
 
 class quic_server_impl;
 
-struct server_connection : public std::enable_shared_from_this<server_connection> {
+struct server_connection : public enable_lw_shared_from_this<server_connection> {
     quic_server_impl* server = nullptr;
     internal::session_runtime_ptr runtime;
 
@@ -250,7 +251,7 @@ struct server_connection : public std::enable_shared_from_this<server_connection
     void fail(quic_error error, const sstring& detail);
 };
 
-using conn_ptr = std::shared_ptr<server_connection>;
+using conn_ptr = lw_shared_ptr<server_connection>;
 
 class quic_server_impl {
 public:
@@ -496,7 +497,7 @@ private:
     }
 
     conn_ptr init_connection(const socket_address& peer, const uint8_t* pkt, size_t pkt_len) {
-        auto conn = std::make_shared<server_connection>();
+        auto conn = make_lw_shared<server_connection>();
         conn->server = this;
         conn->runtime = internal::make_session_runtime(_cfg.session_options);
         conn->peer = peer;
@@ -941,9 +942,9 @@ future<> quic_server::start(quic_server_config config) {
     co_await _impl->start(std::move(config));
 }
 
-future<quic_session> quic_server::accept() {
+future<connection> quic_server::accept() {
     auto runtime = co_await _impl->accept();
-    co_return quic_session(std::move(runtime));
+    co_return connection(std::move(runtime));
 }
 
 future<> quic_server::stop() {
