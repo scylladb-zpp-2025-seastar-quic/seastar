@@ -49,6 +49,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/log.hh>
 
 namespace seastar::quic::experimental {
 
@@ -58,6 +59,8 @@ constexpr size_t max_cid_len = 20;
 constexpr size_t server_short_cid_len = 8;
 constexpr size_t max_udp_payload_size = 65527;
 constexpr size_t default_udp_payload_size = 1200;
+
+static logger quic_server_log("quic_server");
 
 class gnutls_global_guard {
 public:
@@ -146,6 +149,7 @@ future<> send_datagram(net::datagram_channel& channel, const socket_address& dst
     if (len == 0) {
         co_return;
     }
+    quic_server_log.trace("udp send datagram: dst={} bytes={}", dst, len);
     temporary_buffer<char> tb(len);
     std::memcpy(tb.get_write(), data, len);
     std::array<temporary_buffer<char>, 1> bufs{std::move(tb)};
@@ -260,6 +264,12 @@ public:
             throw_quic_error(quic_error::invalid_state, "server already started");
         }
         ensure_gnutls_global();
+        quic_server_log.info(
+          "server start: listen={} cert_file='{}' key_file='{}' alpn_count={}",
+          cfg.listen_address,
+          cfg.cert_file,
+          cfg.key_file,
+          cfg.alpns.size());
 
         _cfg = std::move(cfg);
         int rv = gnutls_certificate_allocate_credentials(&_cred);
@@ -278,10 +288,12 @@ public:
         _listen_address = _channel.local_address();
         _started = true;
         _stopping = false;
+        quic_server_log.info("server listening on {}", _listen_address);
 
         (void)with_gate(_task_gate, [this] { return receive_loop(); })
           .handle_exception([this](std::exception_ptr) {
               if (!_stopping) {
+                  quic_server_log.error("server receive loop failed");
                   _stopping = true;
                   _accept_cv.signal();
               }
@@ -294,6 +306,7 @@ public:
         if (!_started) {
             throw_quic_error(quic_error::invalid_state, "server is not started");
         }
+        quic_server_log.debug("server accept wait: pending_accepted={} active_conns={}", _accepted.size(), _conns.size());
 
         while (_accepted.empty()) {
             if (_stopping) {
@@ -304,14 +317,22 @@ public:
 
         auto runtime = std::move(_accepted.front());
         _accepted.pop_front();
+        quic_server_log.info("server accept ready: pending_accepted={} active_conns={}", _accepted.size(), _conns.size());
         co_return runtime;
     }
 
     future<> stop() {
         if (!_started) {
+            quic_server_log.debug("server stop ignored: not started");
             co_return;
         }
 
+        quic_server_log.info(
+          "server stop start: listen={} active_conns={} pending_accepted={} mapped_dcids={}",
+          _listen_address,
+          _conns.size(),
+          _accepted.size(),
+          _by_dcid.size());
         _stopping = true;
         _accept_cv.signal();
 
@@ -342,6 +363,7 @@ public:
         _started = false;
         _stopping = false;
         _channel_ready = false;
+        quic_server_log.info("server stop complete");
     }
 
     bool stopping() const noexcept {
@@ -356,6 +378,7 @@ public:
         auto key = cid_key(cid, len);
         _by_dcid[key] = conn;
         conn->mapped_dcids.insert(std::move(key));
+        quic_server_log.debug("server map DCID: len={} total_mapped={} conn_mapped={}", len, _by_dcid.size(), conn->mapped_dcids.size());
     }
 
     void unmap_dcid(const conn_ptr& conn, const uint8_t* cid, size_t len) {
@@ -365,9 +388,11 @@ public:
             _by_dcid.erase(it);
         }
         conn->mapped_dcids.erase(key);
+        quic_server_log.debug("server unmap DCID: len={} total_mapped={} conn_mapped={}", len, _by_dcid.size(), conn->mapped_dcids.size());
     }
 
     void unregister_connection(const conn_ptr& conn) {
+        quic_server_log.info("server unregister connection: peer={} mapped_dcids={} active_conns_before={}", conn->peer, conn->mapped_dcids.size(), _conns.size());
         for (const auto& key : conn->mapped_dcids) {
             auto it = _by_dcid.find(key);
             if (it != _by_dcid.end() && it->second == conn) {
@@ -377,10 +402,12 @@ public:
         conn->mapped_dcids.clear();
 
         _conns.erase(std::remove(_conns.begin(), _conns.end(), conn), _conns.end());
+        quic_server_log.info("server connection unregistered: active_conns={} mapped_dcids={}", _conns.size(), _by_dcid.size());
     }
 
     void enqueue_accepted_session(const internal::session_runtime_ptr& runtime) {
         _accepted.push_back(runtime);
+        quic_server_log.debug("server queued accepted session: pending_accepted={}", _accepted.size());
         _accept_cv.signal();
     }
 
@@ -420,6 +447,7 @@ private:
     }
 
     static int handshake_completed_cb(ngtcp2_conn*, void*) {
+        quic_server_log.info("server handshake completed");
         return 0;
     }
 
@@ -430,8 +458,10 @@ private:
         }
         auto self = conn->shared_from_this();
         if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_ACTIVATE) {
+            quic_server_log.debug("server dcid activate: peer={} len={}", conn->peer, cid->datalen);
             conn->server->map_dcid(self, cid->data, cid->datalen);
         } else if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_DEACTIVATE) {
+            quic_server_log.debug("server dcid deactivate: peer={} len={}", conn->peer, cid->datalen);
             conn->server->unmap_dcid(self, cid->data, cid->datalen);
         }
         return 0;
@@ -440,8 +470,11 @@ private:
     static int recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t, const uint8_t* data, size_t datalen, void* user_data, void*) {
         auto* conn = static_cast<server_connection*>(user_data);
         if (!conn || !conn->runtime || !conn->runtime->is_open()) {
+            quic_server_log.trace("server drop recv_stream_data: sid={} bytes={} conn_valid={} runtime_open={}",
+              sid, datalen, conn != nullptr, conn && conn->runtime && conn->runtime->is_open());
             return 0;
         }
+        quic_server_log.trace("server recv_stream_data: peer={} sid={} bytes={}", conn->peer, sid, datalen);
         conn->runtime->mark_ready(sid);
         temporary_buffer<char> tb(datalen);
         if (datalen) {
@@ -497,6 +530,7 @@ private:
     }
 
     conn_ptr init_connection(const socket_address& peer, const uint8_t* pkt, size_t pkt_len) {
+        quic_server_log.info("server init_connection: peer={} first_packet_bytes={}", peer, pkt_len);
         auto conn = make_lw_shared<server_connection>();
         conn->server = this;
         conn->runtime = internal::make_session_runtime(_cfg.session_options);
@@ -589,6 +623,13 @@ private:
         map_dcid(conn, scid.data, scid.datalen);
         _conns.push_back(conn);
         enqueue_accepted_session(conn->runtime);
+        quic_server_log.info(
+          "server connection initialized: peer={} tx_payload_limit={} active_conns={} odcid_len={} scid_len={}",
+          conn->peer,
+          conn->tx_payload_limit,
+          _conns.size(),
+          odcid.datalen,
+          scid.datalen);
 
         (void)with_gate(_task_gate, [conn] { return conn_tx_loop(conn); })
           .handle_exception([conn](std::exception_ptr) {
@@ -617,29 +658,39 @@ private:
             ngtcp2_ssize nwrite =
               ngtcp2_conn_write_pkt(conn->conn, &path, &pkt_info, outbuf.data(), outbuf.size(), now_ns());
             if (nwrite == 0) {
+                quic_server_log.trace("server flush_pending_packets: no packet produced peer={}", conn->peer);
                 co_return;
             }
             if (nwrite < 0) {
                 if (ngtcp2_is_write_more(nwrite)) {
+                    quic_server_log.trace("server flush_pending_packets: write_more peer={}", conn->peer);
                     continue;
                 }
                 if (ngtcp2_is_draining(nwrite)) {
+                    quic_server_log.info("server flush_pending_packets: draining peer={}", conn->peer);
                     conn->stop_transport();
                     conn->server->unregister_connection(conn);
                     co_return;
                 }
+                quic_server_log.warn("server flush_pending_packets failed: peer={} nwrite={} msg={}",
+                  conn->peer, nwrite, ngtcp2_error_message((int)nwrite));
                 conn->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
                 conn->server->unregister_connection(conn);
                 co_return;
             }
+            quic_server_log.trace("server flush_pending_packets: peer={} wrote {} bytes", conn->peer, nwrite);
             co_await send_datagram(conn->server->channel(), conn->peer, outbuf.data(), static_cast<size_t>(nwrite));
         }
     }
 
     static future<> send_stream_message_locked(conn_ptr conn, quic_message msg) {
         if (!conn->conn || msg.stream == invalid_stream_id) {
+            quic_server_log.debug("server send_stream_message skipped: peer={} conn_present={} sid={}",
+              conn->peer, conn->conn != nullptr, msg.stream);
             co_return;
         }
+        quic_server_log.debug("server send_stream_message start: peer={} sid={} bytes={} fin={}",
+          conn->peer, msg.stream, msg.payload.size(), msg.fin);
 
         size_t offset = 0;
         bool send_fin = msg.fin;
@@ -683,19 +734,25 @@ private:
                     if (consumed > 0) {
                         offset += static_cast<size_t>(consumed);
                     }
+                    quic_server_log.trace("server writev_stream: write_more peer={} sid={} consumed={} offset={}",
+                      conn->peer, msg.stream, consumed, offset);
                     co_await flush_pending_packets_locked(conn);
                     continue;
                 }
                 if (ngtcp2_is_draining(nwrite)) {
+                    quic_server_log.info("server writev_stream: draining peer={} sid={}", conn->peer, msg.stream);
                     conn->stop_transport();
                     conn->server->unregister_connection(conn);
                     co_return;
                 }
+                quic_server_log.warn("server writev_stream failed: peer={} sid={} nwrite={} msg={}",
+                  conn->peer, msg.stream, nwrite, ngtcp2_error_message((int)nwrite));
                 conn->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
                 conn->server->unregister_connection(conn);
                 co_return;
             }
             if (nwrite == 0) {
+                quic_server_log.trace("server writev_stream produced 0 bytes: peer={} sid={}", conn->peer, msg.stream);
                 co_await flush_pending_packets_locked(conn);
                 continue;
             }
@@ -706,6 +763,15 @@ private:
             if (!remaining && send_fin) {
                 send_fin = false;
             }
+            quic_server_log.trace(
+              "server writev_stream sent packet: peer={} sid={} packet_bytes={} consumed={} offset={} total={} fin_pending={}",
+              conn->peer,
+              msg.stream,
+              nwrite,
+              consumed,
+              offset,
+              msg.payload.size(),
+              send_fin);
             co_await send_datagram(conn->server->channel(), conn->peer, outbuf.data(), static_cast<size_t>(nwrite));
 
             if (offset >= msg.payload.size() && !send_fin) {
@@ -714,6 +780,8 @@ private:
         }
 
         co_await flush_pending_packets_locked(conn);
+        quic_server_log.debug("server send_stream_message done: peer={} sid={} bytes={} fin={}",
+          conn->peer, msg.stream, msg.payload.size(), msg.fin);
     }
 
     static future<> conn_tx_send_locked(conn_ptr conn, quic_message msg) {
@@ -739,10 +807,13 @@ private:
             int rv = ngtcp2_conn_handle_expiry(conn->conn, now_local);
             if (rv < 0) {
                 if (ngtcp2_is_idle_close(rv) || ngtcp2_is_draining(rv)) {
+                    quic_server_log.info("server timer expiry: closing/draining peer={} rv={}", conn->peer, rv);
                     conn->stop_transport();
                     conn->server->unregister_connection(conn);
                     co_return;
                 }
+                quic_server_log.warn("server timer expiry handling failed: peer={} rv={} msg={}",
+                  conn->peer, rv, ngtcp2_error_message(rv));
                 conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
                 conn->server->unregister_connection(conn);
                 co_return;
@@ -755,6 +826,7 @@ private:
         if (!conn->active() || !conn->conn) {
             co_return;
         }
+        quic_server_log.trace("server handle_conn_datagram_locked: peer={} bytes={}", conn->peer, pkt.size());
 
         ngtcp2_path path{};
         conn->fill_path(path);
@@ -764,10 +836,13 @@ private:
           conn->conn, &path, &pkt_info, reinterpret_cast<const uint8_t*>(pkt.get()), pkt.size(), now_ns());
         if (rv < 0) {
             if (ngtcp2_is_draining(rv)) {
+                quic_server_log.info("server read_pkt draining: peer={}", conn->peer);
                 conn->stop_transport();
                 conn->server->unregister_connection(conn);
                 co_return;
             }
+            quic_server_log.warn("server read_pkt failed: peer={} rv={} msg={}",
+              conn->peer, rv, ngtcp2_error_message(rv));
             conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
             conn->server->unregister_connection(conn);
             co_return;
@@ -784,16 +859,22 @@ private:
                 msg = co_await conn->runtime->pop_outgoing();
             } catch (const quic_exception& e) {
                 if (e.code() == quic_error::closed) {
+                    quic_server_log.debug("server conn_tx_loop exiting on closed runtime: peer={}", conn->peer);
                     co_return;
                 }
+                quic_server_log.warn("server conn_tx_loop pop_outgoing error: peer={} code={} detail='{}'",
+                  conn->peer, to_string(e.code()), e.what());
                 conn->fail(e.code(), e.what());
                 conn->server->unregister_connection(conn);
                 co_return;
             } catch (...) {
+                quic_server_log.error("server conn_tx_loop unexpected pop_outgoing failure: peer={}", conn->peer);
                 conn->fail(quic_error::internal, "server pop_outgoing failed");
                 conn->server->unregister_connection(conn);
                 co_return;
             }
+            quic_server_log.trace("server conn_tx_loop popped message: peer={} sid={} bytes={} fin={}",
+              conn->peer, msg.stream, msg.payload.size(), msg.fin);
 
             co_await with_semaphore(conn->conn_sem, 1, [conn, msg = std::move(msg)]() mutable {
                 return conn_tx_send_locked(conn, std::move(msg));
@@ -839,9 +920,11 @@ private:
         auto pkt = linearize_packet(d.get_buffers());
         const auto* data = reinterpret_cast<const uint8_t*>(pkt.get());
         const size_t len = pkt.size();
+        quic_server_log.trace("server received datagram: src={} bytes={}", src, len);
 
         auto parsed = parse_dcid(data, len, server_short_cid_len);
         if (!parsed.ok) {
+            quic_server_log.debug("server drop datagram: failed to parse DCID src={} bytes={}", src, len);
             co_return;
         }
 
@@ -853,20 +936,25 @@ private:
 
         if (!conn) {
             if (!parsed.long_header || parsed.long_type != quic_long_type::initial) {
+                quic_server_log.debug("server drop datagram: unknown DCID and not Initial src={} long_header={} long_type={}",
+                  src, parsed.long_header, static_cast<unsigned>(parsed.long_type));
                 co_return;
             }
             try {
                 conn = init_connection(src, data, len);
             } catch (...) {
+                quic_server_log.warn("server failed to initialize connection from Initial packet: src={} bytes={}", src, len);
                 co_return;
             }
         }
 
         if (!conn || conn->closing) {
+            quic_server_log.debug("server drop datagram: conn missing/closing src={}", src);
             co_return;
         }
 
         if (conn->peer != src) {
+            quic_server_log.info("server peer address updated: old={} new={}", conn->peer, src);
             conn->peer = src;
             to_sockaddr_storage_v6(src, conn->peer_ss, conn->peer_ss_len);
         }
@@ -885,6 +973,7 @@ private:
                 if (_stopping) {
                     co_return;
                 }
+                quic_server_log.error("server receive_loop channel receive failed");
             }
         }
     }
@@ -910,6 +999,7 @@ bool server_connection::active() const noexcept {
 }
 
 void server_connection::stop_transport() {
+    quic_server_log.info("server connection stop_transport: peer={} closing={} mapped_dcids={}", peer, closing, mapped_dcids.size());
     closing = true;
     if (runtime) {
         runtime->mark_transport_closed();
@@ -918,6 +1008,13 @@ void server_connection::stop_transport() {
 }
 
 void server_connection::fail(quic_error error, const sstring& detail) {
+    quic_server_log.error(
+      "server connection failure: peer={} error={} detail='{}' closing={} mapped_dcids={}",
+      peer,
+      to_string(error),
+      detail,
+      closing,
+      mapped_dcids.size());
     closing = true;
     if (runtime) {
         runtime->mark_error(error, detail);
@@ -939,15 +1036,18 @@ quic_server::quic_server(quic_server&&) noexcept = default;
 quic_server& quic_server::operator=(quic_server&&) noexcept = default;
 
 future<> quic_server::start(quic_server_config config) {
+    quic_server_log.debug("quic_server::start");
     co_await _impl->start(std::move(config));
 }
 
 future<connection> quic_server::accept() {
+    quic_server_log.debug("quic_server::accept");
     auto runtime = co_await _impl->accept();
     co_return connection(std::move(runtime));
 }
 
 future<> quic_server::stop() {
+    quic_server_log.debug("quic_server::stop");
     co_await _impl->stop();
 }
 

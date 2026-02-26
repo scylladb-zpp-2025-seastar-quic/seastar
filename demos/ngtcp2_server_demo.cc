@@ -21,6 +21,7 @@
 
 #include <arpa/inet.h>
 
+#include <atomic>
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -49,12 +50,12 @@ static socket_address parse_ipv6_address(const std::string& ip, uint16_t port) {
     return socket_address(sa);
 }
 
-static future<> handle_session(connection session, bool verbose) {
+static future<> handle_session(connection session, bool verbose, uint64_t conn_id) {
     try {
         while (session.is_open()) {
             auto msg = co_await session.receive();
             if (verbose) {
-                std::cout << "[server] recv sid=" << msg.stream
+                std::cout << "[server conn#" << conn_id << "] recv sid=" << msg.stream
                           << " bytes=" << msg.payload.size() << "\n";
             } else {
                 std::cout.write(msg.payload.get(), static_cast<std::streamsize>(msg.payload.size()));
@@ -68,10 +69,10 @@ static future<> handle_session(connection session, bool verbose) {
         }
     } catch (const quic_exception& e) {
         if (e.code() != quic_error::closed) {
-            std::cerr << "[server] session error: " << e.what() << "\n";
+            std::cerr << "[server conn#" << conn_id << "] session error: " << e.what() << "\n";
         }
     } catch (const std::exception& e) {
-        std::cerr << "[server] session exception: " << e.what() << "\n";
+        std::cerr << "[server conn#" << conn_id << "] session exception: " << e.what() << "\n";
     }
 
     try {
@@ -81,6 +82,7 @@ static future<> handle_session(connection session, bool verbose) {
 }
 
 static future<> accept_loop(quic_server& server, gate& sessions, bool verbose) {
+    static std::atomic<uint64_t> next_conn_id{1};
     while (true) {
         connection session;
         try {
@@ -91,9 +93,14 @@ static future<> accept_loop(quic_server& server, gate& sessions, bool verbose) {
             }
             throw;
         }
+        auto conn_id = next_conn_id.fetch_add(1, std::memory_order_relaxed);
+        if (verbose) {
+            std::cout << "[server conn#" << conn_id << "] accepted\n";
+            std::cout.flush();
+        }
 
         (void)with_gate(
-          sessions, [session = std::move(session), verbose]() mutable { return handle_session(std::move(session), verbose); })
+          sessions, [session = std::move(session), verbose, conn_id]() mutable { return handle_session(std::move(session), verbose, conn_id); })
           .handle_exception([](std::exception_ptr ep) {
               try {
                   std::rethrow_exception(ep);

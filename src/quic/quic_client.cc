@@ -47,6 +47,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/log.hh>
 
 namespace seastar::quic::experimental {
 
@@ -54,6 +55,8 @@ namespace {
 
 constexpr size_t max_udp_payload_size = 65527;
 constexpr size_t default_udp_payload_size = 1200;
+
+static logger quic_client_log("quic_client");
 
 class gnutls_global_guard {
 public:
@@ -142,6 +145,7 @@ future<> send_datagram(net::datagram_channel& channel, const socket_address& dst
     if (len == 0) {
         co_return;
     }
+    quic_client_log.trace("udp send datagram: dst={} bytes={}", dst, len);
     temporary_buffer<char> tb(len);
     std::memcpy(tb.get_write(), data, len);
     std::array<temporary_buffer<char>, 1> bufs{std::move(tb)};
@@ -205,6 +209,14 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 
     void stop_transport() {
+        quic_client_log.info(
+          "client transport stop: local={} remote={} handshake_done={} stream_opened={} stream_sid={} channel_ready={}",
+          local_address,
+          remote_address,
+          handshake_done,
+          stream_opened,
+          stream_sid,
+          channel_ready);
         stopping = true;
         if (runtime) {
             runtime->mark_transport_closed();
@@ -218,6 +230,15 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 
     void fail(quic_error err, const sstring& detail) {
+        quic_client_log.error(
+          "client transport failure: error={} detail='{}' local={} remote={} handshake_done={} stream_opened={} stream_sid={}",
+          to_string(err),
+          detail,
+          local_address,
+          remote_address,
+          handshake_done,
+          stream_opened,
+          stream_sid);
         stopping = true;
         if (runtime) {
             runtime->mark_error(err, detail);
@@ -254,6 +275,7 @@ int get_path_challenge_data_cb(ngtcp2_conn*, uint8_t* data, void*) {
 int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
     auto* st = static_cast<client_state*>(user_data);
     st->handshake_done = true;
+    quic_client_log.info("client handshake completed");
 
     if (!st->stream_opened && st->conn) {
         int64_t sid = invalid_stream_id;
@@ -262,6 +284,9 @@ int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
             st->stream_opened = true;
             st->stream_sid = sid;
             st->runtime->mark_ready(sid);
+            quic_client_log.info("client opened default bidi stream sid={}", sid);
+        } else {
+            quic_client_log.warn("client failed to open bidi stream after handshake: rv={}", rv);
         }
     }
 
@@ -273,8 +298,10 @@ int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
 int recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t, const uint8_t* data, size_t datalen, void* user_data, void*) {
     auto* st = static_cast<client_state*>(user_data);
     if (!st->runtime || !st->runtime->is_open()) {
+        quic_client_log.trace("client drop recv_stream_data: sid={} bytes={} runtime_open={}", sid, datalen, st->runtime && st->runtime->is_open());
         return 0;
     }
+    quic_client_log.trace("client recv_stream_data: sid={} bytes={}", sid, datalen);
     temporary_buffer<char> tb(datalen);
     if (datalen) {
         std::memcpy(tb.get_write(), data, datalen);
@@ -284,6 +311,10 @@ int recv_stream_data_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t, const uin
 }
 
 void init_tls(client_state& st) {
+    quic_client_log.debug(
+      "client init_tls: server_name='{}' alpn_count={}",
+      st.cfg.server_name,
+      st.cfg.alpns.size());
     int rv = gnutls_certificate_allocate_credentials(&st.cred);
     if (rv < 0) {
         throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
@@ -335,6 +366,7 @@ void init_tls(client_state& st) {
     st.conn_ref.get_conn = get_conn;
     st.conn_ref.user_data = nullptr;
     gnutls_session_set_ptr(st.tls, &st.conn_ref);
+    quic_client_log.debug("client TLS initialized");
 }
 
 ngtcp2_cid random_cid(size_t len) {
@@ -407,6 +439,12 @@ void init_client_connection(client_state& st) {
         payload = max_udp_payload_size;
     }
     st.tx_payload_limit = payload;
+    quic_client_log.info(
+      "client QUIC connection initialized: local={} remote={} tx_payload_limit={} initial_stream_id={}",
+      st.local_address,
+      st.remote_address,
+      st.tx_payload_limit,
+      st.cfg.session_options.initial_stream_id);
 }
 
 future<> flush_pending_packets_locked(lw_shared_ptr<client_state> st) {
@@ -423,19 +461,24 @@ future<> flush_pending_packets_locked(lw_shared_ptr<client_state> st) {
         ngtcp2_ssize nwrite =
           ngtcp2_conn_write_pkt(st->conn, &path, &pkt_info, outbuf.data(), outbuf.size(), now_ns());
         if (nwrite == 0) {
+            quic_client_log.trace("client flush_pending_packets: no packet produced");
             co_return;
         }
         if (nwrite < 0) {
             if (ngtcp2_is_write_more(nwrite)) {
+                quic_client_log.trace("client flush_pending_packets: write_more");
                 continue;
             }
             if (ngtcp2_is_draining(nwrite)) {
+                quic_client_log.info("client flush_pending_packets: connection draining");
                 st->stop_transport();
                 co_return;
             }
+            quic_client_log.warn("client flush_pending_packets failed: nwrite={} msg={}", nwrite, ngtcp2_error_message((int)nwrite));
             st->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
             co_return;
         }
+        quic_client_log.trace("client flush_pending_packets: wrote {} bytes", nwrite);
         co_await send_datagram(st->channel, st->remote_address, outbuf.data(), static_cast<size_t>(nwrite));
     }
 }
@@ -444,6 +487,13 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
     if (!st->conn) {
         co_return;
     }
+    quic_client_log.debug(
+      "client send_stream_message start: requested_sid={} bytes={} fin={} stream_opened={} default_sid={}",
+      msg.stream,
+      msg.payload.size(),
+      msg.fin,
+      st->stream_opened,
+      st->stream_sid);
 
     if (!st->stream_opened) {
         int64_t sid = invalid_stream_id;
@@ -452,10 +502,13 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
             st->stream_opened = true;
             st->stream_sid = sid;
             st->runtime->mark_ready(sid);
+            quic_client_log.info("client lazily opened bidi stream sid={}", sid);
         } else if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) {
+            quic_client_log.debug("client stream open blocked, flushing pending packets");
             co_await flush_pending_packets_locked(st);
             co_return;
         } else {
+            quic_client_log.warn("client failed opening bidi stream: rv={} msg={}", rv, ngtcp2_error_message(rv));
             st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
             co_return;
         }
@@ -504,17 +557,21 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
                 if (consumed > 0) {
                     offset += static_cast<size_t>(consumed);
                 }
+                quic_client_log.trace("client writev_stream: write_more sid={} consumed={} offset={}", sid, consumed, offset);
                 co_await flush_pending_packets_locked(st);
                 continue;
             }
             if (ngtcp2_is_draining(nwrite)) {
+                quic_client_log.info("client writev_stream: connection draining sid={}", sid);
                 st->stop_transport();
                 co_return;
             }
+            quic_client_log.warn("client writev_stream failed: sid={} nwrite={} msg={}", sid, nwrite, ngtcp2_error_message((int)nwrite));
             st->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
             co_return;
         }
         if (nwrite == 0) {
+            quic_client_log.trace("client writev_stream produced 0 bytes, flushing sid={}", sid);
             co_await flush_pending_packets_locked(st);
             continue;
         }
@@ -525,6 +582,14 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
         if (!remaining && send_fin) {
             send_fin = false;
         }
+        quic_client_log.trace(
+          "client writev_stream sent packet: sid={} packet_bytes={} consumed={} offset={} total={} fin_pending={}",
+          sid,
+          nwrite,
+          consumed,
+          offset,
+          msg.payload.size(),
+          send_fin);
         co_await send_datagram(st->channel, st->remote_address, outbuf.data(), static_cast<size_t>(nwrite));
 
         if (offset >= msg.payload.size() && !send_fin) {
@@ -533,12 +598,14 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
     }
 
     co_await flush_pending_packets_locked(st);
+    quic_client_log.debug("client send_stream_message done: sid={} total_bytes={} fin={}", sid, msg.payload.size(), msg.fin);
 }
 
 future<> recv_datagram_locked(lw_shared_ptr<client_state> st, temporary_buffer<char> pkt) {
     if (!st->active() || !st->conn) {
         co_return;
     }
+    quic_client_log.trace("client recv_datagram_locked: bytes={}", pkt.size());
 
     ngtcp2_path path{};
     st->fill_path(path);
@@ -547,9 +614,11 @@ future<> recv_datagram_locked(lw_shared_ptr<client_state> st, temporary_buffer<c
       st->conn, &path, &pkt_info, reinterpret_cast<const uint8_t*>(pkt.get()), pkt.size(), now_ns());
     if (rv < 0) {
         if (ngtcp2_is_draining(rv)) {
+            quic_client_log.info("client recv_datagram_locked: connection draining");
             st->stop_transport();
             co_return;
         }
+        quic_client_log.warn("client recv_datagram_locked failed: rv={} msg={}", rv, ngtcp2_error_message(rv));
         st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
         co_return;
     }
@@ -601,6 +670,7 @@ future<> recv_loop(lw_shared_ptr<client_state> st) {
             if (st->stopping || !st->runtime->is_open()) {
                 co_return;
             }
+            quic_client_log.error("client recv_loop datagram receive failed");
             st->fail(quic_error::io, "datagram receive failed");
             co_return;
         }
@@ -608,6 +678,7 @@ future<> recv_loop(lw_shared_ptr<client_state> st) {
         auto src = d.get_src();
         to_sockaddr_storage_v6(src, st->remote_ss, st->remote_ss_len);
         auto pkt = linearize_packet(d.get_buffers());
+        quic_client_log.trace("client recv_loop datagram: src={} bytes={}", src, pkt.size());
 
         co_await with_semaphore(st->conn_sem, 1, [st, pkt = std::move(pkt)]() mutable {
             return recv_datagram_locked(st, std::move(pkt));
@@ -634,14 +705,18 @@ future<> tx_loop(lw_shared_ptr<client_state> st) {
             msg = co_await st->runtime->pop_outgoing();
         } catch (const quic_exception& e) {
             if (e.code() == quic_error::closed) {
+                quic_client_log.debug("client tx_loop exiting on closed runtime");
                 co_return;
             }
+            quic_client_log.warn("client tx_loop pop_outgoing error: code={} detail='{}'", to_string(e.code()), e.what());
             st->fail(e.code(), e.what());
             co_return;
         } catch (...) {
+            quic_client_log.error("client tx_loop pop_outgoing unexpected failure");
             st->fail(quic_error::internal, "pop_outgoing failed");
             co_return;
         }
+        quic_client_log.trace("client tx_loop popped message: sid={} bytes={} fin={}", msg.stream, msg.payload.size(), msg.fin);
 
         co_await with_semaphore(st->conn_sem, 1, [st, msg = std::move(msg)]() mutable {
             return tx_send_locked(st, std::move(msg));
@@ -683,6 +758,7 @@ future<> timer_loop(lw_shared_ptr<client_state> st) {
 }
 
 void start_background_tasks(const lw_shared_ptr<client_state>& st) {
+    quic_client_log.debug("client starting background tasks");
     (void)with_gate(st->task_gate, [st] { return recv_loop(st); })
       .handle_exception([st](std::exception_ptr) {
           if (st->active()) {
@@ -713,6 +789,12 @@ public:
             throw_quic_error(quic_error::invalid_state, "client is already connected");
         }
         ensure_gnutls_global();
+        quic_client_log.info(
+          "client connect start: remote={} local={} server_name='{}' alpn_count={}",
+          config.remote_address,
+          config.local_address.value_or(socket_address(ipv6_addr{0})),
+          config.server_name,
+          config.alpns.size());
 
         auto st = make_lw_shared<client_state>();
         st->cfg = std::move(config);
@@ -736,7 +818,17 @@ public:
 
             start_background_tasks(st);
             _state = st;
+            quic_client_log.info(
+              "client connect initialized: local={} remote={} tx_payload_limit={} handshake_done={}",
+              st->local_address,
+              st->remote_address,
+              st->tx_payload_limit,
+              st->handshake_done);
+        } catch (const quic_exception& e) {
+            quic_client_log.error("client connect failed: code={} detail='{}'", to_string(e.code()), e.what());
+            init_error = std::current_exception();
         } catch (...) {
+            quic_client_log.error("client connect failed: unexpected exception");
             init_error = std::current_exception();
         }
 
@@ -751,14 +843,17 @@ public:
 
     future<> stop() {
         if (!_state) {
+            quic_client_log.debug("client stop ignored: not connected");
             co_return;
         }
         auto st = std::exchange(_state, {});
+        quic_client_log.info("client stop start: local={} remote={}", st->local_address, st->remote_address);
         st->stop_transport();
         co_await st->task_gate.close();
         if (st->channel_ready && !st->channel.is_closed()) {
             st->channel.close();
         }
+        quic_client_log.info("client stop complete");
     }
 
 private:
@@ -779,11 +874,13 @@ quic_client::quic_client(quic_client&&) noexcept = default;
 quic_client& quic_client::operator=(quic_client&&) noexcept = default;
 
 future<connection> quic_client::connect(quic_client_config config) {
+    quic_client_log.debug("quic_client::connect");
     auto runtime = co_await _impl->connect(std::move(config));
     co_return connection(std::move(runtime));
 }
 
 future<> quic_client::stop() {
+    quic_client_log.debug("quic_client::stop");
     co_await _impl->stop();
 }
 

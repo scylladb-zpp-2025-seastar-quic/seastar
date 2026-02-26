@@ -67,7 +67,7 @@ struct connection_options {
 
 namespace internal {
 class session_runtime;
-using session_runtime_ptr = lw_shared_ptr<session_runtime>;
+using session_runtime_ptr = std::shared_ptr<session_runtime>;
 session_runtime_ptr make_session_runtime(connection_options options = {});
 }
 
