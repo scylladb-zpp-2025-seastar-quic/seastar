@@ -143,11 +143,6 @@ int main(int argc, char** argv) {
         std::exception_ptr error;
 
         try {
-            if (smp::count != 1) {
-                std::cerr << "[client] This demo currently supports only --smp 1 (or -c1).\n";
-                co_return 1;
-            }
-
             auto&& cfg = app.configuration();
             auto address = cfg["address"].as<std::string>();
             auto port = cfg["port"].as<uint16_t>();

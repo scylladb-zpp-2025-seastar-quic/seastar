@@ -21,7 +21,6 @@
 
 #include <arpa/inet.h>
 
-#include <atomic>
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -82,7 +81,7 @@ static future<> handle_session(connection session, bool verbose, uint64_t conn_i
 }
 
 static future<> accept_loop(quic_server& server, gate& sessions, bool verbose) {
-    static std::atomic<uint64_t> next_conn_id{1};
+    uint64_t next_conn_id = 1;
     while (true) {
         connection session;
         try {
@@ -93,7 +92,7 @@ static future<> accept_loop(quic_server& server, gate& sessions, bool verbose) {
             }
             throw;
         }
-        auto conn_id = next_conn_id.fetch_add(1, std::memory_order_relaxed);
+        auto conn_id = next_conn_id++;
         if (verbose) {
             std::cout << "[server conn#" << conn_id << "] accepted\n";
             std::cout.flush();
@@ -128,11 +127,6 @@ int main(int argc, char** argv) {
         std::exception_ptr error;
 
         try {
-            if (smp::count != 1) {
-                std::cerr << "[server] This demo currently supports only --smp 1 (or -c1).\n";
-                co_return 1;
-            }
-
             auto&& cfg = app.configuration();
             auto address = cfg["address"].as<std::string>();
             auto port = cfg["port"].as<uint16_t>();
