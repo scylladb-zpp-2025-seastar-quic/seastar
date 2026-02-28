@@ -295,7 +295,7 @@ namespace internal {
 
 session_runtime_ptr make_session_runtime(connection_options options) {
     quic_rt_log.debug("make_session_runtime called");
-    return std::make_shared<basic_session_runtime>(std::move(options));
+    return seastar::make_shared<basic_session_runtime>(std::move(options));
 }
 
 } // namespace internal

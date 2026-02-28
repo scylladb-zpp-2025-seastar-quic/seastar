@@ -39,6 +39,8 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/quic/quic_client.hh>
 
+#include "../apps/lib/stop_signal.hh"
+
 using namespace seastar;
 using namespace seastar::quic::experimental;
 namespace bpo = boost::program_options;
@@ -161,6 +163,16 @@ int main(int argc, char** argv) {
                 std::cout << "[client] connected to [" << address << "]:" << port << "\n";
                 std::cout.flush();
             }
+
+            seastar_apps_lib::stop_signal stop_signal;
+            auto stop_task = stop_signal.wait().then([session]() {
+                if (session && session->is_open()) {
+                    std::cout << "[client] SIGINT received, closing session...\n";
+                    std::cout.flush();
+                    return session->close();
+                }
+                return make_ready_future<>();
+            }).handle_exception([](std::exception_ptr) {});
 
             co_await when_all_succeed(
                        receive_loop(session),

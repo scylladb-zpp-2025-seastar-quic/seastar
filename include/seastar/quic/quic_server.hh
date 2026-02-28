@@ -31,7 +31,7 @@ namespace seastar::quic::experimental {
 
 struct quic_server_config {
     socket_address listen_address;
-    sstring cert_file;
+    sstring crt_file;
     sstring key_file;
     std::vector<sstring> alpns = {sstring("h3")};
     connection_options session_options{};

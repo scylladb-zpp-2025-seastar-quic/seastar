@@ -265,9 +265,9 @@ public:
         }
         ensure_gnutls_global();
         quic_server_log.info(
-          "server start: listen={} cert_file='{}' key_file='{}' alpn_count={}",
+          "server start: listen={} crt_file='{}' key_file='{}' alpn_count={}",
           cfg.listen_address,
-          cfg.cert_file,
+          cfg.crt_file,
           cfg.key_file,
           cfg.alpns.size());
 
@@ -278,7 +278,7 @@ public:
         }
 
         rv = gnutls_certificate_set_x509_key_file(
-          _cred, _cfg.cert_file.c_str(), _cfg.key_file.c_str(), GNUTLS_X509_FMT_PEM);
+          _cred, _cfg.crt_file.c_str(), _cfg.key_file.c_str(), GNUTLS_X509_FMT_PEM);
         if (rv < 0) {
             throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
         }

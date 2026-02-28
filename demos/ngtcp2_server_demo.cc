@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
     app.add_options()
       ("address", bpo::value<std::string>()->default_value("::1"), "Server IPv6 address")
       ("port", bpo::value<uint16_t>()->default_value(4444), "Server UDP port")
-      ("cert", bpo::value<std::string>()->default_value("server.crt"), "PEM certificate file")
+      ("crt", bpo::value<std::string>()->default_value("server.crt"), "PEM certificate file")
       ("key,k", bpo::value<std::string>()->default_value("server.key"), "PEM key file")
       ("verbose,v", bpo::value<bool>()->default_value(false)->implicit_value(true), "Verbose logging");
 
@@ -130,13 +130,13 @@ int main(int argc, char** argv) {
             auto&& cfg = app.configuration();
             auto address = cfg["address"].as<std::string>();
             auto port = cfg["port"].as<uint16_t>();
-            auto cert = cfg["cert"].as<std::string>();
+            auto crt = cfg["crt"].as<std::string>();
             auto key = cfg["key"].as<std::string>();
             auto verbose = cfg["verbose"].as<bool>();
 
             quic_server_config server_cfg;
             server_cfg.listen_address = parse_ipv6_address(address, port);
-            server_cfg.cert_file = cert;
+            server_cfg.crt_file = crt;
             server_cfg.key_file = key;
 
             co_await server.start(std::move(server_cfg));
