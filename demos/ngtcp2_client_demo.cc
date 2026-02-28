@@ -37,6 +37,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/when_any.hh>
 #include <seastar/quic/quic_client.hh>
 
 #include "../apps/lib/stop_signal.hh"
@@ -165,19 +166,31 @@ int main(int argc, char** argv) {
             }
 
             seastar_apps_lib::stop_signal stop_signal;
-            auto stop_task = stop_signal.wait().then([session]() {
-                if (session && session->is_open()) {
-                    std::cout << "[client] SIGINT received, closing session...\n";
-                    std::cout.flush();
-                    return session->close();
-                }
-                return make_ready_future<>();
-            }).handle_exception([](std::exception_ptr) {});
+            auto raced = co_await when_any(
+              when_all_succeed(
+                receive_loop(session),
+                input_loop(session, std::chrono::milliseconds(poll_ms), verbose))
+                .discard_result(),
+              stop_signal
+                .wait()
+                .then([session]() {
+                    if (session && session->is_open()) {
+                        std::cout << "[client] SIGINT received, closing session...\n";
+                        std::cout.flush();
+                        return session->close();
+                    }
+                    return make_ready_future<>();
+                })
+                .handle_exception([](std::exception_ptr) {}));
 
-            co_await when_all_succeed(
-                       receive_loop(session),
-                       input_loop(session, std::chrono::milliseconds(poll_ms), verbose))
-              .discard_result();
+            auto io_task = std::move(std::get<0>(raced.futures));
+            auto stop_task = std::move(std::get<1>(raced.futures));
+            if (!io_task.available()) {
+                co_await std::move(io_task);
+            } else {
+                io_task.get();
+            }
+            stop_task.ignore_ready_future();
         } catch (...) {
             error = std::current_exception();
         }

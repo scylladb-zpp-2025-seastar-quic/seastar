@@ -27,8 +27,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -41,12 +41,12 @@
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_gnutls.h>
 
-#include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/queue.hh>
 #include <seastar/core/reactor.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/util/log.hh>
 
 namespace seastar::quic::experimental {
@@ -152,6 +152,11 @@ future<> send_datagram(net::datagram_channel& channel, const socket_address& dst
     co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
 }
 
+struct rx_event {
+    socket_address src;
+    temporary_buffer<char> packet;
+};
+
 struct client_state : public enable_lw_shared_from_this<client_state> {
     quic_client_config cfg{};
     internal::session_runtime_ptr runtime;
@@ -172,9 +177,13 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     gnutls_session_t tls = nullptr;
 
     gate task_gate;
-    semaphore conn_sem{1};
-    condition_variable wake_cv;
-    condition_variable handshake_cv;
+    queue<std::unique_ptr<rx_event>> rx_queue{1024};
+    queue<std::unique_ptr<quic_message>> tx_queue{1024};
+    std::deque<quic_message> pre_handshake_tx;
+    std::optional<promise<>> actor_waiter;
+    bool tick_pending = false;
+    bool queues_aborted = false;
+    bool stop_requested = false;
 
     bool stopping = false;
     bool handshake_done = false;
@@ -183,8 +192,8 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     size_t tx_payload_limit = default_udp_payload_size;
 
     ~client_state() {
-        wake_cv.broken();
-        handshake_cv.broken();
+        abort_event_queues("client state destroyed");
+        wake_actor();
         if (conn) {
             ngtcp2_conn_del(conn);
             conn = nullptr;
@@ -205,7 +214,57 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 
     bool active() const noexcept {
-        return !stopping && runtime && runtime->is_open();
+        return !stopping && runtime;
+    }
+
+    bool has_pending_actor_work() const noexcept {
+        return stop_requested || !rx_queue.empty() || !tx_queue.empty() || tick_pending || (handshake_done && !pre_handshake_tx.empty());
+    }
+
+    future<> wait_for_actor_wakeup() {
+        if (has_pending_actor_work() || stopping) {
+            co_return;
+        }
+        actor_waiter.emplace();
+        try {
+            co_await actor_waiter->get_future();
+        } catch (...) {
+        }
+    }
+
+    void wake_actor() {
+        if (!actor_waiter) {
+            return;
+        }
+        auto waiter = std::move(*actor_waiter);
+        actor_waiter.reset();
+        waiter.set_value();
+    }
+
+    void signal_tick() {
+        if (stopping || tick_pending) {
+            return;
+        }
+        tick_pending = true;
+        wake_actor();
+    }
+
+    void abort_event_queues(const char* why) {
+        if (queues_aborted) {
+            return;
+        }
+        queues_aborted = true;
+        auto ex = std::make_exception_ptr(std::runtime_error(why));
+        rx_queue.abort(ex);
+        tx_queue.abort(std::move(ex));
+    }
+
+    void request_stop() {
+        if (stopping || stop_requested) {
+            return;
+        }
+        stop_requested = true;
+        wake_actor();
     }
 
     void stop_transport() {
@@ -218,11 +277,11 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
           stream_sid,
           channel_ready);
         stopping = true;
+        abort_event_queues("client transport stopped");
         if (runtime) {
             runtime->mark_transport_closed();
         }
-        wake_cv.signal();
-        handshake_cv.signal();
+        wake_actor();
         if (channel_ready && !channel.is_closed()) {
             channel.shutdown_input();
             channel.shutdown_output();
@@ -240,11 +299,11 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
           stream_opened,
           stream_sid);
         stopping = true;
+        abort_event_queues("client transport failed");
         if (runtime) {
             runtime->mark_error(err, detail);
         }
-        wake_cv.signal();
-        handshake_cv.signal();
+        wake_actor();
         if (channel_ready && !channel.is_closed()) {
             channel.shutdown_input();
             channel.shutdown_output();
@@ -290,8 +349,7 @@ int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
         }
     }
 
-    st->handshake_cv.signal();
-    st->wake_cv.signal();
+    st->wake_actor();
     return 0;
 }
 
@@ -447,7 +505,7 @@ void init_client_connection(client_state& st) {
       st.cfg.session_options.initial_stream_id);
 }
 
-future<> flush_pending_packets_locked(lw_shared_ptr<client_state> st) {
+future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
     if (!st->conn) {
         co_return;
     }
@@ -483,7 +541,7 @@ future<> flush_pending_packets_locked(lw_shared_ptr<client_state> st) {
     }
 }
 
-future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message msg) {
+future<> send_stream_message_actor(lw_shared_ptr<client_state> st, quic_message msg) {
     if (!st->conn) {
         co_return;
     }
@@ -505,7 +563,7 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
             quic_client_log.info("client lazily opened bidi stream sid={}", sid);
         } else if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) {
             quic_client_log.debug("client stream open blocked, flushing pending packets");
-            co_await flush_pending_packets_locked(st);
+            co_await flush_pending_packets_actor(st);
             co_return;
         } else {
             quic_client_log.warn("client failed opening bidi stream: rv={} msg={}", rv, ngtcp2_error_message(rv));
@@ -558,7 +616,7 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
                     offset += static_cast<size_t>(consumed);
                 }
                 quic_client_log.trace("client writev_stream: write_more sid={} consumed={} offset={}", sid, consumed, offset);
-                co_await flush_pending_packets_locked(st);
+                co_await flush_pending_packets_actor(st);
                 continue;
             }
             if (ngtcp2_is_draining(nwrite)) {
@@ -572,7 +630,7 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
         }
         if (nwrite == 0) {
             quic_client_log.trace("client writev_stream produced 0 bytes, flushing sid={}", sid);
-            co_await flush_pending_packets_locked(st);
+            co_await flush_pending_packets_actor(st);
             continue;
         }
 
@@ -597,15 +655,15 @@ future<> send_stream_message_locked(lw_shared_ptr<client_state> st, quic_message
         }
     }
 
-    co_await flush_pending_packets_locked(st);
+    co_await flush_pending_packets_actor(st);
     quic_client_log.debug("client send_stream_message done: sid={} total_bytes={} fin={}", sid, msg.payload.size(), msg.fin);
 }
 
-future<> recv_datagram_locked(lw_shared_ptr<client_state> st, temporary_buffer<char> pkt) {
+future<> recv_datagram_actor(lw_shared_ptr<client_state> st, temporary_buffer<char> pkt) {
     if (!st->active() || !st->conn) {
         co_return;
     }
-    quic_client_log.trace("client recv_datagram_locked: bytes={}", pkt.size());
+    quic_client_log.trace("client recv_datagram_actor: bytes={}", pkt.size());
 
     ngtcp2_path path{};
     st->fill_path(path);
@@ -614,34 +672,19 @@ future<> recv_datagram_locked(lw_shared_ptr<client_state> st, temporary_buffer<c
       st->conn, &path, &pkt_info, reinterpret_cast<const uint8_t*>(pkt.get()), pkt.size(), now_ns());
     if (rv < 0) {
         if (ngtcp2_is_draining(rv)) {
-            quic_client_log.info("client recv_datagram_locked: connection draining");
+            quic_client_log.info("client recv_datagram_actor: connection draining");
             st->stop_transport();
             co_return;
         }
-        quic_client_log.warn("client recv_datagram_locked failed: rv={} msg={}", rv, ngtcp2_error_message(rv));
+        quic_client_log.warn("client recv_datagram_actor failed: rv={} msg={}", rv, ngtcp2_error_message(rv));
         st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
         co_return;
     }
 
-    co_await flush_pending_packets_locked(st);
-    st->wake_cv.signal();
+    co_await flush_pending_packets_actor(st);
 }
 
-future<> tx_send_locked(lw_shared_ptr<client_state> st, quic_message msg) {
-    if (!st->active()) {
-        co_return;
-    }
-    co_await send_stream_message_locked(st, std::move(msg));
-}
-
-future<uint64_t> read_expiry_locked(lw_shared_ptr<client_state> st) {
-    if (!st->conn) {
-        co_return std::numeric_limits<uint64_t>::max();
-    }
-    co_return ngtcp2_conn_get_expiry(st->conn);
-}
-
-future<> handle_timer_locked(lw_shared_ptr<client_state> st) {
+future<> handle_timer_actor(lw_shared_ptr<client_state> st) {
     if (!st->active() || !st->conn) {
         co_return;
     }
@@ -658,7 +701,39 @@ future<> handle_timer_locked(lw_shared_ptr<client_state> st) {
             co_return;
         }
     }
-    co_await flush_pending_packets_locked(st);
+    co_await flush_pending_packets_actor(st);
+}
+
+future<> send_connection_close_actor(lw_shared_ptr<client_state> st) {
+    if (!st->conn || !st->channel_ready || st->channel.is_closed()) {
+        co_return;
+    }
+
+    ngtcp2_path path{};
+    st->fill_path(path);
+    ngtcp2_pkt_info pkt_info{};
+    std::vector<uint8_t> outbuf(st->tx_payload_limit);
+
+    ngtcp2_ccerr ccerr{};
+    ngtcp2_ccerr_default(&ccerr);
+    ngtcp2_ccerr_set_application_error(&ccerr, 0, nullptr, 0);
+
+    ngtcp2_ssize nwrite = ngtcp2_conn_write_connection_close(
+      st->conn, &path, &pkt_info, outbuf.data(), outbuf.size(), &ccerr, now_ns());
+    if (nwrite == 0) {
+        quic_client_log.debug("client stop: no CONNECTION_CLOSE packet produced");
+        co_return;
+    }
+    if (nwrite < 0) {
+        quic_client_log.warn(
+          "client stop: failed to write CONNECTION_CLOSE nwrite={} msg={}",
+          nwrite,
+          ngtcp2_error_message((int)nwrite));
+        co_return;
+    }
+
+    quic_client_log.info("client sent CONNECTION_CLOSE packet bytes={}", nwrite);
+    co_await send_datagram(st->channel, st->remote_address, outbuf.data(), static_cast<size_t>(nwrite));
 }
 
 future<> recv_loop(lw_shared_ptr<client_state> st) {
@@ -676,36 +751,32 @@ future<> recv_loop(lw_shared_ptr<client_state> st) {
         }
 
         auto src = d.get_src();
-        to_sockaddr_storage_v6(src, st->remote_ss, st->remote_ss_len);
         auto pkt = linearize_packet(d.get_buffers());
         quic_client_log.trace("client recv_loop datagram: src={} bytes={}", src, pkt.size());
 
-        co_await with_semaphore(st->conn_sem, 1, [st, pkt = std::move(pkt)]() mutable {
-            return recv_datagram_locked(st, std::move(pkt));
-        });
+        try {
+            auto evt = std::make_unique<rx_event>(rx_event{src, std::move(pkt)});
+            co_await st->rx_queue.push_eventually(std::move(evt));
+            st->wake_actor();
+        } catch (...) {
+            if (st->stopping || !st->runtime || !st->runtime->is_open()) {
+                co_return;
+            }
+            st->fail(quic_error::io, "rx queue push failed");
+            co_return;
+        }
     }
 }
 
 future<> tx_loop(lw_shared_ptr<client_state> st) {
     while (st->active()) {
-        while (!st->handshake_done && st->active()) {
-            try {
-                co_await st->handshake_cv.wait(std::chrono::milliseconds(200));
-            } catch (const condition_variable_timed_out&) {
-            } catch (const broken_condition_variable&) {
-                co_return;
-            }
-        }
-        if (!st->active()) {
-            co_return;
-        }
-
         quic_message msg;
         try {
             msg = co_await st->runtime->pop_outgoing();
         } catch (const quic_exception& e) {
             if (e.code() == quic_error::closed) {
                 quic_client_log.debug("client tx_loop exiting on closed runtime");
+                st->request_stop();
                 co_return;
             }
             quic_client_log.warn("client tx_loop pop_outgoing error: code={} detail='{}'", to_string(e.code()), e.what());
@@ -718,47 +789,88 @@ future<> tx_loop(lw_shared_ptr<client_state> st) {
         }
         quic_client_log.trace("client tx_loop popped message: sid={} bytes={} fin={}", msg.stream, msg.payload.size(), msg.fin);
 
-        co_await with_semaphore(st->conn_sem, 1, [st, msg = std::move(msg)]() mutable {
-            return tx_send_locked(st, std::move(msg));
-        });
-        st->wake_cv.signal();
+        try {
+            auto out = std::make_unique<quic_message>(std::move(msg));
+            co_await st->tx_queue.push_eventually(std::move(out));
+            st->wake_actor();
+        } catch (...) {
+            if (st->stopping || !st->runtime || !st->runtime->is_open()) {
+                co_return;
+            }
+            st->fail(quic_error::io, "tx queue push failed");
+            co_return;
+        }
     }
 }
 
 future<> timer_loop(lw_shared_ptr<client_state> st) {
     while (st->active()) {
-        auto expiry = co_await with_semaphore(st->conn_sem, 1, [st] {
-            return read_expiry_locked(st);
-        });
-
-        auto wait_dur = std::chrono::milliseconds(200);
-        auto now = now_ns();
-        if (expiry != std::numeric_limits<uint64_t>::max() && expiry > now) {
-            auto until_expiry = std::chrono::nanoseconds(expiry - now);
-            if (until_expiry < wait_dur) {
-                wait_dur = std::chrono::duration_cast<std::chrono::milliseconds>(until_expiry);
-            }
-        }
-
-        try {
-            co_await st->wake_cv.wait(wait_dur);
-        } catch (const condition_variable_timed_out&) {
-        } catch (const broken_condition_variable&) {
-            co_return;
-        }
-
+        co_await sleep(std::chrono::milliseconds(200));
         if (!st->active()) {
             co_return;
         }
+        st->signal_tick();
+    }
+}
 
-        co_await with_semaphore(st->conn_sem, 1, [st] {
-            return handle_timer_locked(st);
-        });
+future<> actor_loop(lw_shared_ptr<client_state> st) {
+    while (st->active()) {
+        if (!st->has_pending_actor_work()) {
+            co_await st->wait_for_actor_wakeup();
+            if (!st->active()) {
+                co_return;
+            }
+        }
+
+        if (st->stop_requested) {
+            co_await send_connection_close_actor(st);
+            st->stop_transport();
+            co_return;
+        }
+
+        while (st->active() && !st->rx_queue.empty()) {
+            auto evt = st->rx_queue.pop();
+            if (!evt) {
+                continue;
+            }
+            to_sockaddr_storage_v6(evt->src, st->remote_ss, st->remote_ss_len);
+            co_await recv_datagram_actor(st, std::move(evt->packet));
+        }
+
+        while (st->active() && !st->tx_queue.empty()) {
+            auto out = st->tx_queue.pop();
+            if (!out) {
+                continue;
+            }
+            if (!st->handshake_done) {
+                st->pre_handshake_tx.push_back(std::move(*out));
+                continue;
+            }
+            co_await send_stream_message_actor(st, std::move(*out));
+        }
+
+        while (st->active() && st->handshake_done && !st->pre_handshake_tx.empty()) {
+            auto msg = std::move(st->pre_handshake_tx.front());
+            st->pre_handshake_tx.pop_front();
+            co_await send_stream_message_actor(st, std::move(msg));
+        }
+
+        if (st->active() && st->tick_pending) {
+            st->tick_pending = false;
+            co_await handle_timer_actor(st);
+        }
     }
 }
 
 void start_background_tasks(const lw_shared_ptr<client_state>& st) {
     quic_client_log.debug("client starting background tasks");
+    (void)with_gate(st->task_gate, [st] { return actor_loop(st); })
+      .handle_exception([st](std::exception_ptr) {
+          if (st->active()) {
+              st->fail(quic_error::io, "actor loop failed");
+          }
+      })
+      .or_terminate();
     (void)with_gate(st->task_gate, [st] { return recv_loop(st); })
       .handle_exception([st](std::exception_ptr) {
           if (st->active()) {
@@ -814,7 +926,7 @@ public:
             init_tls(*st);
             init_client_connection(*st);
 
-            co_await with_semaphore(st->conn_sem, 1, [st] { return flush_pending_packets_locked(st); });
+            co_await flush_pending_packets_actor(st);
 
             start_background_tasks(st);
             _state = st;
@@ -848,7 +960,7 @@ public:
         }
         auto st = std::exchange(_state, {});
         quic_client_log.info("client stop start: local={} remote={}", st->local_address, st->remote_address);
-        st->stop_transport();
+        st->request_stop();
         co_await st->task_gate.close();
         if (st->channel_ready && !st->channel.is_closed()) {
             st->channel.close();
