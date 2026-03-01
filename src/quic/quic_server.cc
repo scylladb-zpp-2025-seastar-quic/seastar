@@ -31,6 +31,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -46,9 +47,10 @@
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/queue.hh>
 #include <seastar/core/reactor.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/util/log.hh>
 
 namespace seastar::quic::experimental {
@@ -212,6 +214,11 @@ dcid_parse_result parse_dcid(const uint8_t* pkt, size_t len, size_t short_dcid_l
 
 class quic_server_impl;
 
+struct conn_rx_event {
+    socket_address src;
+    temporary_buffer<char> packet;
+};
+
 struct server_connection : public enable_lw_shared_from_this<server_connection> {
     quic_server_impl* server = nullptr;
     internal::session_runtime_ptr runtime;
@@ -226,15 +233,23 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     sockaddr_storage peer_ss{};
     socklen_t peer_ss_len = 0;
 
-    semaphore conn_sem{1};
-    condition_variable wake_cv;
+    queue<std::unique_ptr<conn_rx_event>> rx_queue{1024};
+    queue<std::unique_ptr<quic_message>> tx_queue{1024};
+    std::optional<promise<>> actor_waiter;
+    bool tick_pending = false;
+    bool queues_aborted = false;
+    bool unregistered = false;
+    bool stop_requested = false;
+    std::optional<quic_error> stop_error;
+    sstring stop_error_detail;
 
     bool closing = false;
     size_t tx_payload_limit = default_udp_payload_size;
     std::unordered_set<std::string> mapped_dcids;
 
     ~server_connection() {
-        wake_cv.broken();
+        abort_event_queues("server connection destroyed");
+        wake_actor();
         if (conn) {
             ngtcp2_conn_del(conn);
             conn = nullptr;
@@ -248,6 +263,48 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     void fill_path(ngtcp2_path& path) {
         init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&local_ss), local_ss_len);
         init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&peer_ss), peer_ss_len);
+    }
+
+    bool has_pending_actor_work() const noexcept {
+        return stop_requested || !rx_queue.empty() || !tx_queue.empty() || tick_pending;
+    }
+
+    future<> wait_for_actor_wakeup() {
+        if (has_pending_actor_work() || closing) {
+            co_return;
+        }
+        actor_waiter.emplace();
+        try {
+            co_await actor_waiter->get_future();
+        } catch (...) {
+        }
+    }
+
+    void wake_actor() {
+        if (!actor_waiter) {
+            return;
+        }
+        auto waiter = std::move(*actor_waiter);
+        actor_waiter.reset();
+        waiter.set_value();
+    }
+
+    void signal_tick() {
+        if (closing || tick_pending) {
+            return;
+        }
+        tick_pending = true;
+        wake_actor();
+    }
+
+    void abort_event_queues(const char* why) {
+        if (queues_aborted) {
+            return;
+        }
+        queues_aborted = true;
+        auto ex = std::make_exception_ptr(std::runtime_error(why));
+        rx_queue.abort(ex);
+        tx_queue.abort(std::move(ex));
     }
 
     bool active() const noexcept;
@@ -343,12 +400,12 @@ public:
 
         if (_channel_ready && !_channel.is_closed()) {
             _channel.shutdown_input();
-            _channel.shutdown_output();
         }
 
         co_await _task_gate.close();
 
         if (_channel_ready && !_channel.is_closed()) {
+            _channel.shutdown_output();
             _channel.close();
         }
 
@@ -392,6 +449,10 @@ public:
     }
 
     void unregister_connection(const conn_ptr& conn) {
+        if (!conn || conn->unregistered) {
+            return;
+        }
+        conn->unregistered = true;
         quic_server_log.info("server unregister connection: peer={} mapped_dcids={} active_conns_before={}", conn->peer, conn->mapped_dcids.size(), _conns.size());
         for (const auto& key : conn->mapped_dcids) {
             auto it = _by_dcid.find(key);
@@ -631,6 +692,18 @@ private:
           odcid.datalen,
           scid.datalen);
 
+        (void)with_gate(_task_gate, [conn] { return conn_actor_loop(conn); })
+          .handle_exception([conn](std::exception_ptr) {
+              conn->closing = true;
+              conn->abort_event_queues("server actor loop failed");
+              if (conn->runtime && conn->runtime->is_open()) {
+                  conn->runtime->mark_error(quic_error::io, "server actor loop failed");
+              }
+              if (conn->server) {
+                  conn->server->unregister_connection(conn);
+              }
+          })
+          .or_terminate();
         (void)with_gate(_task_gate, [conn] { return conn_tx_loop(conn); })
           .handle_exception([conn](std::exception_ptr) {
               conn->fail(quic_error::io, "server tx loop failed");
@@ -645,7 +718,7 @@ private:
         return conn;
     }
 
-    static future<> flush_pending_packets_locked(conn_ptr conn) {
+    static future<> flush_pending_packets_actor(conn_ptr conn) {
         if (!conn->conn || !conn->server) {
             co_return;
         }
@@ -669,13 +742,11 @@ private:
                 if (ngtcp2_is_draining(nwrite)) {
                     quic_server_log.info("server flush_pending_packets: draining peer={}", conn->peer);
                     conn->stop_transport();
-                    conn->server->unregister_connection(conn);
                     co_return;
                 }
                 quic_server_log.warn("server flush_pending_packets failed: peer={} nwrite={} msg={}",
                   conn->peer, nwrite, ngtcp2_error_message((int)nwrite));
                 conn->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
-                conn->server->unregister_connection(conn);
                 co_return;
             }
             quic_server_log.trace("server flush_pending_packets: peer={} wrote {} bytes", conn->peer, nwrite);
@@ -683,7 +754,7 @@ private:
         }
     }
 
-    static future<> send_stream_message_locked(conn_ptr conn, quic_message msg) {
+    static future<> send_stream_message_actor(conn_ptr conn, quic_message msg) {
         if (!conn->conn || msg.stream == invalid_stream_id) {
             quic_server_log.debug("server send_stream_message skipped: peer={} conn_present={} sid={}",
               conn->peer, conn->conn != nullptr, msg.stream);
@@ -736,24 +807,22 @@ private:
                     }
                     quic_server_log.trace("server writev_stream: write_more peer={} sid={} consumed={} offset={}",
                       conn->peer, msg.stream, consumed, offset);
-                    co_await flush_pending_packets_locked(conn);
+                    co_await flush_pending_packets_actor(conn);
                     continue;
                 }
                 if (ngtcp2_is_draining(nwrite)) {
                     quic_server_log.info("server writev_stream: draining peer={} sid={}", conn->peer, msg.stream);
                     conn->stop_transport();
-                    conn->server->unregister_connection(conn);
                     co_return;
                 }
                 quic_server_log.warn("server writev_stream failed: peer={} sid={} nwrite={} msg={}",
                   conn->peer, msg.stream, nwrite, ngtcp2_error_message((int)nwrite));
                 conn->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
-                conn->server->unregister_connection(conn);
                 co_return;
             }
             if (nwrite == 0) {
                 quic_server_log.trace("server writev_stream produced 0 bytes: peer={} sid={}", conn->peer, msg.stream);
-                co_await flush_pending_packets_locked(conn);
+                co_await flush_pending_packets_actor(conn);
                 continue;
             }
 
@@ -779,26 +848,19 @@ private:
             }
         }
 
-        co_await flush_pending_packets_locked(conn);
+        co_await flush_pending_packets_actor(conn);
         quic_server_log.debug("server send_stream_message done: peer={} sid={} bytes={} fin={}",
           conn->peer, msg.stream, msg.payload.size(), msg.fin);
     }
 
-    static future<> conn_tx_send_locked(conn_ptr conn, quic_message msg) {
+    static future<> conn_tx_send_actor(conn_ptr conn, quic_message msg) {
         if (!conn->active()) {
             co_return;
         }
-        co_await send_stream_message_locked(conn, std::move(msg));
+        co_await send_stream_message_actor(conn, std::move(msg));
     }
 
-    static future<uint64_t> conn_read_expiry_locked(conn_ptr conn) {
-        if (!conn->conn) {
-            co_return std::numeric_limits<uint64_t>::max();
-        }
-        co_return ngtcp2_conn_get_expiry(conn->conn);
-    }
-
-    static future<> conn_handle_timer_locked(conn_ptr conn) {
+    static future<> conn_handle_timer_actor(conn_ptr conn) {
         if (!conn->active() || !conn->conn) {
             co_return;
         }
@@ -809,24 +871,22 @@ private:
                 if (ngtcp2_is_idle_close(rv) || ngtcp2_is_draining(rv)) {
                     quic_server_log.info("server timer expiry: closing/draining peer={} rv={}", conn->peer, rv);
                     conn->stop_transport();
-                    conn->server->unregister_connection(conn);
                     co_return;
                 }
                 quic_server_log.warn("server timer expiry handling failed: peer={} rv={} msg={}",
                   conn->peer, rv, ngtcp2_error_message(rv));
                 conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-                conn->server->unregister_connection(conn);
                 co_return;
             }
         }
-        co_await flush_pending_packets_locked(conn);
+        co_await flush_pending_packets_actor(conn);
     }
 
-    static future<> handle_conn_datagram_locked(conn_ptr conn, temporary_buffer<char> pkt) {
+    static future<> handle_conn_datagram_actor(conn_ptr conn, temporary_buffer<char> pkt) {
         if (!conn->active() || !conn->conn) {
             co_return;
         }
-        quic_server_log.trace("server handle_conn_datagram_locked: peer={} bytes={}", conn->peer, pkt.size());
+        quic_server_log.trace("server handle_conn_datagram_actor: peer={} bytes={}", conn->peer, pkt.size());
 
         ngtcp2_path path{};
         conn->fill_path(path);
@@ -838,18 +898,15 @@ private:
             if (ngtcp2_is_draining(rv)) {
                 quic_server_log.info("server read_pkt draining: peer={}", conn->peer);
                 conn->stop_transport();
-                conn->server->unregister_connection(conn);
                 co_return;
             }
             quic_server_log.warn("server read_pkt failed: peer={} rv={} msg={}",
               conn->peer, rv, ngtcp2_error_message(rv));
             conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-            conn->server->unregister_connection(conn);
             co_return;
         }
 
-        co_await flush_pending_packets_locked(conn);
-        conn->wake_cv.signal();
+        co_await flush_pending_packets_actor(conn);
     }
 
     static future<> conn_tx_loop(conn_ptr conn) {
@@ -865,53 +922,130 @@ private:
                 quic_server_log.warn("server conn_tx_loop pop_outgoing error: peer={} code={} detail='{}'",
                   conn->peer, to_string(e.code()), e.what());
                 conn->fail(e.code(), e.what());
-                conn->server->unregister_connection(conn);
                 co_return;
             } catch (...) {
                 quic_server_log.error("server conn_tx_loop unexpected pop_outgoing failure: peer={}", conn->peer);
                 conn->fail(quic_error::internal, "server pop_outgoing failed");
-                conn->server->unregister_connection(conn);
                 co_return;
             }
             quic_server_log.trace("server conn_tx_loop popped message: peer={} sid={} bytes={} fin={}",
               conn->peer, msg.stream, msg.payload.size(), msg.fin);
 
-            co_await with_semaphore(conn->conn_sem, 1, [conn, msg = std::move(msg)]() mutable {
-                return conn_tx_send_locked(conn, std::move(msg));
-            });
-            conn->wake_cv.signal();
+            try {
+                auto out = std::make_unique<quic_message>(std::move(msg));
+                co_await conn->tx_queue.push_eventually(std::move(out));
+                conn->wake_actor();
+            } catch (...) {
+                if (!conn->active()) {
+                    co_return;
+                }
+                conn->fail(quic_error::io, "server tx queue push failed");
+                co_return;
+            }
         }
+    }
+
+    static future<> send_connection_close_actor(conn_ptr conn) {
+        if (!conn->conn || !conn->server) {
+            co_return;
+        }
+
+        auto& server = *conn->server;
+        auto& channel = server.channel();
+        if (channel.is_closed()) {
+            co_return;
+        }
+
+        ngtcp2_path path{};
+        conn->fill_path(path);
+        ngtcp2_pkt_info pkt_info{};
+        std::vector<uint8_t> outbuf(conn->tx_payload_limit);
+
+        ngtcp2_ccerr ccerr{};
+        ngtcp2_ccerr_default(&ccerr);
+        ngtcp2_ccerr_set_application_error(&ccerr, 0, nullptr, 0);
+
+        ngtcp2_ssize nwrite = ngtcp2_conn_write_connection_close(
+          conn->conn, &path, &pkt_info, outbuf.data(), outbuf.size(), &ccerr, now_ns());
+        if (nwrite == 0) {
+            quic_server_log.debug("server stop: no CONNECTION_CLOSE packet produced peer={}", conn->peer);
+            co_return;
+        }
+        if (nwrite < 0) {
+            quic_server_log.warn(
+              "server stop: failed to write CONNECTION_CLOSE peer={} nwrite={} msg={}",
+              conn->peer,
+              nwrite,
+              ngtcp2_error_message((int)nwrite));
+            co_return;
+        }
+
+        quic_server_log.info("server sent CONNECTION_CLOSE packet: peer={} bytes={}", conn->peer, nwrite);
+        co_await send_datagram(channel, conn->peer, outbuf.data(), static_cast<size_t>(nwrite));
     }
 
     static future<> conn_timer_loop(conn_ptr conn) {
         while (conn->active()) {
-            auto expiry = co_await with_semaphore(conn->conn_sem, 1, [conn] {
-                return conn_read_expiry_locked(conn);
-            });
-
-            auto wait_dur = std::chrono::milliseconds(200);
-            auto now = now_ns();
-            if (expiry != std::numeric_limits<uint64_t>::max() && expiry > now) {
-                auto until_expiry = std::chrono::nanoseconds(expiry - now);
-                if (until_expiry < wait_dur) {
-                    wait_dur = std::chrono::duration_cast<std::chrono::milliseconds>(until_expiry);
-                }
-            }
-
-            try {
-                co_await conn->wake_cv.wait(wait_dur);
-            } catch (const condition_variable_timed_out&) {
-            } catch (const broken_condition_variable&) {
-                co_return;
-            }
-
+            co_await sleep(std::chrono::milliseconds(200));
             if (!conn->active()) {
                 co_return;
             }
+            conn->signal_tick();
+        }
+    }
 
-            co_await with_semaphore(conn->conn_sem, 1, [conn] {
-                return conn_handle_timer_locked(conn);
-            });
+    static future<> conn_actor_loop(conn_ptr conn) {
+        while (conn->active()) {
+            if (!conn->has_pending_actor_work()) {
+                co_await conn->wait_for_actor_wakeup();
+                if (!conn->active()) {
+                    co_return;
+                }
+            }
+
+            if (conn->stop_requested) {
+                auto stop_error = conn->stop_error;
+                auto stop_error_detail = conn->stop_error_detail;
+                conn->stop_requested = false;
+
+                co_await send_connection_close_actor(conn);
+
+                conn->closing = true;
+                conn->abort_event_queues(stop_error ? "server connection failed" : "server connection stopped");
+                if (conn->runtime && conn->runtime->is_open()) {
+                    if (stop_error) {
+                        conn->runtime->mark_error(*stop_error, stop_error_detail);
+                    } else {
+                        conn->runtime->mark_transport_closed();
+                    }
+                }
+
+                if (conn->server) {
+                    conn->server->unregister_connection(conn);
+                }
+                co_return;
+            }
+
+            while (conn->active() && !conn->stop_requested && !conn->rx_queue.empty()) {
+                auto evt = conn->rx_queue.pop();
+                if (!evt) {
+                    continue;
+                }
+                co_await handle_conn_datagram_actor(conn, std::move(evt->packet));
+            }
+
+            while (conn->active() && !conn->stop_requested && !conn->tx_queue.empty()) {
+                auto out = conn->tx_queue.pop();
+                if (!out) {
+                    continue;
+                }
+                co_await conn_tx_send_actor(conn, std::move(*out));
+            }
+
+            if (conn->active() && !conn->stop_requested && conn->tick_pending) {
+                conn->tick_pending = false;
+                co_await conn_handle_timer_actor(conn);
+            }
         }
     }
 
@@ -959,9 +1093,16 @@ private:
             to_sockaddr_storage_v6(src, conn->peer_ss, conn->peer_ss_len);
         }
 
-        co_await with_semaphore(conn->conn_sem, 1, [conn, pkt = std::move(pkt)]() mutable {
-            return handle_conn_datagram_locked(conn, std::move(pkt));
-        });
+        try {
+            auto evt = std::make_unique<conn_rx_event>(conn_rx_event{src, std::move(pkt)});
+            co_await conn->rx_queue.push_eventually(std::move(evt));
+            conn->wake_actor();
+        } catch (...) {
+            if (!conn->active()) {
+                co_return;
+            }
+            conn->fail(quic_error::io, "server rx queue push failed");
+        }
     }
 
     future<> receive_loop() {
@@ -995,16 +1136,16 @@ private:
 };
 
 bool server_connection::active() const noexcept {
-    return !closing && runtime && runtime->is_open() && server && !server->stopping();
+    return !closing && runtime && runtime->is_open() && server;
 }
 
 void server_connection::stop_transport() {
-    quic_server_log.info("server connection stop_transport: peer={} closing={} mapped_dcids={}", peer, closing, mapped_dcids.size());
-    closing = true;
-    if (runtime) {
-        runtime->mark_transport_closed();
+    quic_server_log.info("server connection request stop: peer={} closing={} mapped_dcids={}", peer, closing, mapped_dcids.size());
+    if (closing || stop_requested) {
+        return;
     }
-    wake_cv.signal();
+    stop_requested = true;
+    wake_actor();
 }
 
 void server_connection::fail(quic_error error, const sstring& detail) {
@@ -1015,11 +1156,15 @@ void server_connection::fail(quic_error error, const sstring& detail) {
       detail,
       closing,
       mapped_dcids.size());
-    closing = true;
-    if (runtime) {
-        runtime->mark_error(error, detail);
+    if (closing) {
+        return;
     }
-    wake_cv.signal();
+    if (!stop_error) {
+        stop_error = error;
+        stop_error_detail = detail;
+    }
+    stop_requested = true;
+    wake_actor();
 }
 
 } // namespace
