@@ -118,6 +118,10 @@ static future<> input_loop(lw_shared_ptr<connection> session, std::chrono::milli
             continue;
         }
         if (n == 0) {
+            if (verbose) {
+                std::cout << "[client] stdin EOF, closing session...\n";
+                std::cout.flush();
+            }
             co_await session->close();
             co_return;
         }
@@ -190,7 +194,9 @@ int main(int argc, char** argv) {
             } else {
                 io_task.get();
             }
-            stop_task.ignore_ready_future();
+            if (stop_task.available()) {
+                stop_task.get();
+            }
         } catch (...) {
             error = std::current_exception();
         }

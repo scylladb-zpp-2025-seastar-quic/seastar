@@ -125,6 +125,7 @@ int main(int argc, char** argv) {
         gate sessions;
         std::optional<future<>> accept_task;
         std::exception_ptr error;
+        bool verbose = false;
 
         try {
             auto&& cfg = app.configuration();
@@ -132,7 +133,7 @@ int main(int argc, char** argv) {
             auto port = cfg["port"].as<uint16_t>();
             auto crt = cfg["crt"].as<std::string>();
             auto key = cfg["key"].as<std::string>();
-            auto verbose = cfg["verbose"].as<bool>();
+            verbose = cfg["verbose"].as<bool>();
 
             quic_server_config server_cfg;
             server_cfg.listen_address = parse_ipv6_address(address, port);
@@ -147,6 +148,8 @@ int main(int argc, char** argv) {
 
             seastar_apps_lib::stop_signal stop_signal;
             co_await stop_signal.wait();
+            std::cout << "[server] SIGINT received, disconnecting clients...\n";
+            std::cout.flush();
         } catch (...) {
             error = std::current_exception();
         }
