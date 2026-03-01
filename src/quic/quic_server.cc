@@ -236,6 +236,8 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     queue<std::unique_ptr<conn_rx_event>> rx_queue{1024};
     queue<std::unique_ptr<quic_message>> tx_queue{1024};
     std::optional<promise<>> actor_waiter;
+    condition_variable timer_cv;
+    bool timer_rearm_requested = false;
     bool tick_pending = false;
     bool queues_aborted = false;
     bool unregistered = false;
@@ -295,6 +297,11 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         }
         tick_pending = true;
         wake_actor();
+    }
+
+    void request_timer_rearm() {
+        timer_rearm_requested = true;
+        timer_cv.signal();
     }
 
     void abort_event_queues(const char* why) {
@@ -858,6 +865,7 @@ private:
             co_return;
         }
         co_await send_stream_message_actor(conn, std::move(msg));
+        conn->request_timer_rearm();
     }
 
     static future<> conn_handle_timer_actor(conn_ptr conn) {
@@ -907,6 +915,7 @@ private:
         }
 
         co_await flush_pending_packets_actor(conn);
+        conn->request_timer_rearm();
     }
 
     static future<> conn_tx_loop(conn_ptr conn) {
@@ -985,12 +994,47 @@ private:
     }
 
     static future<> conn_timer_loop(conn_ptr conn) {
+        constexpr auto max_timer_sleep = std::chrono::hours(24);
         while (conn->active()) {
-            co_await sleep(std::chrono::milliseconds(200));
-            if (!conn->active()) {
+            if (!conn->conn) {
                 co_return;
             }
-            conn->signal_tick();
+
+            auto expiry = ngtcp2_conn_get_expiry(conn->conn);
+            auto now = now_ns();
+            if (expiry <= now) {
+                conn->signal_tick();
+                try {
+                    co_await conn->timer_cv.wait([conn] {
+                        return !conn->active() || conn->stop_requested || conn->timer_rearm_requested || !conn->tick_pending;
+                    });
+                } catch (...) {
+                }
+                conn->timer_rearm_requested = false;
+                continue;
+            }
+
+            auto wait_ns = expiry - now;
+            auto max_wait_ns = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(max_timer_sleep).count());
+            auto sleep_ns = std::min(wait_ns, max_wait_ns);
+            conn->timer_rearm_requested = false;
+
+            try {
+                co_await conn->timer_cv.wait(std::chrono::nanoseconds(sleep_ns), [conn] {
+                    return !conn->active() || conn->stop_requested || conn->timer_rearm_requested;
+                });
+                conn->timer_rearm_requested = false;
+            } catch (const condition_variable_timed_out&) {
+                if (!conn->active()) {
+                    co_return;
+                }
+                conn->signal_tick();
+            } catch (...) {
+                if (!conn->active()) {
+                    co_return;
+                }
+            }
         }
     }
 
@@ -1146,6 +1190,7 @@ void server_connection::stop_transport() {
     }
     stop_requested = true;
     wake_actor();
+    request_timer_rearm();
 }
 
 void server_connection::fail(quic_error error, const sstring& detail) {
@@ -1165,6 +1210,7 @@ void server_connection::fail(quic_error error, const sstring& detail) {
     }
     stop_requested = true;
     wake_actor();
+    request_timer_rearm();
 }
 
 } // namespace

@@ -42,6 +42,7 @@
 #include <ngtcp2/ngtcp2_crypto_gnutls.h>
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/reactor.hh>
@@ -181,6 +182,8 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     queue<std::unique_ptr<quic_message>> tx_queue{1024};
     std::deque<quic_message> pre_handshake_tx;
     std::optional<promise<>> actor_waiter;
+    condition_variable timer_cv;
+    bool timer_rearm_requested = false;
     bool tick_pending = false;
     bool queues_aborted = false;
     bool stop_requested = false;
@@ -249,6 +252,11 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         wake_actor();
     }
 
+    void request_timer_rearm() {
+        timer_rearm_requested = true;
+        timer_cv.signal();
+    }
+
     void abort_event_queues(const char* why) {
         if (queues_aborted) {
             return;
@@ -265,6 +273,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         }
         stop_requested = true;
         wake_actor();
+        request_timer_rearm();
     }
 
     void stop_transport() {
@@ -282,6 +291,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
             runtime->mark_transport_closed();
         }
         wake_actor();
+        request_timer_rearm();
         if (channel_ready && !channel.is_closed()) {
             channel.shutdown_input();
             channel.shutdown_output();
@@ -304,6 +314,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
             runtime->mark_error(err, detail);
         }
         wake_actor();
+        request_timer_rearm();
         if (channel_ready && !channel.is_closed()) {
             channel.shutdown_input();
             channel.shutdown_output();
@@ -350,6 +361,7 @@ int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
     }
 
     st->wake_actor();
+    st->request_timer_rearm();
     return 0;
 }
 
@@ -656,6 +668,7 @@ future<> send_stream_message_actor(lw_shared_ptr<client_state> st, quic_message 
     }
 
     co_await flush_pending_packets_actor(st);
+    st->request_timer_rearm();
     quic_client_log.debug("client send_stream_message done: sid={} total_bytes={} fin={}", sid, msg.payload.size(), msg.fin);
 }
 
@@ -682,6 +695,7 @@ future<> recv_datagram_actor(lw_shared_ptr<client_state> st, temporary_buffer<ch
     }
 
     co_await flush_pending_packets_actor(st);
+    st->request_timer_rearm();
 }
 
 future<> handle_timer_actor(lw_shared_ptr<client_state> st) {
@@ -804,12 +818,47 @@ future<> tx_loop(lw_shared_ptr<client_state> st) {
 }
 
 future<> timer_loop(lw_shared_ptr<client_state> st) {
+    constexpr auto max_timer_sleep = std::chrono::hours(24);
     while (st->active()) {
-        co_await sleep(std::chrono::milliseconds(200));
-        if (!st->active()) {
+        if (!st->conn) {
             co_return;
         }
-        st->signal_tick();
+
+        auto expiry = ngtcp2_conn_get_expiry(st->conn);
+        auto now = now_ns();
+        if (expiry <= now) {
+            st->signal_tick();
+            try {
+                co_await st->timer_cv.wait([st] {
+                    return !st->active() || st->stop_requested || st->timer_rearm_requested || !st->tick_pending;
+                });
+            } catch (...) {
+            }
+            st->timer_rearm_requested = false;
+            continue;
+        }
+
+        auto wait_ns = expiry - now;
+        auto max_wait_ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(max_timer_sleep).count());
+        auto sleep_ns = wait_ns > max_wait_ns ? max_wait_ns : wait_ns;
+        st->timer_rearm_requested = false;
+
+        try {
+            co_await st->timer_cv.wait(std::chrono::nanoseconds(sleep_ns), [st] {
+                return !st->active() || st->stop_requested || st->timer_rearm_requested;
+            });
+            st->timer_rearm_requested = false;
+        } catch (const condition_variable_timed_out&) {
+            if (!st->active()) {
+                co_return;
+            }
+            st->signal_tick();
+        } catch (...) {
+            if (!st->active()) {
+                co_return;
+            }
+        }
     }
 }
 
@@ -857,6 +906,7 @@ future<> actor_loop(lw_shared_ptr<client_state> st) {
 
         if (st->active() && st->tick_pending) {
             st->tick_pending = false;
+            st->timer_cv.signal();
             co_await handle_timer_actor(st);
         }
     }
