@@ -85,12 +85,15 @@ private:
     bool _active = false;
 };
 
-static future<> receive_loop(lw_shared_ptr<connection> session) {
-    while (session->is_open()) {
+static future<> receive_loop(lw_shared_ptr<input_stream<char>> input) {
+    while (true) {
         try {
-            auto msg = co_await session->receive();
-            std::cout.write(msg.payload.get(), static_cast<std::streamsize>(msg.payload.size()));
-            if (msg.payload.size() && msg.payload.get()[msg.payload.size() - 1] != '\n') {
+            auto chunk = co_await input->read();
+            if (chunk.empty()) {
+                co_return;
+            }
+            std::cout.write(chunk.get(), static_cast<std::streamsize>(chunk.size()));
+            if (chunk.size() && chunk.get()[chunk.size() - 1] != '\n') {
                 std::cout << "\n";
             }
             std::cout.flush();
@@ -103,26 +106,29 @@ static future<> receive_loop(lw_shared_ptr<connection> session) {
     }
 }
 
-static future<> input_loop(lw_shared_ptr<connection> session, std::chrono::milliseconds poll_interval, bool verbose) {
+static future<> input_loop(
+  lw_shared_ptr<output_stream<char>> output,
+  lw_shared_ptr<connection> session,
+  std::chrono::milliseconds poll_interval,
+  bool verbose) {
     char buf[2048];
     while (session->is_open()) {
         auto n = ::read(STDIN_FILENO, buf, sizeof(buf));
         if (n > 0) {
-            temporary_buffer<char> tb(static_cast<size_t>(n));
-            std::memcpy(tb.get_write(), buf, static_cast<size_t>(n));
             if (verbose) {
                 std::cout << "[client] send bytes=" << n << "\n";
                 std::cout.flush();
             }
-            co_await session->send(invalid_stream_id, std::move(tb));
+            co_await output->write(buf, static_cast<size_t>(n));
+            co_await output->flush();
             continue;
         }
         if (n == 0) {
             if (verbose) {
-                std::cout << "[client] stdin EOF, closing session...\n";
+                std::cout << "[client] stdin EOF, closing stream output...\n";
                 std::cout.flush();
             }
-            co_await session->close();
+            co_await output->close();
             co_return;
         }
 
@@ -147,6 +153,8 @@ int main(int argc, char** argv) {
     return app.run(argc, argv, [&app]() -> future<int> {
         quic_client client;
         lw_shared_ptr<connection> session;
+        lw_shared_ptr<input_stream<char>> input;
+        lw_shared_ptr<output_stream<char>> output;
         std::exception_ptr error;
 
         try {
@@ -162,6 +170,13 @@ int main(int argc, char** argv) {
             client_cfg.server_name = server_name;
 
             session = make_lw_shared<connection>(co_await client.connect(std::move(client_cfg)));
+            auto quic_stream = co_await session->open_stream();
+            if (verbose) {
+                std::cout << "[client] opened stream sid=" << quic_stream.id() << "\n";
+                std::cout.flush();
+            }
+            input = make_lw_shared<input_stream<char>>(quic_stream.input());
+            output = make_lw_shared<output_stream<char>>(quic_stream.output());
             stdin_flag_guard guard(STDIN_FILENO);
 
             if (verbose) {
@@ -172,8 +187,8 @@ int main(int argc, char** argv) {
             seastar_apps_lib::stop_signal stop_signal;
             auto raced = co_await when_any(
               when_all_succeed(
-                receive_loop(session),
-                input_loop(session, std::chrono::milliseconds(poll_ms), verbose))
+                receive_loop(input),
+                input_loop(output, session, std::chrono::milliseconds(poll_ms), verbose))
                 .discard_result(),
               stop_signal
                 .wait()
@@ -204,6 +219,18 @@ int main(int argc, char** argv) {
         if (session) {
             try {
                 co_await session->close();
+            } catch (...) {
+            }
+        }
+        if (output) {
+            try {
+                co_await output->close();
+            } catch (...) {
+            }
+        }
+        if (input) {
+            try {
+                co_await input->close();
             } catch (...) {
             }
         }

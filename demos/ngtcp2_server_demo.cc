@@ -49,33 +49,74 @@ static socket_address parse_ipv6_address(const std::string& ip, uint16_t port) {
     return socket_address(sa);
 }
 
-static future<> handle_session(connection session, bool verbose, uint64_t conn_id) {
+static future<> handle_stream(seastar::quic::experimental::stream quic_stream, bool verbose, uint64_t conn_id, uint64_t stream_no) {
     try {
-        while (session.is_open()) {
-            auto msg = co_await session.receive();
+        auto input = quic_stream.input();
+        auto output = quic_stream.output();
+        while (true) {
+            auto chunk = co_await input.read();
+            if (chunk.empty()) {
+                break;
+            }
             if (verbose) {
-                std::cout << "[server conn#" << conn_id << "] recv sid=" << msg.stream
-                          << " bytes=" << msg.payload.size() << "\n";
+                std::cout << "[server conn#" << conn_id << " stream#" << stream_no << "] recv sid=" << quic_stream.id()
+                          << " bytes=" << chunk.size() << "\n";
             } else {
-                std::cout.write(msg.payload.get(), static_cast<std::streamsize>(msg.payload.size()));
-                if (msg.payload.size() && msg.payload.get()[msg.payload.size() - 1] != '\n') {
+                std::cout.write(chunk.get(), static_cast<std::streamsize>(chunk.size()));
+                if (chunk.size() && chunk.get()[chunk.size() - 1] != '\n') {
                     std::cout << "\n";
                 }
             }
             std::cout.flush();
+            co_await output.write(chunk.get(), chunk.size());
+            co_await output.flush();
+        }
+        co_await output.close();
+        co_await input.close();
+    } catch (const quic_exception& e) {
+        if (e.code() != quic_error::closed) {
+            std::cerr << "[server conn#" << conn_id << " stream#" << stream_no << "] stream error: " << e.what() << "\n";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[server conn#" << conn_id << " stream#" << stream_no << "] stream exception: " << e.what() << "\n";
+    }
+}
 
-            co_await session.send(msg.stream, std::move(msg.payload), msg.fin);
+static future<> handle_session(connection session, bool verbose, uint64_t conn_id) {
+    gate streams;
+    uint64_t next_stream_no = 1;
+    try {
+        while (session.is_open()) {
+            auto quic_stream = co_await session.accept_stream();
+            auto stream_no = next_stream_no++;
+            if (verbose) {
+                std::cout << "[server conn#" << conn_id << "] accepted stream sid=" << quic_stream.id() << "\n";
+                std::cout.flush();
+            }
+            (void)with_gate(streams, [quic_stream = std::move(quic_stream), verbose, conn_id, stream_no]() mutable {
+                return handle_stream(std::move(quic_stream), verbose, conn_id, stream_no);
+            }).handle_exception([](std::exception_ptr ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::exception& e) {
+                    std::cerr << "[server] stream task failed: " << e.what() << "\n";
+                }
+            }).or_terminate();
         }
     } catch (const quic_exception& e) {
         if (e.code() != quic_error::closed) {
-            std::cerr << "[server conn#" << conn_id << "] session error: " << e.what() << "\n";
+            std::cerr << "[server conn#" << conn_id << "] connection error: " << e.what() << "\n";
         }
     } catch (const std::exception& e) {
-        std::cerr << "[server conn#" << conn_id << "] session exception: " << e.what() << "\n";
+        std::cerr << "[server conn#" << conn_id << "] connection exception: " << e.what() << "\n";
     }
 
     try {
         co_await session.close();
+    } catch (...) {
+    }
+    try {
+        co_await streams.close();
     } catch (...) {
     }
 }
