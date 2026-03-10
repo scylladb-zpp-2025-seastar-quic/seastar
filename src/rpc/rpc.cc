@@ -149,13 +149,14 @@ snd_buf connection::compress(snd_buf buf) {
 
 future<> connection::send_buffer(snd_buf buf) {
     auto* b = std::get_if<temporary_buffer<char>>(&buf.bufs);
+    auto& write_buf = transport_layer().write_stream();
     if (b) {
-        return _connected->write_buf.write(std::move(*b));
+        return write_buf.write(std::move(*b));
     } else {
         return do_with(std::move(std::get<std::vector<temporary_buffer<char>>>(buf.bufs)),
-                [this] (std::vector<temporary_buffer<char>>& ar) {
-            return do_for_each(ar.begin(), ar.end(), [this] (auto& b) {
-                return _connected->write_buf.write(std::move(b));
+                [&write_buf] (std::vector<temporary_buffer<char>>& ar) {
+            return do_for_each(ar.begin(), ar.end(), [&write_buf] (auto& b) {
+                return write_buf.write(std::move(b));
             });
         });
     }
@@ -180,7 +181,7 @@ future<> connection::send_entry(outgoing_entry& d) noexcept {
         auto buf = compress(std::move(d.buf));
         return send_buffer(std::move(buf)).then([this] {
             _stats.sent_messages++;
-            return _connected->write_buf.flush();
+            return transport_layer().write_stream().flush();
         });
     });
 }
@@ -192,8 +193,8 @@ void connection::set_negotiated() noexcept {
 
 future<> connection::stop_send_loop(std::exception_ptr ex) {
     _error = true;
-    if (_connected) {
-        _connected->fd.shutdown_output();
+    if (_transport) {
+        _transport->shutdown_output();
     }
     if (ex == nullptr) {
         ex = std::make_exception_ptr(closed_error());
@@ -223,15 +224,26 @@ future<> connection::stop_send_loop(std::exception_ptr ex) {
         std::get<0>(res).ignore_ready_future();
         // _sink_closed_future is never exceptional
         bool sink_closed = std::get<1>(res).get();
-        return _connected && !sink_closed ? _connected->write_buf.close() : make_ready_future();
+        return _transport && !sink_closed ? _transport->close_write_stream() : make_ready_future();
     });
 }
 
 void connection::set_socket(connected_socket&& fd) {
-    if (_connected.has_value()) {
+    set_transport(std::make_unique<socket_transport>(std::move(fd)));
+}
+
+void connection::set_transport(std::unique_ptr<transport> tr) {
+    if (_transport) {
         throw std::runtime_error("already connected");
     }
-    _connected.emplace(std::move(fd));
+    _transport = std::move(tr);
+}
+
+connection::transport& connection::transport_layer() {
+    if (!_transport) {
+        throw std::runtime_error("transport is not configured");
+    }
+    return *_transport;
 }
 
 future<> connection::send_negotiation_frame(feature_map features) {
@@ -252,9 +264,9 @@ future<> connection::send_negotiation_frame(feature_map features) {
         p += 4;
         p = std::copy_n(e.second.begin(), e.second.size(), p);
     }
-    return _connected->write_buf.write(std::move(reply)).then([this] {
+    return transport_layer().write_stream().write(std::move(reply)).then([this] {
         _stats.sent_messages++;
-        return _connected->write_buf.flush();
+        return transport_layer().write_stream().flush();
     });
 }
 
@@ -341,7 +353,9 @@ future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point>
 void connection::abort() {
     if (!_error) {
         _error = true;
-        _connected->fd.shutdown_input();
+        if (_transport) {
+            _transport->shutdown_input();
+        }
     }
 }
 
@@ -547,7 +561,7 @@ future<> connection::stream_close() {
         _sink_closed_future = p.get_future();
         // stop_send_loop(), which also calls _write_buf.close(), and this code can run in parallel.
         // Use _sink_closed_future to serialize them and skip second call to close()
-        f = _connected->write_buf.close().finally([p = std::move(p)] () mutable { p.set_value(true);});
+        f = transport_layer().close_write_stream().finally([p = std::move(p)] () mutable { p.set_value(true);});
     }
     return f.finally([this] () mutable { return stop(); });
 }
@@ -563,7 +577,7 @@ future<> connection::stream_process_incoming(rcv_buf&& buf) {
 }
 
 future<> connection::handle_stream_frame() {
-    return read_stream_frame_compressed(_connected->read_buf).then([this] (std::optional<rcv_buf> data) {
+    return read_stream_frame_compressed(transport_layer().read_stream()).then([this] (std::optional<rcv_buf> data) {
         if (!data) {
             _error = true;
             return make_ready_future<>();
@@ -698,7 +712,7 @@ client::negotiate(feature_map provided) {
 
 future<> client::negotiate_protocol(feature_map features) {
     return send_negotiation_frame(std::move(features)).then([this] {
-        return receive_negotiation_frame(*this, _connected->read_buf).then([this] (feature_map features) {
+        return receive_negotiation_frame(*this, transport_layer().read_stream()).then([this] (feature_map features) {
             return negotiate(std::move(features));
         });
     });
@@ -984,12 +998,13 @@ future<> client::loop(client_options ops, const socket_address& addr, const sock
 
         _propagate_timeout = !is_stream();
         set_negotiated();
-        while (!_connected->read_buf.eof() && !_error) {
+        auto& read_buf = transport_layer().read_stream();
+        while (!read_buf.eof() && !_error) {
             if (is_stream()) {
                 co_await handle_stream_frame();
                 continue;
             }
-            auto&& [msg_id, ht, data] = co_await read_response_frame_compressed(_connected->read_buf);
+            auto&& [msg_id, ht, data] = co_await read_response_frame_compressed(read_buf);
             auto it = _outstanding.find(std::abs(msg_id));
             if (!data) {
                 _error = true;
@@ -1020,7 +1035,7 @@ future<> client::loop(client_options ops, const socket_address& addr, const sock
         }
     } catch (...) {
         ep = std::current_exception();
-        if (_connected) {
+        if (_transport) {
             if (is_stream()) {
                 log_exception(*this, log_level::error, "client stream connection dropped", ep);
             } else {
@@ -1160,7 +1175,7 @@ server::connection::negotiate(feature_map requested) {
 
 future<>
 server::connection::negotiate_protocol() {
-    return receive_negotiation_frame(*this, _connected->read_buf).then([this] (feature_map requested_features) {
+    return receive_negotiation_frame(*this, transport_layer().read_stream()).then([this] (feature_map requested_features) {
         return negotiate(std::move(requested_features)).then([this] (feature_map returned_features) {
             return send_negotiation_frame(std::move(returned_features));
         });
@@ -1219,12 +1234,13 @@ future<> server::connection::process() {
         auto sg = _isolation_config ? _isolation_config->sched_group : current_scheduling_group();
         co_await coroutine::switch_to(sg);
         set_negotiated();
-        while (!_connected->read_buf.eof() && !_error) {
+        auto& read_buf = transport_layer().read_stream();
+        while (!read_buf.eof() && !_error) {
             if (is_stream()) {
                 co_await handle_stream_frame();
                 continue;
             }
-            auto [expire, type, msg_id, data] = co_await read_request_frame_compressed(_connected->read_buf);
+            auto [expire, type, msg_id, data] = co_await read_request_frame_compressed(read_buf);
             if (!data) {
                 _error = true;
                 continue;
@@ -1256,7 +1272,9 @@ future<> server::connection::process() {
         log_exception(*this, log_level::error,
             format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
     }
-    _connected->fd.shutdown_input();
+    if (_transport) {
+        _transport->shutdown_input();
+    }
     if (is_stream() && (ep || _error)) {
         _stream_queue.abort(std::make_exception_ptr(stream_closed()));
     }

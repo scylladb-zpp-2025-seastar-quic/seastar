@@ -28,13 +28,13 @@ set (NGTCP2_ENABLE_OPENSSL
   BOOL 
   "Disable OpenSSL")
 
-set (BUILD_TESTING      
-  OFF
-  CACHE
-  BOOL 
-  "Disable tests")
+set(SAVED_BUILD_TESTING ${BUILD_TESTING})
+
+set(BUILD_TESTING OFF)
 
 add_subdirectory (ngtcp2)
+
+set(BUILD_TESTING ${SAVED_BUILD_TESTING})
 
 set (NGTCP2_SRC "${CMAKE_CURRENT_SOURCE_DIR}/ngtcp2")
 set (NGTCP2_BIN "${CMAKE_CURRENT_BINARY_DIR}/ngtcp2")

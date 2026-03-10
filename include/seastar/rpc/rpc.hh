@@ -22,6 +22,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <list>
@@ -240,18 +241,44 @@ class source_impl;
 
 class connection {
 protected:
-    struct socket_and_buffers {
-        connected_socket fd;
-        input_stream<char> read_buf;
-        output_stream<char> write_buf;
-        socket_and_buffers(connected_socket cs) noexcept
-                : fd(std::move(cs))
-                , read_buf(fd.input())
-                , write_buf(fd.output())
+    class transport {
+    public:
+        virtual ~transport() = default;
+        virtual input_stream<char>& read_stream() = 0;
+        virtual output_stream<char>& write_stream() = 0;
+        virtual void shutdown_output() = 0;
+        virtual void shutdown_input() = 0;
+        virtual future<> close_write_stream() = 0;
+    };
+
+    class socket_transport final : public transport {
+        connected_socket _fd;
+        input_stream<char> _read_buf;
+        output_stream<char> _write_buf;
+    public:
+        explicit socket_transport(connected_socket&& cs) noexcept
+                : _fd(std::move(cs))
+                , _read_buf(_fd.input())
+                , _write_buf(_fd.output())
         {}
+        input_stream<char>& read_stream() override {
+            return _read_buf;
+        }
+        output_stream<char>& write_stream() override {
+            return _write_buf;
+        }
+        void shutdown_output() override {
+            _fd.shutdown_output();
+        }
+        void shutdown_input() override {
+            _fd.shutdown_input();
+        }
+        future<> close_write_stream() override {
+            return _write_buf.close();
+        }
     };
     bool _error = false;
-    std::optional<socket_and_buffers> _connected;
+    std::unique_ptr<transport> _transport;
     std::optional<shared_promise<>> _negotiated = shared_promise<>();
     promise<> _stopped;
     stats _stats;
@@ -337,6 +364,8 @@ public:
     }
 
     void set_socket(connected_socket&& fd);
+    void set_transport(std::unique_ptr<transport> tr);
+    transport& transport_layer();
     bool error() const noexcept { return _error; }
     void abort();
     future<> stop() noexcept;
