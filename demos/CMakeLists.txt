@@ -123,26 +123,11 @@ seastar_add_demo (tutorial_examples
 seastar_add_demo (http_client
   SOURCES http_client_demo.cc)
 
-set (Seastar_QUIC_EXPERIMENTAL_SOURCES
-  ${CMAKE_CURRENT_SOURCE_DIR}/../src/quic/quic.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/../src/quic/quic_client.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/../src/quic/quic_error.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/../src/quic/quic_server.cc)
+seastar_add_demo (quic_server
+  SOURCES quic_server_demo.cc)
 
-add_library (seastar_quic_experimental STATIC
-  ${Seastar_QUIC_EXPERIMENTAL_SOURCES})
-
-target_link_libraries (seastar_quic_experimental
-  PRIVATE
-    seastar_private
-    ngtcp2::ngtcp2
-    gnutls)
-
-seastar_add_demo (ngtcp2_server
-  SOURCES ngtcp2_server_demo.cc)
-
-seastar_add_demo (ngtcp2_client
-  SOURCES ngtcp2_client_demo.cc)
+seastar_add_demo (quic_client
+  SOURCES quic_client_demo.cc)
 
 if (Seastar_MODULE)
   add_executable (hello_cxx_module)
@@ -157,15 +142,3 @@ if (Seastar_MODULE)
       CXX_STANDARD ${CMAKE_CXX_STANDARD}
       CXX_EXTENSIONS ON)
 endif ()
-
-target_link_libraries (demo_ngtcp2_server
-  PRIVATE 
-    seastar_quic_experimental
-    ngtcp2::ngtcp2
-    gnutls)
-
-target_link_libraries (demo_ngtcp2_client
-  PRIVATE 
-    seastar_quic_experimental
-    ngtcp2::ngtcp2
-    gnutls)

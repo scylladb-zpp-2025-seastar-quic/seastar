@@ -133,6 +133,34 @@ void to_sockaddr_storage_v6(const socket_address& sa, sockaddr_storage& out, soc
     outlen = sizeof(in6);
 }
 
+std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
+    if (!addr.addr || addr.addrlen == 0) {
+        return std::nullopt;
+    }
+
+    auto* sa = reinterpret_cast<const sockaddr*>(addr.addr);
+    switch (sa->sa_family) {
+    case AF_INET: {
+        if (addr.addrlen < sizeof(sockaddr_in)) {
+            return std::nullopt;
+        }
+        sockaddr_in in{};
+        std::memcpy(&in, sa, sizeof(in));
+        return socket_address(in);
+    }
+    case AF_INET6: {
+        if (addr.addrlen < sizeof(sockaddr_in6)) {
+            return std::nullopt;
+        }
+        sockaddr_in6 in6{};
+        std::memcpy(&in6, sa, sizeof(in6));
+        return socket_address(in6);
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
 temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) {
     size_t total = 0;
     for (const auto& b : bufs) {
@@ -325,6 +353,42 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
 };
 
 using conn_ptr = lw_shared_ptr<server_connection>;
+
+void sync_current_path(server_connection& conn) {
+    if (!conn.conn) {
+        return;
+    }
+
+    const auto* path = ngtcp2_conn_get_path(conn.conn);
+    if (!path) {
+        return;
+    }
+
+    auto local = to_socket_address(path->local);
+    auto remote = to_socket_address(path->remote);
+    if (!local || !remote) {
+        return;
+    }
+
+    auto old_local = to_socket_address(ngtcp2_addr{
+      reinterpret_cast<ngtcp2_sockaddr*>(&conn.local_ss),
+      static_cast<ngtcp2_socklen>(conn.local_ss_len),
+    });
+
+    if ((!old_local || *local == *old_local) && *remote == conn.peer) {
+        return;
+    }
+
+    quic_server_log.info("server active path updated: old_local={} old_remote={} new_local={} new_remote={}",
+      old_local.value_or(socket_address{}),
+      conn.peer,
+      *local,
+      *remote);
+
+    conn.peer = *remote;
+    to_sockaddr_storage_v6(*local, conn.local_ss, conn.local_ss_len);
+    to_sockaddr_storage_v6(conn.peer, conn.peer_ss, conn.peer_ss_len);
+}
 
 class quic_server_impl {
 public:
@@ -533,8 +597,10 @@ private:
             return 0;
         }
         conn->handshake_done = true;
+        sync_current_path(*conn);
         conn->runtime->mark_transport_ready(
-          conn->server ? conn->server->listen_address() : socket_address{},
+          to_socket_address(ngtcp2_conn_get_path(conn->conn)->local).value_or(
+            conn->server ? conn->server->listen_address() : socket_address{}),
           conn->peer,
           selected_alpn_or_empty(conn->tls));
         if (!conn->accepted_to_listener && conn->server) {
@@ -544,6 +610,43 @@ private:
         quic_server_log.info("server handshake completed: peer={} alpn='{}'", conn->peer, conn->runtime->selected_alpn());
         conn->wake_actor();
         conn->request_timer_rearm();
+        return 0;
+    }
+
+    static int begin_path_validation_cb(ngtcp2_conn*, uint32_t, const ngtcp2_path* path, const ngtcp2_path*, void* user_data) {
+        auto* conn = static_cast<server_connection*>(user_data);
+        if (!conn || !path) {
+            return 0;
+        }
+
+        auto remote = to_socket_address(path->remote);
+        if (remote) {
+            quic_server_log.info("server begin path validation: peer={} candidate_remote={}", conn->peer, *remote);
+        }
+        return 0;
+    }
+
+    static int path_validation_cb(
+      ngtcp2_conn*,
+      uint32_t,
+      const ngtcp2_path* path,
+      const ngtcp2_path* fallback_path,
+      ngtcp2_path_validation_result res,
+      void* user_data) {
+        auto* conn = static_cast<server_connection*>(user_data);
+        if (!conn) {
+            return 0;
+        }
+
+        auto candidate = path ? to_socket_address(path->remote) : std::nullopt;
+        auto fallback = fallback_path ? to_socket_address(fallback_path->remote) : std::nullopt;
+        quic_server_log.info("server path validation complete: peer={} result={} candidate_remote={} fallback_remote={}",
+          conn->peer,
+          res == NGTCP2_PATH_VALIDATION_RESULT_SUCCESS ? "success" : "failure",
+          candidate.value_or(socket_address{}),
+          fallback.value_or(socket_address{}));
+
+        sync_current_path(*conn);
         return 0;
     }
 
@@ -699,6 +802,8 @@ private:
         callbacks.rand = rand_cb;
         callbacks.get_new_connection_id = get_new_connection_id_cb;
         callbacks.get_path_challenge_data = get_path_challenge_data_cb;
+        callbacks.path_validation = path_validation_cb;
+        callbacks.begin_path_validation = begin_path_validation_cb;
         callbacks.handshake_completed = handshake_completed_cb;
         callbacks.dcid_status = dcid_status_cb;
         callbacks.recv_stream_data = recv_stream_data_cb;
@@ -719,6 +824,7 @@ private:
         params.initial_max_data = _cfg.session_options.transport.initial_max_data;
         params.initial_max_streams_bidi = _cfg.session_options.transport.initial_max_streams_bidi;
         params.max_idle_timeout = _cfg.session_options.transport.max_idle_timeout_ns;
+        params.disable_active_migration = 1;
 
         ngtcp2_path path{};
         conn->fill_path(path);
@@ -997,14 +1103,19 @@ private:
         co_await flush_pending_packets_actor(conn);
     }
 
-    static future<> handle_conn_datagram_actor(conn_ptr conn, temporary_buffer<char> pkt) {
+    static future<> handle_conn_datagram_actor(conn_ptr conn, const socket_address& src, temporary_buffer<char> pkt) {
         if (!conn->active() || !conn->conn) {
             co_return;
         }
-        quic_server_log.trace("server handle_conn_datagram_actor: peer={} bytes={}", conn->peer, pkt.size());
+        quic_server_log.trace("server handle_conn_datagram_actor: peer={} src={} bytes={}", conn->peer, src, pkt.size());
+
+        sockaddr_storage peer_ss{};
+        socklen_t peer_ss_len = 0;
+        to_sockaddr_storage_v6(src, peer_ss, peer_ss_len);
 
         ngtcp2_path path{};
-        conn->fill_path(path);
+        init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&conn->local_ss), conn->local_ss_len);
+        init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&peer_ss), peer_ss_len);
         ngtcp2_pkt_info pkt_info{};
 
         int rv = ngtcp2_conn_read_pkt(
@@ -1021,6 +1132,7 @@ private:
             co_return;
         }
 
+        sync_current_path(*conn);
         co_await flush_pending_packets_actor(conn);
         conn->request_timer_rearm();
     }
@@ -1180,7 +1292,7 @@ private:
                 if (!evt) {
                     continue;
                 }
-                co_await handle_conn_datagram_actor(conn, std::move(evt->packet));
+                co_await handle_conn_datagram_actor(conn, evt->src, std::move(evt->packet));
             }
 
             while (conn->active() && !conn->stop_requested && !conn->op_queue.empty()) {
@@ -1215,7 +1327,7 @@ private:
         }
     }
 
-    future<> handle_datagram(net::datagram d) {
+    void handle_datagram(net::datagram d) {
         auto src = d.get_src();
         auto pkt = linearize_packet(d.get_buffers());
         const auto* data = reinterpret_cast<const uint8_t*>(pkt.get());
@@ -1225,7 +1337,7 @@ private:
         auto parsed = parse_dcid(data, len, server_short_cid_len);
         if (!parsed.ok) {
             quic_server_log.debug("server drop datagram: failed to parse DCID src={} bytes={}", src, len);
-            co_return;
+            return;
         }
 
         conn_ptr conn;
@@ -1238,34 +1350,32 @@ private:
             if (!parsed.long_header || parsed.long_type != quic_long_type::initial) {
                 quic_server_log.debug("server drop datagram: unknown DCID and not Initial src={} long_header={} long_type={}",
                   src, parsed.long_header, static_cast<unsigned>(parsed.long_type));
-                co_return;
+                return;
             }
             try {
                 conn = init_connection(src, data, len);
             } catch (...) {
                 quic_server_log.warn("server failed to initialize connection from Initial packet: src={} bytes={}", src, len);
-                co_return;
+                return;
             }
         }
 
         if (!conn || conn->closing) {
             quic_server_log.debug("server drop datagram: conn missing/closing src={}", src);
-            co_return;
-        }
-
-        if (conn->peer != src) {
-            quic_server_log.info("server peer address updated: old={} new={}", conn->peer, src);
-            conn->peer = src;
-            to_sockaddr_storage_v6(src, conn->peer_ss, conn->peer_ss_len);
+            return;
         }
 
         try {
             auto evt = std::make_unique<conn_rx_event>(conn_rx_event{src, std::move(pkt)});
-            co_await conn->rx_queue.push_eventually(std::move(evt));
+            if (!conn->rx_queue.push(std::move(evt))) {
+                quic_server_log.warn("server rx queue full: peer={} queued={} max={}", conn->peer, conn->rx_queue.size(), conn->rx_queue.max_size());
+                conn->fail(quic_error::io, "server rx queue is full");
+                return;
+            }
             conn->wake_actor();
         } catch (...) {
             if (!conn->active()) {
-                co_return;
+                return;
             }
             conn->fail(quic_error::io, "server rx queue push failed");
         }
@@ -1275,7 +1385,7 @@ private:
         while (!_stopping) {
             try {
                 auto d = co_await _channel.receive();
-                co_await handle_datagram(std::move(d));
+                handle_datagram(std::move(d));
             } catch (...) {
                 if (_stopping) {
                     co_return;

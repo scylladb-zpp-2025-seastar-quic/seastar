@@ -34,6 +34,7 @@ struct quic_client_config {
     socket_address remote_address;
     std::optional<socket_address> local_address{};
     sstring server_name = "localhost";
+    std::optional<sstring> ca_file{};
     std::vector<sstring> alpns = {sstring("h3")};
     connection_options session_options{};
 };

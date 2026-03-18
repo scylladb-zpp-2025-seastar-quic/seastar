@@ -548,7 +548,6 @@ public:
         : _state(std::move(state)) {
     }
 
-#if SEASTAR_API_LEVEL >= 9
     future<> put(std::span<temporary_buffer<char>> bufs) override {
         std::vector<temporary_buffer<char>> owned;
         owned.reserve(bufs.size());
@@ -561,13 +560,6 @@ public:
             });
         });
     }
-#else
-    using data_sink_impl::put;
-
-    future<> put(net::packet p) override {
-        return fallback_put(std::move(p));
-    }
-#endif
 
     future<> close() override {
         return _state->close_output();

@@ -61,6 +61,11 @@ constexpr size_t default_udp_payload_size = 1200;
 static logger quic_client_log("quic_client");
 using quic_message = internal::quic_message;
 
+struct tls_verification_failure {
+    quic_error error = quic_error::none;
+    sstring detail;
+};
+
 class gnutls_global_guard {
 public:
     gnutls_global_guard() {
@@ -126,6 +131,34 @@ void to_sockaddr_storage_v6(const socket_address& sa, sockaddr_storage& out, soc
     auto in6 = sa.as_posix_sockaddr_in6();
     std::memcpy(&out, &in6, sizeof(in6));
     outlen = sizeof(in6);
+}
+
+std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
+    if (!addr.addr || addr.addrlen == 0) {
+        return std::nullopt;
+    }
+
+    auto* sa = reinterpret_cast<const sockaddr*>(addr.addr);
+    switch (sa->sa_family) {
+    case AF_INET: {
+        if (addr.addrlen < sizeof(sockaddr_in)) {
+            return std::nullopt;
+        }
+        sockaddr_in in{};
+        std::memcpy(&in, sa, sizeof(in));
+        return socket_address(in);
+    }
+    case AF_INET6: {
+        if (addr.addrlen < sizeof(sockaddr_in6)) {
+            return std::nullopt;
+        }
+        sockaddr_in6 in6{};
+        std::memcpy(&in6, sa, sizeof(in6));
+        return socket_address(in6);
+    }
+    default:
+        return std::nullopt;
+    }
 }
 
 temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) {
@@ -339,6 +372,38 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 };
 
+void sync_current_path(client_state& st) {
+    if (!st.conn) {
+        return;
+    }
+
+    const auto* path = ngtcp2_conn_get_path(st.conn);
+    if (!path) {
+        return;
+    }
+
+    auto local = to_socket_address(path->local);
+    auto remote = to_socket_address(path->remote);
+    if (!local || !remote) {
+        return;
+    }
+
+    if (*local == st.local_address && *remote == st.remote_address) {
+        return;
+    }
+
+    quic_client_log.info("client active path updated: old_local={} old_remote={} new_local={} new_remote={}",
+      st.local_address,
+      st.remote_address,
+      *local,
+      *remote);
+
+    st.local_address = *local;
+    st.remote_address = *remote;
+    to_sockaddr_storage_v6(st.local_address, st.local_ss, st.local_ss_len);
+    to_sockaddr_storage_v6(st.remote_address, st.remote_ss, st.remote_ss_len);
+}
+
 ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref) {
     return static_cast<ngtcp2_conn*>(ref->user_data);
 }
@@ -367,15 +432,97 @@ sstring selected_alpn_or_empty(gnutls_session_t tls) {
     return {reinterpret_cast<const char*>(selected.data), selected.size};
 }
 
+static sstring certificate_status_to_string(gnutls_session_t tls, unsigned int status) {
+    gnutls_datum_t out{};
+    auto rv = gnutls_certificate_verification_status_print(
+      status, gnutls_certificate_type_get(tls), &out, 0);
+    if (rv < 0) {
+        return sstring("certificate verification failed");
+    }
+    sstring message(reinterpret_cast<const char*>(out.data), out.size);
+    gnutls_free(out.data);
+    while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) {
+        message.resize(message.size() - 1);
+    }
+    return message;
+}
+
+static std::optional<tls_verification_failure> verify_tls_peer_certificate(client_state& st) {
+    unsigned int status = 0;
+    auto* hostname = st.cfg.server_name.empty() ? nullptr : st.cfg.server_name.c_str();
+    int rv = gnutls_certificate_verify_peers3(st.tls, hostname, &status);
+    if (rv < 0) {
+        return tls_verification_failure{
+          .error = classify_gnutls_error(rv),
+          .detail = sstring("peer certificate verification failed: ") + gnutls_error_message(rv),
+        };
+    }
+    if (status != 0) {
+        return tls_verification_failure{
+          .error = quic_error::protocol,
+          .detail = sstring("peer certificate verification failed: ")
+                    + certificate_status_to_string(st.tls, status),
+        };
+    }
+    return std::nullopt;
+}
+
 int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
     auto* st = static_cast<client_state*>(user_data);
+    if (auto verification_failure = verify_tls_peer_certificate(*st)) {
+        quic_client_log.warn(
+          "client handshake verification failed: error={} detail='{}'",
+          to_string(verification_failure->error),
+          verification_failure->detail);
+        st->fail(verification_failure->error, verification_failure->detail);
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     st->handshake_done = true;
+    sync_current_path(*st);
     st->runtime->mark_transport_ready(st->local_address, st->remote_address, selected_alpn_or_empty(st->tls));
     st->resolve_handshake_ready();
     quic_client_log.info("client handshake completed");
 
     st->wake_actor();
     st->request_timer_rearm();
+    return 0;
+}
+
+int begin_path_validation_cb(ngtcp2_conn*, uint32_t, const ngtcp2_path* path, const ngtcp2_path*, void* user_data) {
+    auto* st = static_cast<client_state*>(user_data);
+    if (!st || !path) {
+        return 0;
+    }
+
+    auto remote = to_socket_address(path->remote);
+    if (remote) {
+        quic_client_log.info("client begin path validation: current_remote={} candidate_remote={}",
+          st->remote_address,
+          *remote);
+    }
+    return 0;
+}
+
+int path_validation_cb(
+  ngtcp2_conn*,
+  uint32_t,
+  const ngtcp2_path* path,
+  const ngtcp2_path* fallback_path,
+  ngtcp2_path_validation_result res,
+  void* user_data) {
+    auto* st = static_cast<client_state*>(user_data);
+    if (!st) {
+        return 0;
+    }
+
+    auto candidate = path ? to_socket_address(path->remote) : std::nullopt;
+    auto fallback = fallback_path ? to_socket_address(fallback_path->remote) : std::nullopt;
+    quic_client_log.info("client path validation complete: result={} candidate_remote={} fallback_remote={}",
+      res == NGTCP2_PATH_VALIDATION_RESULT_SUCCESS ? "success" : "failure",
+      candidate.value_or(socket_address{}),
+      fallback.value_or(socket_address{}));
+
+    sync_current_path(*st);
     return 0;
 }
 
@@ -436,6 +583,22 @@ void init_tls(client_state& st) {
     int rv = gnutls_certificate_allocate_credentials(&st.cred);
     if (rv < 0) {
         throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+    }
+
+    rv = gnutls_certificate_set_x509_system_trust(st.cred);
+    if (rv < 0) {
+        throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+    }
+    if (st.cfg.ca_file) {
+        rv = gnutls_certificate_set_x509_trust_file(st.cred, st.cfg.ca_file->c_str(), GNUTLS_X509_FMT_PEM);
+        if (rv < 0) {
+            throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+        }
+        if (rv == 0) {
+            throw quic_exception(
+              quic_error::invalid_argument,
+              sstring("no trust anchors loaded from ") + *st.cfg.ca_file);
+        }
     }
 
     rv = gnutls_init(&st.tls, GNUTLS_CLIENT | GNUTLS_ENABLE_EARLY_DATA);
@@ -508,6 +671,8 @@ void init_client_connection(client_state& st) {
     callbacks.rand = rand_cb;
     callbacks.get_new_connection_id = get_new_connection_id_cb;
     callbacks.get_path_challenge_data = get_path_challenge_data_cb;
+    callbacks.path_validation = path_validation_cb;
+    callbacks.begin_path_validation = begin_path_validation_cb;
     callbacks.handshake_completed = handshake_completed_cb;
     callbacks.recv_stream_data = recv_stream_data_cb;
     callbacks.stream_reset = stream_reset_cb;
@@ -525,6 +690,7 @@ void init_client_connection(client_state& st) {
     params.initial_max_data = st.cfg.session_options.transport.initial_max_data;
     params.initial_max_streams_bidi = st.cfg.session_options.transport.initial_max_streams_bidi;
     params.max_idle_timeout = st.cfg.session_options.transport.max_idle_timeout_ns;
+    params.disable_active_migration = 1;
 
     auto dcid = random_cid(8);
     auto scid = random_cid(8);
@@ -752,14 +918,19 @@ future<> stop_sending_actor(lw_shared_ptr<client_state> st, stream_id sid, appli
     st->request_timer_rearm();
 }
 
-future<> recv_datagram_actor(lw_shared_ptr<client_state> st, temporary_buffer<char> pkt) {
+future<> recv_datagram_actor(lw_shared_ptr<client_state> st, const socket_address& src, temporary_buffer<char> pkt) {
     if (!st->active() || !st->conn) {
         co_return;
     }
-    quic_client_log.trace("client recv_datagram_actor: bytes={}", pkt.size());
+    quic_client_log.trace("client recv_datagram_actor: src={} bytes={}", src, pkt.size());
+
+    sockaddr_storage remote_ss{};
+    socklen_t remote_ss_len = 0;
+    to_sockaddr_storage_v6(src, remote_ss, remote_ss_len);
 
     ngtcp2_path path{};
-    st->fill_path(path);
+    init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&st->local_ss), st->local_ss_len);
+    init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&remote_ss), remote_ss_len);
     ngtcp2_pkt_info pkt_info{};
     int rv = ngtcp2_conn_read_pkt(
       st->conn, &path, &pkt_info, reinterpret_cast<const uint8_t*>(pkt.get()), pkt.size(), now_ns());
@@ -774,6 +945,7 @@ future<> recv_datagram_actor(lw_shared_ptr<client_state> st, temporary_buffer<ch
         co_return;
     }
 
+    sync_current_path(*st);
     co_await flush_pending_packets_actor(st);
     st->request_timer_rearm();
 }
@@ -830,7 +1002,7 @@ future<> send_connection_close_actor(lw_shared_ptr<client_state> st) {
     co_await send_datagram(st->channel, st->remote_address, outbuf.data(), static_cast<size_t>(nwrite));
 }
 
-future<> recv_loop(lw_shared_ptr<client_state> st) {
+    future<> recv_loop(lw_shared_ptr<client_state> st) {
     while (st->active()) {
         net::datagram d(std::unique_ptr<net::datagram_impl>{});
         try {
@@ -961,8 +1133,7 @@ future<> actor_loop(lw_shared_ptr<client_state> st) {
             if (!evt) {
                 continue;
             }
-            to_sockaddr_storage_v6(evt->src, st->remote_ss, st->remote_ss_len);
-            co_await recv_datagram_actor(st, std::move(evt->packet));
+            co_await recv_datagram_actor(st, evt->src, std::move(evt->packet));
         }
 
         while (st->active() && !st->op_queue.empty()) {
