@@ -821,8 +821,11 @@ private:
           _cfg.session_options.transport.initial_max_stream_data_bidi_local;
         params.initial_max_stream_data_bidi_remote =
           _cfg.session_options.transport.initial_max_stream_data_bidi_remote;
+        params.initial_max_stream_data_uni =
+          _cfg.session_options.transport.initial_max_stream_data_uni;
         params.initial_max_data = _cfg.session_options.transport.initial_max_data;
         params.initial_max_streams_bidi = _cfg.session_options.transport.initial_max_streams_bidi;
+        params.initial_max_streams_uni = _cfg.session_options.transport.initial_max_streams_uni;
         params.max_idle_timeout = _cfg.session_options.transport.max_idle_timeout_ns;
         params.disable_active_migration = 1;
 
@@ -1059,7 +1062,7 @@ private:
         if (!conn->conn) {
             co_return;
         }
-        int rv = ngtcp2_conn_shutdown_stream(conn->conn, 0, sid, app_error_code);
+        int rv = ngtcp2_conn_shutdown_stream_write(conn->conn, 0, sid, app_error_code);
         if (rv < 0) {
             conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
             co_return;

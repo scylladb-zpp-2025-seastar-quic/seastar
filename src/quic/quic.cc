@@ -273,14 +273,20 @@ class stream_state final : public enable_shared_from_this<stream_state> {
     class sink_impl;
 
 public:
-    stream_state(session_runtime_ptr runtime, stream_id sid, stream_type type)
+    stream_state(session_runtime_ptr runtime, stream_id sid, stream_type type, bool peer_initiated)
         : _runtime(std::move(runtime))
         , _id(sid)
-        , _type(type) {
+        , _type(type)
+        , _can_read(type == stream_type::bidirectional || peer_initiated)
+        , _can_write(type == stream_type::bidirectional || !peer_initiated) {
+        if (!_can_read) {
+            notify_input_shutdown();
+        }
     }
 
     bool is_open() const noexcept {
-        return !_output_closed && !_transport_closed;
+        return !_transport_closed
+               && ((_can_read && !_input_shutdown_notified) || (_can_write && !_output_closed));
     }
 
     stream_id id() const noexcept {
@@ -289,6 +295,14 @@ public:
 
     stream_type type() const noexcept {
         return _type;
+    }
+
+    bool can_read() const noexcept {
+        return _can_read;
+    }
+
+    bool can_write() const noexcept {
+        return _can_write;
     }
 
     input_stream<char> input(connected_socket_input_stream_config cfg);
@@ -346,6 +360,8 @@ private:
     session_runtime_ptr _runtime;
     stream_id _id = invalid_stream_id;
     stream_type _type = stream_type::bidirectional;
+    bool _can_read = true;
+    bool _can_write = true;
 
     queue<temporary_buffer<char>> _read_queue{1024};
     shared_promise<> _input_shutdown;
@@ -388,7 +404,7 @@ public:
 
     future<stream> open_stream(stream_open_options options) {
         auto sid = co_await _runtime->open_stream(options.type);
-        auto st = get_or_create_stream(sid, options.type);
+        auto st = get_or_create_stream(sid, options.type, false);
         co_return stream(std::move(st));
     }
 
@@ -405,10 +421,10 @@ public:
         co_await _gate.close();
     }
 
-    shared_ptr<stream_state> get_or_create_stream(stream_id sid, stream_type type) {
+    shared_ptr<stream_state> get_or_create_stream(stream_id sid, stream_type type, bool peer_initiated) {
         auto [it, inserted] = _streams.emplace(sid, shared_ptr<stream_state>{});
         if (inserted || !it->second) {
-            it->second = make_shared<stream_state>(_runtime, sid, type);
+            it->second = make_shared<stream_state>(_runtime, sid, type, peer_initiated);
         }
         return it->second;
     }
@@ -419,14 +435,14 @@ private:
             auto evt = co_await _runtime->receive_event();
             switch (evt.op) {
             case stream_event::kind::opened: {
-                auto st = get_or_create_stream(evt.stream, evt.type);
+                auto st = get_or_create_stream(evt.stream, evt.type, evt.peer_initiated);
                 if (evt.peer_initiated && _accepted_stream_ids.emplace(evt.stream).second) {
                     co_await _accepted_streams.push_eventually(shared_ptr<stream_state>(st));
                 }
                 break;
             }
             case stream_event::kind::data: {
-                auto st = get_or_create_stream(evt.stream, evt.type);
+                auto st = get_or_create_stream(evt.stream, evt.type, evt.peer_initiated);
                 if (evt.peer_initiated && _accepted_stream_ids.emplace(evt.stream).second) {
                     co_await _accepted_streams.push_eventually(shared_ptr<stream_state>(st));
                 }
@@ -434,7 +450,7 @@ private:
                 break;
             }
             case stream_event::kind::reset: {
-                auto st = get_or_create_stream(evt.stream, evt.type);
+                auto st = get_or_create_stream(evt.stream, evt.type, evt.peer_initiated);
                 st->on_reset(evt.app_error_code);
                 break;
             }
@@ -461,6 +477,9 @@ private:
 };
 
 future<> stream_state::send_one(temporary_buffer<char> payload, bool fin) {
+    if (!_can_write) {
+        return make_exception_future<>(quic_exception(quic_error::invalid_state, "stream output is unavailable"));
+    }
     if (!_runtime) {
         return make_exception_future<>(quic_exception(quic_error::closed, "stream runtime is gone"));
     }
@@ -475,6 +494,9 @@ future<> stream_state::send_one(temporary_buffer<char> payload, bool fin) {
 }
 
 future<> stream_state::close_output() {
+    if (!_can_write) {
+        throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+    }
     if (_output_closed) {
         co_return;
     }
@@ -483,15 +505,26 @@ future<> stream_state::close_output() {
 }
 
 future<> stream_state::reset(application_error_code app_error_code) {
+    if (!_can_write) {
+        throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+    }
+    if (_output_closed) {
+        co_return;
+    }
     _output_closed = true;
     if (!_runtime) {
         co_return;
     }
-    abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::closed, "stream reset")));
     co_await _runtime->reset_stream(_id, app_error_code);
 }
 
 future<> stream_state::stop_sending(application_error_code app_error_code) {
+    if (!_can_read) {
+        throw_quic_error(quic_error::invalid_state, "stream input is unavailable");
+    }
+    if (_input_shutdown_notified) {
+        co_return;
+    }
     if (!_runtime) {
         co_return;
     }
@@ -574,18 +607,30 @@ private:
 };
 
 input_stream<char> stream_state::input(connected_socket_input_stream_config cfg) {
+    if (!_can_read) {
+        throw_quic_error(quic_error::invalid_state, "stream input is unavailable");
+    }
     return input_stream<char>(source(cfg));
 }
 
 output_stream<char> stream_state::output(size_t buffer_size) {
+    if (!_can_write) {
+        throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+    }
     return output_stream<char>(sink(), buffer_size);
 }
 
 data_source stream_state::source(connected_socket_input_stream_config) {
+    if (!_can_read) {
+        throw_quic_error(quic_error::invalid_state, "stream input is unavailable");
+    }
     return data_source(std::make_unique<source_impl>(shared_from_this()));
 }
 
 data_sink stream_state::sink() {
+    if (!_can_write) {
+        throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+    }
     return data_sink(std::make_unique<sink_impl>(shared_from_this()));
 }
 
@@ -686,6 +731,14 @@ stream::stream(internal::stream_state_ptr state)
 
 bool stream::is_open() const noexcept {
     return _state && _state->is_open();
+}
+
+bool stream::can_read() const noexcept {
+    return _state && _state->can_read();
+}
+
+bool stream::can_write() const noexcept {
+    return _state && _state->can_write();
 }
 
 stream_id stream::id() const noexcept {
@@ -792,6 +845,9 @@ future<> connection::close() {
 connected_socket to_connected_socket(stream&& s) {
     if (!s._state) {
         throw_quic_error(quic_error::invalid_state, "stream state is null");
+    }
+    if (!s._state->can_read() || !s._state->can_write()) {
+        throw_quic_error(quic_error::invalid_state, "connected_socket requires a bidirectional stream");
     }
     return connected_socket(std::make_unique<quic_connected_socket_impl>(std::move(s._state)));
 }

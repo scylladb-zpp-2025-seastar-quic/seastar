@@ -687,8 +687,11 @@ void init_client_connection(client_state& st) {
       st.cfg.session_options.transport.initial_max_stream_data_bidi_local;
     params.initial_max_stream_data_bidi_remote =
       st.cfg.session_options.transport.initial_max_stream_data_bidi_remote;
+    params.initial_max_stream_data_uni =
+      st.cfg.session_options.transport.initial_max_stream_data_uni;
     params.initial_max_data = st.cfg.session_options.transport.initial_max_data;
     params.initial_max_streams_bidi = st.cfg.session_options.transport.initial_max_streams_bidi;
+    params.initial_max_streams_uni = st.cfg.session_options.transport.initial_max_streams_uni;
     params.max_idle_timeout = st.cfg.session_options.transport.max_idle_timeout_ns;
     params.disable_active_migration = 1;
 
@@ -896,7 +899,7 @@ future<> reset_stream_actor(lw_shared_ptr<client_state> st, stream_id sid, appli
     if (!st->conn) {
         co_return;
     }
-    int rv = ngtcp2_conn_shutdown_stream(st->conn, 0, sid, app_error_code);
+    int rv = ngtcp2_conn_shutdown_stream_write(st->conn, 0, sid, app_error_code);
     if (rv < 0) {
         st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
         co_return;

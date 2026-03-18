@@ -50,8 +50,10 @@ struct transport_config {
     uint64_t max_idle_timeout_ns = 60ULL * 1000 * 1000 * 1000;
     uint64_t initial_max_stream_data_bidi_local = 256 * 1024;
     uint64_t initial_max_stream_data_bidi_remote = 256 * 1024;
+    uint64_t initial_max_stream_data_uni = 256 * 1024;
     uint64_t initial_max_data = 4 * 1024 * 1024;
     uint64_t initial_max_streams_bidi = 128;
+    uint64_t initial_max_streams_uni = 128;
 };
 
 struct connection_options {
@@ -87,6 +89,8 @@ public:
     bool is_open() const noexcept;
     stream_id id() const noexcept;
     stream_type type() const noexcept;
+    bool can_read() const noexcept;
+    bool can_write() const noexcept;
 
     input_stream<char> input(connected_socket_input_stream_config cfg = {});
     output_stream<char> output(size_t buffer_size = 8192);
