@@ -328,6 +328,8 @@ public:
 
     void on_data(temporary_buffer<char> payload, bool fin);
     void on_reset(application_error_code app_error_code);
+    void on_stop_sending_input(application_error_code app_error_code);
+    void on_stop_sending_output(application_error_code app_error_code);
     void on_transport_closed();
 
 private:
@@ -454,8 +456,15 @@ private:
                 st->on_reset(evt.app_error_code);
                 break;
             }
-            case stream_event::kind::stop_sending:
+            case stream_event::kind::stop_sending: {
+                auto st = get_or_create_stream(evt.stream, evt.type, evt.peer_initiated);
+                if (evt.shutdown_side == stream_shutdown_side::write) {
+                    st->on_stop_sending_output(evt.app_error_code);
+                } else {
+                    st->on_stop_sending_input(evt.app_error_code);
+                }
                 break;
+            }
             case stream_event::kind::transport_closed:
                 co_return;
             }
@@ -549,6 +558,20 @@ void stream_state::on_reset(application_error_code) {
     abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::closed, "peer reset stream")));
 }
 
+void stream_state::on_stop_sending_input(application_error_code) {
+    if (!_can_read || _input_shutdown_notified) {
+        return;
+    }
+    abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::closed, "stop_sending")));
+}
+
+void stream_state::on_stop_sending_output(application_error_code) {
+    if (!_can_write || _output_closed) {
+        return;
+    }
+    _output_closed = true;
+}
+
 void stream_state::on_transport_closed() {
     if (_transport_closed) {
         return;
@@ -617,6 +640,9 @@ output_stream<char> stream_state::output(size_t buffer_size) {
     if (!_can_write) {
         throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
     }
+    if (_output_closed) {
+        throw_quic_error(quic_error::closed, "stream output is closed");
+    }
     return output_stream<char>(sink(), buffer_size);
 }
 
@@ -630,6 +656,9 @@ data_source stream_state::source(connected_socket_input_stream_config) {
 data_sink stream_state::sink() {
     if (!_can_write) {
         throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+    }
+    if (_output_closed) {
+        throw_quic_error(quic_error::closed, "stream output is closed");
     }
     return data_sink(std::make_unique<sink_impl>(shared_from_this()));
 }

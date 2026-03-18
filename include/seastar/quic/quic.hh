@@ -150,6 +150,11 @@ struct quic_message {
     bool fin = false;
 };
 
+enum class stream_shutdown_side : uint8_t {
+    read,
+    write,
+};
+
 struct stream_event {
     enum class kind : uint8_t {
         opened,
@@ -166,6 +171,7 @@ struct stream_event {
     temporary_buffer<char> payload;
     bool fin = false;
     application_error_code app_error_code = 0;
+    stream_shutdown_side shutdown_side = stream_shutdown_side::read;
 };
 
 struct transport_command {
