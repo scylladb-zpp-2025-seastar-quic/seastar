@@ -684,7 +684,21 @@ int stream_stop_sending_cb(ngtcp2_conn* conn, int64_t sid, uint64_t app_error_co
     if (!st->runtime) {
         return 0;
     }
-    push_stream_event(*st, conn, internal::stream_event::kind::stop_sending, sid, app_error_code, internal::stream_shutdown_side::read);
+    push_stream_event(*st, conn, internal::stream_event::kind::stop_sending, sid, app_error_code, internal::stream_shutdown_side::write);
+    return 0;
+}
+
+int stream_close_cb(ngtcp2_conn* conn, uint32_t, int64_t sid, uint64_t, void* user_data, void*) {
+    auto* st = static_cast<client_state*>(user_data);
+    if (!st || !conn || ngtcp2_conn_is_local_stream(conn, sid)) {
+        return 0;
+    }
+
+    if (ngtcp2_is_bidi_stream(sid)) {
+        ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+    } else {
+        ngtcp2_conn_extend_max_streams_uni(conn, 1);
+    }
     return 0;
 }
 
@@ -808,6 +822,7 @@ void init_client_connection(client_state& st) {
     callbacks.begin_path_validation = begin_path_validation_cb;
     callbacks.handshake_completed = handshake_completed_cb;
     callbacks.recv_stream_data = recv_stream_data_cb;
+    callbacks.stream_close = stream_close_cb;
     callbacks.stream_reset = stream_reset_cb;
     callbacks.stream_stop_sending = stream_stop_sending_cb;
     callbacks.extend_max_local_streams_bidi = extend_max_local_streams_bidi_cb;

@@ -821,7 +821,21 @@ private:
         if (!conn || !conn->runtime) {
             return 0;
         }
-        push_stream_event(*conn, ngconn, internal::stream_event::kind::stop_sending, sid, app_error_code, internal::stream_shutdown_side::read);
+        push_stream_event(*conn, ngconn, internal::stream_event::kind::stop_sending, sid, app_error_code, internal::stream_shutdown_side::write);
+        return 0;
+    }
+
+    static int stream_close_cb(ngtcp2_conn* ngconn, uint32_t, int64_t sid, uint64_t, void* user_data, void*) {
+        auto* conn = static_cast<server_connection*>(user_data);
+        if (!conn || !ngconn || ngtcp2_conn_is_local_stream(ngconn, sid)) {
+            return 0;
+        }
+
+        if (ngtcp2_is_bidi_stream(sid)) {
+            ngtcp2_conn_extend_max_streams_bidi(ngconn, 1);
+        } else {
+            ngtcp2_conn_extend_max_streams_uni(ngconn, 1);
+        }
         return 0;
     }
 
@@ -936,6 +950,7 @@ private:
         callbacks.handshake_completed = handshake_completed_cb;
         callbacks.dcid_status = dcid_status_cb;
         callbacks.recv_stream_data = recv_stream_data_cb;
+        callbacks.stream_close = stream_close_cb;
         callbacks.stream_reset = stream_reset_cb;
         callbacks.stream_stop_sending = stream_stop_sending_cb;
         callbacks.extend_max_local_streams_bidi = extend_max_local_streams_bidi_cb;
