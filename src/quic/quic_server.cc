@@ -269,6 +269,7 @@ struct conn_rx_event {
 struct server_connection : public enable_lw_shared_from_this<server_connection> {
     quic_server_impl* server = nullptr;
     internal::session_runtime_ptr runtime;
+    internal::connection_engine_ptr engine;
 
     ngtcp2_conn* conn = nullptr;
     ngtcp2_crypto_conn_ref conn_ref{};
@@ -281,18 +282,9 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     socklen_t peer_ss_len = 0;
 
     queue<std::unique_ptr<conn_rx_event>> rx_queue{1024};
-    queue<std::unique_ptr<transport_command>> op_queue{1024};
-    std::deque<transport_command> blocked_bidi_open_streams;
-    std::deque<transport_command> blocked_uni_open_streams;
-    std::optional<promise<>> actor_waiter;
-    condition_variable timer_cv;
-    bool timer_rearm_requested = false;
-    bool tick_pending = false;
     bool queues_aborted = false;
     bool unregistered = false;
     bool stop_requested = false;
-    bool blocked_bidi_open_stream_retry_pending = false;
-    bool blocked_uni_open_stream_retry_pending = false;
     std::optional<quic_error> stop_error;
     sstring stop_error_detail;
 
@@ -301,11 +293,13 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     bool accepted_to_listener = false;
     size_t tx_payload_limit = default_udp_payload_size;
     std::unordered_set<std::string> mapped_dcids;
-    std::unordered_set<stream_id> announced_streams;
 
     ~server_connection() {
         fail_blocked_open_streams(quic_error::closed, "server connection destroyed");
         abort_event_queues("server connection destroyed");
+        if (runtime) {
+            runtime->set_command_notifier({});
+        }
         wake_actor();
         if (conn) {
             ngtcp2_conn_del(conn);
@@ -325,43 +319,45 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     bool has_pending_actor_work() const noexcept {
         return stop_requested
                || !rx_queue.empty()
-               || !op_queue.empty()
-               || tick_pending
-               || (blocked_bidi_open_stream_retry_pending && !blocked_bidi_open_streams.empty())
-               || (blocked_uni_open_stream_retry_pending && !blocked_uni_open_streams.empty());
+               || (runtime && runtime->has_pending_commands())
+               || engine->tick_pending()
+               || engine->has_blocked_open_stream_retry_work();
     }
 
     future<> wait_for_actor_wakeup() {
-        if (has_pending_actor_work() || closing) {
-            co_return;
-        }
-        actor_waiter.emplace();
-        try {
-            co_await actor_waiter->get_future();
-        } catch (...) {
-        }
+        return engine->wait_for_actor_wakeup(has_pending_actor_work(), closing);
     }
 
     void wake_actor() {
-        if (!actor_waiter) {
-            return;
-        }
-        auto waiter = std::move(*actor_waiter);
-        actor_waiter.reset();
-        waiter.set_value();
+        engine->wake_actor();
     }
 
-    void signal_tick() {
-        if (closing || tick_pending) {
+    void rearm_transport_timer() {
+        if (!engine) {
             return;
         }
-        tick_pending = true;
-        wake_actor();
+        if (!conn) {
+            engine->cancel_timer();
+            return;
+        }
+        constexpr auto max_timer_sleep = std::chrono::hours(24);
+        auto expiry = ngtcp2_conn_get_expiry(conn);
+        auto now = now_ns();
+        if (expiry <= now) {
+            engine->arm_timer(std::chrono::nanoseconds(0), closing);
+            return;
+        }
+        auto wait_ns = expiry - now;
+        auto max_wait_ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(max_timer_sleep).count());
+        auto sleep_ns = wait_ns > max_wait_ns ? max_wait_ns : wait_ns;
+        engine->arm_timer(std::chrono::nanoseconds(sleep_ns), closing);
     }
 
-    void request_timer_rearm() {
-        timer_rearm_requested = true;
-        timer_cv.signal();
+    void cancel_transport_timer() {
+        if (engine) {
+            engine->cancel_timer();
+        }
     }
 
     void abort_event_queues(const char* why) {
@@ -371,64 +367,33 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         queues_aborted = true;
         auto ex = std::make_exception_ptr(std::runtime_error(why));
         rx_queue.abort(ex);
-        op_queue.abort(std::move(ex));
     }
 
-    std::deque<transport_command>& blocked_open_streams(stream_type type) {
-        return type == stream_type::bidirectional ? blocked_bidi_open_streams : blocked_uni_open_streams;
-    }
-
-    bool& blocked_open_stream_retry_pending(stream_type type) {
-        return type == stream_type::bidirectional
-                 ? blocked_bidi_open_stream_retry_pending
-                 : blocked_uni_open_stream_retry_pending;
+    bool blocked_open_stream_retry_pending(stream_type type) const {
+        return engine->blocked_open_stream_retry_pending(type);
     }
 
     void defer_blocked_open_stream(transport_command cmd) {
-        blocked_open_streams(cmd.type).push_back(std::move(cmd));
+        engine->defer_blocked_open_stream(std::move(cmd));
     }
 
     std::optional<transport_command> pop_blocked_open_stream(stream_type type) {
-        auto& q = blocked_open_streams(type);
-        if (q.empty()) {
-            return std::nullopt;
-        }
-        auto cmd = std::move(q.front());
-        q.pop_front();
-        return cmd;
+        return engine->pop_blocked_open_stream(type);
     }
 
     void request_blocked_open_stream_retry(stream_type type) {
-        auto& pending = blocked_open_stream_retry_pending(type);
-        pending = true;
-        wake_actor();
-        request_timer_rearm();
+        engine->request_blocked_open_stream_retry(type);
     }
 
     void clear_blocked_open_stream_retry(stream_type type) {
-        blocked_open_stream_retry_pending(type) = false;
+        engine->clear_blocked_open_stream_retry(type);
     }
 
     void fail_blocked_open_streams(quic_error error, std::string_view detail) {
-        if (!runtime) {
-            blocked_bidi_open_streams.clear();
-            blocked_uni_open_streams.clear();
-            blocked_bidi_open_stream_retry_pending = false;
-            blocked_uni_open_stream_retry_pending = false;
+        if (!engine) {
             return;
         }
-
-        auto fail_queue = [this, error, detail] (auto& q) {
-            for (auto& cmd : q) {
-                runtime->fail_open_stream(cmd.open_result, error, sstring(detail));
-            }
-            q.clear();
-        };
-
-        fail_queue(blocked_bidi_open_streams);
-        fail_queue(blocked_uni_open_streams);
-        blocked_bidi_open_stream_retry_pending = false;
-        blocked_uni_open_stream_retry_pending = false;
+        engine->fail_blocked_open_streams(error, detail);
     }
 
     bool active() const noexcept;
@@ -519,7 +484,7 @@ public:
         co_return;
     }
 
-    future<internal::session_runtime_ptr> accept() {
+    future<internal::connection_engine_ptr> accept() {
         if (!_started) {
             throw_quic_error(quic_error::invalid_state, "server is not started");
         }
@@ -532,10 +497,10 @@ public:
             co_await _accept_cv.wait();
         }
 
-        auto runtime = std::move(_accepted.front());
+        auto engine = std::move(_accepted.front());
         _accepted.pop_front();
         quic_server_log.info("server accept ready: pending_accepted={} active_conns={}", _accepted.size(), _conns.size());
-        co_return runtime;
+        co_return engine;
     }
 
     future<> stop() {
@@ -626,8 +591,8 @@ public:
         quic_server_log.info("server connection unregistered: active_conns={} mapped_dcids={}", _conns.size(), _by_dcid.size());
     }
 
-    void enqueue_accepted_session(const internal::session_runtime_ptr& runtime) {
-        _accepted.push_back(runtime);
+    void enqueue_accepted_session(const internal::connection_engine_ptr& engine) {
+        _accepted.push_back(engine);
         quic_server_log.debug("server queued accepted session: pending_accepted={}", _accepted.size());
         _accept_cv.signal();
     }
@@ -683,22 +648,6 @@ private:
         return {reinterpret_cast<const char*>(selected.data), selected.size};
     }
 
-    static void push_stream_event(server_connection& conn, ngtcp2_conn* ngconn, internal::stream_event::kind kind, stream_id sid, application_error_code app_error_code, internal::stream_shutdown_side shutdown_side = internal::stream_shutdown_side::read) {
-        if (!conn.runtime) {
-            return;
-        }
-        auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
-        auto peer_initiated = !ngtcp2_conn_is_local_stream(ngconn, sid);
-        conn.runtime->push_event(internal::stream_event{
-          .op = kind,
-          .stream = sid,
-          .type = type,
-          .peer_initiated = peer_initiated,
-          .app_error_code = app_error_code,
-          .shutdown_side = shutdown_side,
-        });
-    }
-
     static int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
         auto* conn = static_cast<server_connection*>(user_data);
         if (!conn || !conn->runtime) {
@@ -711,13 +660,13 @@ private:
             conn->server ? conn->server->listen_address() : socket_address{}),
           conn->peer,
           selected_alpn_or_empty(conn->tls));
-        if (!conn->accepted_to_listener && conn->server) {
+        if (!conn->accepted_to_listener && conn->server && conn->engine) {
             conn->accepted_to_listener = true;
-            conn->server->enqueue_accepted_session(conn->runtime);
+            conn->server->enqueue_accepted_session(conn->engine);
         }
         quic_server_log.info("server handshake completed: peer={} alpn='{}'", conn->peer, conn->runtime->selected_alpn());
         conn->wake_actor();
-        conn->request_timer_rearm();
+        conn->rearm_transport_timer();
         return 0;
     }
 
@@ -776,52 +725,41 @@ private:
 
     static int recv_stream_data_cb(ngtcp2_conn* ngconn, uint32_t flags, int64_t sid, uint64_t, const uint8_t* data, size_t datalen, void* user_data, void*) {
         auto* conn = static_cast<server_connection*>(user_data);
-        if (!conn || !conn->runtime || !conn->runtime->is_open()) {
-            quic_server_log.trace("server drop recv_stream_data: sid={} bytes={} conn_valid={} runtime_open={}",
-              sid, datalen, conn != nullptr, conn && conn->runtime && conn->runtime->is_open());
+        if (!conn || !conn->engine || !conn->engine->is_open()) {
+            quic_server_log.trace("server drop recv_stream_data: sid={} bytes={} conn_valid={} engine_open={}",
+              sid, datalen, conn != nullptr, conn && conn->engine && conn->engine->is_open());
             return 0;
         }
         quic_server_log.trace("server recv_stream_data: peer={} sid={} bytes={}", conn->peer, sid, datalen);
         auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
         auto peer_initiated = !ngtcp2_conn_is_local_stream(ngconn, sid);
-        if (conn->announced_streams.emplace(sid).second) {
-            conn->runtime->push_event(internal::stream_event{
-              .op = internal::stream_event::kind::opened,
-              .stream = sid,
-              .type = type,
-              .peer_initiated = peer_initiated,
-            });
-        }
         temporary_buffer<char> tb(datalen);
         if (datalen) {
             std::memcpy(tb.get_write(), data, datalen);
         }
-        conn->runtime->push_event(internal::stream_event{
-          .op = internal::stream_event::kind::data,
-          .stream = sid,
-          .type = type,
-          .peer_initiated = peer_initiated,
-          .payload = std::move(tb),
-          .fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0,
-        });
+        conn->engine->on_stream_data(sid, type, peer_initiated, std::move(tb), (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
         return 0;
     }
 
     static int stream_reset_cb(ngtcp2_conn* ngconn, int64_t sid, uint64_t, uint64_t app_error_code, void* user_data, void*) {
         auto* conn = static_cast<server_connection*>(user_data);
-        if (!conn || !conn->runtime) {
+        if (!conn || !conn->engine) {
             return 0;
         }
-        push_stream_event(*conn, ngconn, internal::stream_event::kind::reset, sid, app_error_code);
+        auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
+        auto peer_initiated = !ngtcp2_conn_is_local_stream(ngconn, sid);
+        conn->engine->on_stream_reset(sid, type, peer_initiated, app_error_code);
         return 0;
     }
 
     static int stream_stop_sending_cb(ngtcp2_conn* ngconn, int64_t sid, uint64_t app_error_code, void* user_data, void*) {
         auto* conn = static_cast<server_connection*>(user_data);
-        if (!conn || !conn->runtime) {
+        if (!conn || !conn->engine) {
             return 0;
         }
-        push_stream_event(*conn, ngconn, internal::stream_event::kind::stop_sending, sid, app_error_code, internal::stream_shutdown_side::write);
+        auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
+        auto peer_initiated = !ngtcp2_conn_is_local_stream(ngconn, sid);
+        conn->engine->on_stream_stop_sending(sid, type, peer_initiated, app_error_code, internal::stream_shutdown_side::write);
         return 0;
     }
 
@@ -909,6 +847,10 @@ private:
         auto conn = make_lw_shared<server_connection>();
         conn->server = this;
         conn->runtime = internal::make_session_runtime(_cfg.session_options);
+        conn->engine = internal::make_connection_engine(conn->runtime, _cfg.session_options);
+        conn->runtime->set_command_notifier([raw = conn.get()] {
+            raw->wake_actor();
+        });
         conn->peer = peer;
         to_sockaddr_storage_v6(_listen_address, conn->local_ss, conn->local_ss_len);
         to_sockaddr_storage_v6(peer, conn->peer_ss, conn->peer_ss_len);
@@ -1028,17 +970,6 @@ private:
               }
           })
           .or_terminate();
-        (void)with_gate(_task_gate, [conn] { return conn_command_loop(conn); })
-          .handle_exception([conn](std::exception_ptr) {
-              conn->fail(quic_error::io, "server command loop failed");
-          })
-          .or_terminate();
-        (void)with_gate(_task_gate, [conn] { return conn_timer_loop(conn); })
-          .handle_exception([conn](std::exception_ptr) {
-              conn->fail(quic_error::io, "server timer loop failed");
-          })
-          .or_terminate();
-
         return conn;
     }
 
@@ -1146,9 +1077,13 @@ private:
                       msg.stream,
                       nwrite,
                       ngtcp2_error_message((int)nwrite));
-                    push_stream_event(*conn, conn->conn, internal::stream_event::kind::stop_sending, msg.stream, 0, internal::stream_shutdown_side::write);
+                    if (conn->engine) {
+                        auto type = ngtcp2_is_bidi_stream(msg.stream) ? stream_type::bidirectional : stream_type::unidirectional;
+                        auto peer_initiated = !ngtcp2_conn_is_local_stream(conn->conn, msg.stream);
+                        conn->engine->on_stream_stop_sending(msg.stream, type, peer_initiated, 0, internal::stream_shutdown_side::write);
+                    }
                     co_await flush_pending_packets_actor(conn);
-                    conn->request_timer_rearm();
+                    conn->rearm_transport_timer();
                     co_return;
                 }
                 quic_server_log.warn("server writev_stream failed: peer={} sid={} nwrite={} msg={}",
@@ -1200,17 +1135,16 @@ private:
           : ngtcp2_conn_open_uni_stream(conn->conn, &sid, nullptr);
 
         if (rv == 0) {
-            conn->announced_streams.emplace(sid);
             conn->runtime->complete_open_stream(cmd.open_result, sid);
             co_await flush_pending_packets_actor(conn);
-            conn->request_timer_rearm();
+            conn->rearm_transport_timer();
             co_return false;
         }
 
         if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) {
             conn->defer_blocked_open_stream(std::move(cmd));
             co_await flush_pending_packets_actor(conn);
-            conn->request_timer_rearm();
+            conn->rearm_transport_timer();
             co_return true;
         }
 
@@ -1229,7 +1163,7 @@ private:
             co_return;
         }
         co_await flush_pending_packets_actor(conn);
-        conn->request_timer_rearm();
+        conn->rearm_transport_timer();
     }
 
     static future<> stop_sending_actor(conn_ptr conn, stream_id sid, application_error_code app_error_code) {
@@ -1242,7 +1176,7 @@ private:
             co_return;
         }
         co_await flush_pending_packets_actor(conn);
-        conn->request_timer_rearm();
+        conn->rearm_transport_timer();
     }
 
     static future<> retry_blocked_open_streams_actor(conn_ptr conn, stream_type type) {
@@ -1283,6 +1217,7 @@ private:
             }
         }
         co_await flush_pending_packets_actor(conn);
+        conn->rearm_transport_timer();
     }
 
     static future<> handle_conn_datagram_actor(conn_ptr conn, const socket_address& src, temporary_buffer<char> pkt) {
@@ -1316,40 +1251,27 @@ private:
 
         sync_current_path(*conn);
         co_await flush_pending_packets_actor(conn);
-        conn->request_timer_rearm();
+        conn->rearm_transport_timer();
     }
 
-    static future<> conn_command_loop(conn_ptr conn) {
-        while (conn->active()) {
-            transport_command cmd;
-            try {
-                cmd = co_await conn->runtime->pop_command();
-            } catch (const quic_exception& e) {
-                if (e.code() == quic_error::closed) {
-                    quic_server_log.debug("server conn_command_loop exiting on closed runtime: peer={}", conn->peer);
-                    co_return;
-                }
-                quic_server_log.warn("server conn_command_loop pop_command error: peer={} code={} detail='{}'",
-                  conn->peer, to_string(e.code()), e.what());
-                conn->fail(e.code(), e.what());
-                co_return;
-            } catch (...) {
-                quic_server_log.error("server conn_command_loop unexpected pop_command failure: peer={}", conn->peer);
-                conn->fail(quic_error::internal, "server pop_command failed");
-                co_return;
-            }
-
-            try {
-                auto out = std::make_unique<transport_command>(std::move(cmd));
-                co_await conn->op_queue.push_eventually(std::move(out));
-                conn->wake_actor();
-            } catch (...) {
-                if (!conn->active()) {
-                    co_return;
-                }
-                conn->fail(quic_error::io, "server command queue push failed");
-                co_return;
-            }
+    static future<> handle_transport_command_actor(conn_ptr conn, transport_command cmd) {
+        switch (cmd.op) {
+        case transport_command::kind::send:
+            co_await send_stream_message_actor(conn, std::move(cmd.msg));
+            conn->rearm_transport_timer();
+            break;
+        case transport_command::kind::open_stream:
+            (void)co_await open_stream_actor(conn, std::move(cmd));
+            break;
+        case transport_command::kind::reset_stream:
+            co_await reset_stream_actor(conn, cmd.msg.stream, cmd.app_error_code);
+            break;
+        case transport_command::kind::stop_sending:
+            co_await stop_sending_actor(conn, cmd.msg.stream, cmd.app_error_code);
+            break;
+        case transport_command::kind::close_connection:
+            conn->stop_requested = true;
+            break;
         }
     }
 
@@ -1392,51 +1314,6 @@ private:
         co_await send_datagram(channel, conn->peer, outbuf.data(), static_cast<size_t>(nwrite));
     }
 
-    static future<> conn_timer_loop(conn_ptr conn) {
-        constexpr auto max_timer_sleep = std::chrono::hours(24);
-        while (conn->active()) {
-            if (!conn->conn) {
-                co_return;
-            }
-
-            auto expiry = ngtcp2_conn_get_expiry(conn->conn);
-            auto now = now_ns();
-            if (expiry <= now) {
-                conn->signal_tick();
-                try {
-                    co_await conn->timer_cv.wait([conn] {
-                        return !conn->active() || conn->stop_requested || conn->timer_rearm_requested || !conn->tick_pending;
-                    });
-                } catch (...) {
-                }
-                conn->timer_rearm_requested = false;
-                continue;
-            }
-
-            auto wait_ns = expiry - now;
-            auto max_wait_ns = static_cast<uint64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(max_timer_sleep).count());
-            auto sleep_ns = std::min(wait_ns, max_wait_ns);
-            conn->timer_rearm_requested = false;
-
-            try {
-                co_await conn->timer_cv.wait(std::chrono::nanoseconds(sleep_ns), [conn] {
-                    return !conn->active() || conn->stop_requested || conn->timer_rearm_requested;
-                });
-                conn->timer_rearm_requested = false;
-            } catch (const condition_variable_timed_out&) {
-                if (!conn->active()) {
-                    co_return;
-                }
-                conn->signal_tick();
-            } catch (...) {
-                if (!conn->active()) {
-                    co_return;
-                }
-            }
-        }
-    }
-
     static future<> conn_actor_loop(conn_ptr conn) {
         while (conn->active()) {
             if (!conn->has_pending_actor_work()) {
@@ -1477,29 +1354,12 @@ private:
                 co_await handle_conn_datagram_actor(conn, evt->src, std::move(evt->packet));
             }
 
-            while (conn->active() && !conn->stop_requested && !conn->op_queue.empty()) {
-                auto out = conn->op_queue.pop();
-                if (!out) {
-                    continue;
-                }
-                switch (out->op) {
-                case transport_command::kind::send:
-                    co_await send_stream_message_actor(conn, std::move(out->msg));
-                    conn->request_timer_rearm();
-                    break;
-                case transport_command::kind::open_stream:
-                    (void)co_await open_stream_actor(conn, std::move(*out));
-                    break;
-                case transport_command::kind::reset_stream:
-                    co_await reset_stream_actor(conn, out->msg.stream, out->app_error_code);
-                    break;
-                case transport_command::kind::stop_sending:
-                    co_await stop_sending_actor(conn, out->msg.stream, out->app_error_code);
-                    break;
-                case transport_command::kind::close_connection:
-                    conn->stop_requested = true;
+            while (conn->active() && !conn->stop_requested && conn->runtime && conn->runtime->has_pending_commands()) {
+                auto cmd = conn->runtime->poll_command();
+                if (!cmd) {
                     break;
                 }
+                co_await handle_transport_command_actor(conn, std::move(*cmd));
             }
 
             if (conn->active() && !conn->stop_requested) {
@@ -1507,8 +1367,8 @@ private:
                 co_await retry_blocked_open_streams_actor(conn, stream_type::unidirectional);
             }
 
-            if (conn->active() && !conn->stop_requested && conn->tick_pending) {
-                conn->tick_pending = false;
+            if (conn->active() && !conn->stop_requested && conn->engine->tick_pending()) {
+                conn->engine->clear_tick();
                 co_await conn_handle_timer_actor(conn);
             }
         }
@@ -1593,7 +1453,7 @@ private:
 
     gate _task_gate;
     condition_variable _accept_cv;
-    std::deque<internal::session_runtime_ptr> _accepted;
+    std::deque<internal::connection_engine_ptr> _accepted;
     std::unordered_map<std::string, conn_ptr> _by_dcid;
     std::vector<conn_ptr> _conns;
 };
@@ -1609,8 +1469,11 @@ void server_connection::stop_transport() {
     }
     stop_requested = true;
     fail_blocked_open_streams(quic_error::closed, "server connection stopped");
+    if (engine) {
+        engine->on_transport_closed(std::make_exception_ptr(quic_exception(quic_error::closed, "server connection stopped")));
+    }
+    cancel_transport_timer();
     wake_actor();
-    request_timer_rearm();
 }
 
 void server_connection::fail(quic_error error, const sstring& detail) {
@@ -1629,9 +1492,12 @@ void server_connection::fail(quic_error error, const sstring& detail) {
         stop_error_detail = detail;
     }
     fail_blocked_open_streams(error, detail);
+    if (engine) {
+        engine->on_transport_closed(std::make_exception_ptr(quic_exception(error, detail)));
+    }
+    cancel_transport_timer();
     stop_requested = true;
     wake_actor();
-    request_timer_rearm();
 }
 
 } // namespace
@@ -1654,8 +1520,8 @@ future<> quic_server::start(quic_server_config config) {
 
 future<connection> quic_server::accept() {
     quic_server_log.debug("quic_server::accept");
-    auto runtime = co_await _impl->accept();
-    co_return connection(std::move(runtime));
+    auto engine = co_await _impl->accept();
+    co_return connection(std::move(engine));
 }
 
 future<> quic_server::stop() {
