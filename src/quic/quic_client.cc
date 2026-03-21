@@ -210,7 +210,7 @@ struct rx_event {
     temporary_buffer<char> packet;
 };
 
-struct client_state : public enable_lw_shared_from_this<client_state> {
+struct client_state : public enable_lw_shared_from_this<client_state>, public internal::connection_transport {
     quic_client_config cfg{};
     internal::session_runtime_ptr runtime;
 
@@ -272,6 +272,22 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         return !stopping && runtime;
     }
 
+    bool transport_active() const noexcept override {
+        return active();
+    }
+
+    bool has_transport_connection() const noexcept override {
+        return conn != nullptr;
+    }
+
+    bool can_retry_blocked_open_streams() const noexcept override {
+        return active() && handshake_done;
+    }
+
+    size_t tx_payload_limit_bytes() const noexcept override {
+        return tx_payload_limit;
+    }
+
     bool has_pending_actor_work() const noexcept {
         return stop_requested
                || !rx_queue.empty()
@@ -289,7 +305,81 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         engine->wake_actor();
     }
 
-    void rearm_transport_timer() {
+    int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override {
+        ngtcp2_path path{};
+        fill_path(path);
+        ngtcp2_pkt_info pkt_info{};
+        return ngtcp2_conn_write_pkt(conn, &path, &pkt_info, outbuf, outbuf_size, now_ns());
+    }
+
+    internal::transport_stream_write_result write_stream_packet(
+      stream_id sid,
+      const char* data,
+      size_t len,
+      bool fin,
+      uint8_t* outbuf,
+      size_t outbuf_size) override {
+        ngtcp2_path path{};
+        fill_path(path);
+        ngtcp2_pkt_info pkt_info{};
+        ngtcp2_vec vec{};
+        ngtcp2_ssize consumed = 0;
+        if (data && len) {
+            vec.base = reinterpret_cast<uint8_t*>(const_cast<char*>(data));
+            vec.len = len;
+        }
+        auto flags = (!len && fin) ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
+        auto nwrite = ngtcp2_conn_writev_stream(
+          conn,
+          &path,
+          &pkt_info,
+          outbuf,
+          outbuf_size,
+          &consumed,
+          flags,
+          sid,
+          (data && len) ? &vec : nullptr,
+          (data && len) ? 1 : 0,
+          now_ns());
+        return internal::transport_stream_write_result{
+          .nwrite = nwrite,
+          .consumed = consumed > 0 ? static_cast<size_t>(consumed) : 0,
+        };
+    }
+
+    internal::transport_open_stream_result try_open_stream(stream_type type) override {
+        int64_t sid = invalid_stream_id;
+        auto rv = type == stream_type::bidirectional
+                    ? ngtcp2_conn_open_bidi_stream(conn, &sid, nullptr)
+                    : ngtcp2_conn_open_uni_stream(conn, &sid, nullptr);
+        return internal::transport_open_stream_result{
+          .rv = rv,
+          .sid = sid,
+        };
+    }
+
+    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) override {
+        return ngtcp2_conn_shutdown_stream_write(conn, 0, sid, app_error_code);
+    }
+
+    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override {
+        return ngtcp2_conn_shutdown_stream_read(conn, 0, sid, app_error_code);
+    }
+
+    future<> send_datagram_packet(const uint8_t* data, size_t len) override {
+        return send_datagram(channel, remote_address, data, len);
+    }
+
+    void on_stream_write_closed(stream_id sid) override {
+        if (!engine || !conn) {
+            return;
+        }
+        auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
+        auto peer_initiated = !ngtcp2_conn_is_local_stream(conn, sid);
+        engine->on_stream_stop_sending(sid, type, peer_initiated, 0, internal::stream_shutdown_side::write);
+    }
+
+    void rearm_transport_timer() override {
         if (!engine) {
             return;
         }
@@ -297,18 +387,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
             engine->cancel_timer();
             return;
         }
-        constexpr auto max_timer_sleep = std::chrono::hours(24);
-        auto expiry = ngtcp2_conn_get_expiry(conn);
-        auto now = now_ns();
-        if (expiry <= now) {
-            engine->arm_timer(std::chrono::nanoseconds(0), stopping);
-            return;
-        }
-        auto wait_ns = expiry - now;
-        auto max_wait_ns = static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(max_timer_sleep).count());
-        auto sleep_ns = wait_ns > max_wait_ns ? max_wait_ns : wait_ns;
-        engine->arm_timer(std::chrono::nanoseconds(sleep_ns), stopping);
+        engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), now_ns(), stopping);
     }
 
     void cancel_transport_timer() {
@@ -342,15 +421,30 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         handshake_promise->set_exception(ex);
     }
 
-    bool blocked_open_stream_retry_pending(stream_type type) const {
+    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override {
+        if (runtime) {
+            runtime->complete_open_stream(std::move(result), sid);
+        }
+    }
+
+    void fail_open_stream(
+      std::shared_ptr<promise<stream_id>> result,
+      quic_error error,
+      sstring detail) override {
+        if (runtime) {
+            runtime->fail_open_stream(std::move(result), error, std::move(detail));
+        }
+    }
+
+    bool blocked_open_stream_retry_pending(stream_type type) const noexcept override {
         return engine->blocked_open_stream_retry_pending(type);
     }
 
-    void defer_blocked_open_stream(internal::transport_command cmd) {
+    void defer_blocked_open_stream(internal::transport_command cmd) override {
         engine->defer_blocked_open_stream(std::move(cmd));
     }
 
-    std::optional<internal::transport_command> pop_blocked_open_stream(stream_type type) {
+    std::optional<internal::transport_command> pop_blocked_open_stream(stream_type type) override {
         return engine->pop_blocked_open_stream(type);
     }
 
@@ -358,7 +452,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         engine->request_blocked_open_stream_retry(type);
     }
 
-    void clear_blocked_open_stream_retry(stream_type type) {
+    void clear_blocked_open_stream_retry(stream_type type) noexcept override {
         engine->clear_blocked_open_stream_retry(type);
     }
 
@@ -379,7 +473,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         wake_actor();
     }
 
-    void stop_transport() {
+    void stop_transport() override {
         quic_client_log.info(
           "client transport stop: local={} remote={} handshake_done={} channel_ready={}",
           local_address,
@@ -430,6 +524,10 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
             channel.shutdown_input();
             channel.shutdown_output();
         }
+    }
+
+    void fail_transport(quic_error err, sstring detail) override {
+        fail(err, detail);
     }
 };
 
@@ -832,224 +930,27 @@ void init_client_connection(client_state& st) {
 }
 
 future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
-    if (!st->conn) {
-        co_return;
-    }
-
-    std::vector<uint8_t> outbuf(st->tx_payload_limit);
-    while (st->active()) {
-        ngtcp2_path path{};
-        st->fill_path(path);
-        ngtcp2_pkt_info pkt_info{};
-
-        ngtcp2_ssize nwrite =
-          ngtcp2_conn_write_pkt(st->conn, &path, &pkt_info, outbuf.data(), outbuf.size(), now_ns());
-        if (nwrite == 0) {
-            quic_client_log.trace("client flush_pending_packets: no packet produced");
-            co_return;
-        }
-        if (nwrite < 0) {
-            if (ngtcp2_is_write_more(nwrite)) {
-                quic_client_log.trace("client flush_pending_packets: write_more");
-                continue;
-            }
-            if (ngtcp2_is_draining(nwrite)) {
-                quic_client_log.info("client flush_pending_packets: connection draining");
-                st->stop_transport();
-                co_return;
-            }
-            quic_client_log.warn("client flush_pending_packets failed: nwrite={} msg={}", nwrite, ngtcp2_error_message((int)nwrite));
-            st->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
-            co_return;
-        }
-        quic_client_log.trace("client flush_pending_packets: wrote {} bytes", nwrite);
-        co_await send_datagram(st->channel, st->remote_address, outbuf.data(), static_cast<size_t>(nwrite));
-    }
+    co_await internal::flush_pending_transport_packets(*st);
 }
 
 future<> send_stream_message_actor(lw_shared_ptr<client_state> st, quic_message msg) {
-    if (!st->conn || msg.stream == invalid_stream_id) {
-        co_return;
-    }
-    quic_client_log.debug(
-      "client send_stream_message start: sid={} bytes={} fin={}",
-      msg.stream,
-      msg.payload.size(),
-      msg.fin);
-    int64_t sid = msg.stream;
-    size_t offset = 0;
-    bool send_fin = msg.fin;
-    std::vector<uint8_t> outbuf(st->tx_payload_limit);
-
-    while (st->active()) {
-        const bool remaining = offset < msg.payload.size();
-        if (!remaining && !send_fin) {
-            break;
-        }
-
-        ngtcp2_path path{};
-        st->fill_path(path);
-        ngtcp2_pkt_info pkt_info{};
-        ngtcp2_vec vec{};
-        ngtcp2_ssize consumed = 0;
-
-        const uint8_t* ptr = remaining ? reinterpret_cast<const uint8_t*>(msg.payload.get() + offset) : nullptr;
-        const size_t len = remaining ? (msg.payload.size() - offset) : 0;
-        if (remaining) {
-            vec.base = const_cast<uint8_t*>(ptr);
-            vec.len = len;
-        }
-
-        uint32_t flags = (!remaining && send_fin) ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
-        ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(
-          st->conn,
-          &path,
-          &pkt_info,
-          outbuf.data(),
-          outbuf.size(),
-          &consumed,
-          flags,
-          sid,
-          remaining ? &vec : nullptr,
-          remaining ? 1 : 0,
-          now_ns());
-
-        if (nwrite < 0) {
-            if (ngtcp2_is_write_more(nwrite)) {
-                if (consumed > 0) {
-                    offset += static_cast<size_t>(consumed);
-                }
-                quic_client_log.trace("client writev_stream: write_more sid={} consumed={} offset={}", sid, consumed, offset);
-                co_await flush_pending_packets_actor(st);
-                continue;
-            }
-            if (ngtcp2_is_draining(nwrite)) {
-                quic_client_log.info("client writev_stream: connection draining sid={}", sid);
-                st->stop_transport();
-                co_return;
-            }
-            if (nwrite == NGTCP2_ERR_STREAM_SHUT_WR || nwrite == NGTCP2_ERR_STREAM_NOT_FOUND) {
-                quic_client_log.info(
-                  "client writev_stream stopped by peer/runtime: sid={} nwrite={} msg={}",
-                  sid,
-                  nwrite,
-                  ngtcp2_error_message((int)nwrite));
-                if (st->engine) {
-                    auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
-                    auto peer_initiated = !ngtcp2_conn_is_local_stream(st->conn, sid);
-                    st->engine->on_stream_stop_sending(sid, type, peer_initiated, 0, internal::stream_shutdown_side::write);
-                }
-                co_await flush_pending_packets_actor(st);
-                st->rearm_transport_timer();
-                co_return;
-            }
-            quic_client_log.warn("client writev_stream failed: sid={} nwrite={} msg={}", sid, nwrite, ngtcp2_error_message((int)nwrite));
-            st->fail(classify_ngtcp2_error(nwrite), ngtcp2_error_message((int)nwrite));
-            co_return;
-        }
-        if (nwrite == 0) {
-            quic_client_log.trace("client writev_stream produced 0 bytes, flushing sid={}", sid);
-            co_await flush_pending_packets_actor(st);
-            continue;
-        }
-
-        if (consumed > 0) {
-            offset += static_cast<size_t>(consumed);
-        }
-        if (!remaining && send_fin) {
-            send_fin = false;
-        }
-        quic_client_log.trace(
-          "client writev_stream sent packet: sid={} packet_bytes={} consumed={} offset={} total={} fin_pending={}",
-          sid,
-          nwrite,
-          consumed,
-          offset,
-          msg.payload.size(),
-          send_fin);
-        co_await send_datagram(st->channel, st->remote_address, outbuf.data(), static_cast<size_t>(nwrite));
-
-        if (offset >= msg.payload.size() && !send_fin) {
-            break;
-        }
-    }
-
-    co_await flush_pending_packets_actor(st);
-    st->rearm_transport_timer();
-    quic_client_log.debug("client send_stream_message done: sid={} total_bytes={} fin={}", sid, msg.payload.size(), msg.fin);
+    co_await internal::send_stream_message(*st, std::move(msg));
 }
 
 future<bool> open_stream_actor(lw_shared_ptr<client_state> st, internal::transport_command cmd) {
-    if (!st->conn || !cmd.open_result) {
-        co_return false;
-    }
-
-    int64_t sid = invalid_stream_id;
-    int rv = cmd.type == stream_type::bidirectional
-      ? ngtcp2_conn_open_bidi_stream(st->conn, &sid, nullptr)
-      : ngtcp2_conn_open_uni_stream(st->conn, &sid, nullptr);
-
-    if (rv == 0) {
-        st->runtime->complete_open_stream(cmd.open_result, sid);
-        co_await flush_pending_packets_actor(st);
-        st->rearm_transport_timer();
-        co_return false;
-    }
-
-    if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) {
-        st->defer_blocked_open_stream(std::move(cmd));
-        co_await flush_pending_packets_actor(st);
-        st->rearm_transport_timer();
-        co_return true;
-    }
-
-    st->runtime->fail_open_stream(cmd.open_result, classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-    st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-    co_return false;
+    co_return co_await internal::open_stream(*st, std::move(cmd));
 }
 
 future<> reset_stream_actor(lw_shared_ptr<client_state> st, stream_id sid, application_error_code app_error_code) {
-    if (!st->conn) {
-        co_return;
-    }
-    int rv = ngtcp2_conn_shutdown_stream_write(st->conn, 0, sid, app_error_code);
-    if (rv < 0) {
-        st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-        co_return;
-    }
-    co_await flush_pending_packets_actor(st);
-    st->rearm_transport_timer();
+    co_await internal::reset_stream(*st, sid, app_error_code);
 }
 
 future<> stop_sending_actor(lw_shared_ptr<client_state> st, stream_id sid, application_error_code app_error_code) {
-    if (!st->conn) {
-        co_return;
-    }
-    int rv = ngtcp2_conn_shutdown_stream_read(st->conn, 0, sid, app_error_code);
-    if (rv < 0) {
-        st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-        co_return;
-    }
-    co_await flush_pending_packets_actor(st);
-    st->rearm_transport_timer();
+    co_await internal::stop_sending(*st, sid, app_error_code);
 }
 
 future<> retry_blocked_open_streams_actor(lw_shared_ptr<client_state> st, stream_type type) {
-    if (!st->handshake_done || !st->blocked_open_stream_retry_pending(type)) {
-        co_return;
-    }
-
-    st->clear_blocked_open_stream_retry(type);
-    while (st->active() && st->handshake_done) {
-        auto cmd = st->pop_blocked_open_stream(type);
-        if (!cmd) {
-            co_return;
-        }
-        auto blocked = co_await open_stream_actor(st, std::move(*cmd));
-        if (blocked) {
-            co_return;
-        }
-    }
+    co_await internal::retry_blocked_open_streams(*st, type);
 }
 
 future<> recv_datagram_actor(lw_shared_ptr<client_state> st, const socket_address& src, temporary_buffer<char> pkt) {

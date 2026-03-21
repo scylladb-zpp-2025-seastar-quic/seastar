@@ -199,6 +199,54 @@ public:
     virtual void mark_error(quic_error error, sstring detail) = 0;
 };
 
+struct transport_stream_write_result {
+    int64_t nwrite = 0;
+    size_t consumed = 0;
+};
+
+struct transport_open_stream_result {
+    int rv = 0;
+    stream_id sid = invalid_stream_id;
+};
+
+class connection_transport {
+public:
+    virtual ~connection_transport() = default;
+
+    virtual bool transport_active() const noexcept = 0;
+    virtual bool has_transport_connection() const noexcept = 0;
+    virtual bool can_retry_blocked_open_streams() const noexcept = 0;
+    virtual size_t tx_payload_limit_bytes() const noexcept = 0;
+
+    virtual int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
+    virtual transport_stream_write_result write_stream_packet(
+      stream_id sid,
+      const char* data,
+      size_t len,
+      bool fin,
+      uint8_t* outbuf,
+      size_t outbuf_size) = 0;
+    virtual transport_open_stream_result try_open_stream(stream_type type) = 0;
+    virtual int shutdown_stream_write(stream_id sid, application_error_code app_error_code) = 0;
+    virtual int shutdown_stream_read(stream_id sid, application_error_code app_error_code) = 0;
+
+    virtual future<> send_datagram_packet(const uint8_t* data, size_t len) = 0;
+    virtual void on_stream_write_closed(stream_id sid) = 0;
+    virtual void rearm_transport_timer() = 0;
+    virtual void stop_transport() = 0;
+    virtual void fail_transport(quic_error error, sstring detail) = 0;
+
+    virtual void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) = 0;
+    virtual void fail_open_stream(
+      std::shared_ptr<promise<stream_id>> result,
+      quic_error error,
+      sstring detail) = 0;
+    virtual void defer_blocked_open_stream(transport_command cmd) = 0;
+    virtual std::optional<transport_command> pop_blocked_open_stream(stream_type type) = 0;
+    virtual bool blocked_open_stream_retry_pending(stream_type type) const noexcept = 0;
+    virtual void clear_blocked_open_stream_retry(stream_type type) noexcept = 0;
+};
+
 class connection_engine {
 public:
     explicit connection_engine(session_runtime_ptr runtime, connection_options options = {});
@@ -233,6 +281,7 @@ public:
     void clear_tick() noexcept;
 
     void arm_timer(std::chrono::nanoseconds delay, bool closing);
+    void rearm_timer_from_expiry(uint64_t expiry_ns, uint64_t now_ns, bool closing);
     void cancel_timer() noexcept;
 
     void defer_blocked_open_stream(transport_command cmd);
@@ -249,6 +298,13 @@ private:
 };
 
 connection_engine_ptr make_connection_engine(session_runtime_ptr runtime, connection_options options = {});
+
+future<> flush_pending_transport_packets(connection_transport& transport);
+future<> send_stream_message(connection_transport& transport, quic_message msg);
+future<bool> open_stream(connection_transport& transport, transport_command cmd);
+future<> reset_stream(connection_transport& transport, stream_id sid, application_error_code app_error_code);
+future<> stop_sending(connection_transport& transport, stream_id sid, application_error_code app_error_code);
+future<> retry_blocked_open_streams(connection_transport& transport, stream_type type);
 
 session_runtime_ptr make_session_runtime(connection_options options = {});
 
