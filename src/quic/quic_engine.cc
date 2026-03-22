@@ -27,7 +27,6 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -127,6 +126,14 @@ public:
 
     bool can_write() const noexcept {
         return _can_write;
+    }
+
+    bool mark_accepted_for_delivery() noexcept {
+        if (_accepted_for_delivery) {
+            return false;
+        }
+        _accepted_for_delivery = true;
+        return true;
     }
 
     input_stream<char> input(connected_socket_input_stream_config cfg);
@@ -229,6 +236,7 @@ private:
     bool _input_shutdown_notified = false;
     bool _output_closed = false;
     bool _transport_closed = false;
+    bool _accepted_for_delivery = false;
     size_t _queued_read_bytes = 0;
 };
 
@@ -257,7 +265,6 @@ public:
     connection_options options;
     queue<shared_ptr<stream_state>> accepted_streams;
     std::unordered_map<stream_id, shared_ptr<stream_state>> streams;
-    std::unordered_set<stream_id> accepted_stream_ids;
     shared_ptr<receive_budget> receive_window;
     bool transport_closed = false;
 
@@ -500,7 +507,7 @@ void connection_engine::on_stream_data(stream_id sid, stream_type type, bool pee
         it->second = make_shared<stream_state>(_impl->runtime, _impl->receive_window, sid, type, peer_initiated);
     }
     auto st = it->second;
-    if (peer_initiated && _impl->accepted_stream_ids.emplace(st->id()).second) {
+    if (peer_initiated && st->mark_accepted_for_delivery()) {
         if (!_impl->accepted_streams.push(shared_ptr<stream_state>(st)) && _impl->runtime) {
             _impl->runtime->mark_error(quic_error::io, "accepted stream queue is full");
         }
@@ -518,7 +525,7 @@ void connection_engine::on_stream_reset(
         it->second = make_shared<stream_state>(_impl->runtime, _impl->receive_window, sid, type, peer_initiated);
     }
     auto st = it->second;
-    if (peer_initiated && _impl->accepted_stream_ids.emplace(st->id()).second) {
+    if (peer_initiated && st->mark_accepted_for_delivery()) {
         if (!_impl->accepted_streams.push(shared_ptr<stream_state>(st)) && _impl->runtime) {
             _impl->runtime->mark_error(quic_error::io, "accepted stream queue is full");
         }
@@ -537,7 +544,7 @@ void connection_engine::on_stream_stop_sending(
         it->second = make_shared<stream_state>(_impl->runtime, _impl->receive_window, sid, type, peer_initiated);
     }
     auto st = it->second;
-    if (peer_initiated && _impl->accepted_stream_ids.emplace(st->id()).second) {
+    if (peer_initiated && st->mark_accepted_for_delivery()) {
         if (!_impl->accepted_streams.push(shared_ptr<stream_state>(st)) && _impl->runtime) {
             _impl->runtime->mark_error(quic_error::io, "accepted stream queue is full");
         }
@@ -547,6 +554,10 @@ void connection_engine::on_stream_stop_sending(
     } else {
         st->on_stop_sending_input(app_error_code);
     }
+}
+
+void connection_engine::on_stream_closed(stream_id sid) {
+    _impl->streams.erase(sid);
 }
 
 void connection_engine::on_transport_closed(std::exception_ptr ex) {
@@ -562,6 +573,7 @@ void connection_engine::on_transport_closed(std::exception_ptr ex) {
     for (auto& [_, st] : _impl->streams) {
         st->on_transport_closed();
     }
+    _impl->streams.clear();
 }
 
 future<> connection_engine::wait_for_actor_wakeup(bool has_pending_work, bool closing) {

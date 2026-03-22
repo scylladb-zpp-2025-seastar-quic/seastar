@@ -298,6 +298,7 @@ public:
       bool peer_initiated,
       application_error_code app_error_code,
       stream_shutdown_side shutdown_side);
+    void on_stream_closed(stream_id sid);
     void on_transport_closed(std::exception_ptr ex);
 
     future<> wait_for_actor_wakeup(bool has_pending_work, bool closing);

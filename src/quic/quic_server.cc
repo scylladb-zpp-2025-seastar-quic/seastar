@@ -965,7 +965,13 @@ private:
 
     static int stream_close_cb(ngtcp2_conn* ngconn, uint32_t, int64_t sid, uint64_t, void* user_data, void*) {
         auto* conn = static_cast<server_connection*>(user_data);
-        if (!conn || !ngconn || ngtcp2_conn_is_local_stream(ngconn, sid)) {
+        if (!conn || !conn->engine || !ngconn) {
+            return 0;
+        }
+
+        conn->engine->on_stream_closed(sid);
+
+        if (ngtcp2_conn_is_local_stream(ngconn, sid)) {
             return 0;
         }
 

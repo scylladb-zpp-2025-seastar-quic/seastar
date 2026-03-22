@@ -858,7 +858,13 @@ int stream_stop_sending_cb(ngtcp2_conn* conn, int64_t sid, uint64_t app_error_co
 
 int stream_close_cb(ngtcp2_conn* conn, uint32_t, int64_t sid, uint64_t, void* user_data, void*) {
     auto* st = static_cast<client_state*>(user_data);
-    if (!st || !conn || ngtcp2_conn_is_local_stream(conn, sid)) {
+    if (!st || !st->engine || !conn) {
+        return 0;
+    }
+
+    st->engine->on_stream_closed(sid);
+
+    if (ngtcp2_conn_is_local_stream(conn, sid)) {
         return 0;
     }
 
