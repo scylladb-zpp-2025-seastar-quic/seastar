@@ -266,7 +266,10 @@ struct conn_rx_event {
     temporary_buffer<char> packet;
 };
 
-struct server_connection : public enable_lw_shared_from_this<server_connection>, public internal::connection_transport {
+struct server_connection;
+void sync_current_path(server_connection& conn);
+
+struct server_connection : public enable_lw_shared_from_this<server_connection>, public internal::connection_transport, public internal::connection_actor {
     quic_server_impl* server = nullptr;
     internal::session_runtime_ptr runtime;
     internal::connection_engine_ptr engine;
@@ -409,7 +412,56 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return ngtcp2_conn_shutdown_stream_read(conn, 0, sid, app_error_code);
     }
 
+    int read_transport_datagram(const socket_address& src, const char* data, size_t len) override {
+        sockaddr_storage peer_addr_ss{};
+        socklen_t peer_addr_ss_len = 0;
+        to_sockaddr_storage_v6(src, peer_addr_ss, peer_addr_ss_len);
+
+        ngtcp2_path path{};
+        init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&local_ss), local_ss_len);
+        init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&peer_addr_ss), peer_addr_ss_len);
+        ngtcp2_pkt_info pkt_info{};
+        return ngtcp2_conn_read_pkt(
+          conn,
+          &path,
+          &pkt_info,
+          reinterpret_cast<const uint8_t*>(data),
+          len,
+          now_ns());
+    }
+
+    void sync_transport_path() override {
+        sync_current_path(*this);
+    }
+
+    uint64_t transport_expiry_ns() const noexcept override {
+        return ngtcp2_conn_get_expiry(conn);
+    }
+
+    int handle_transport_expiry(uint64_t now_local) override {
+        return ngtcp2_conn_handle_expiry(conn, now_local);
+    }
+
     future<> send_datagram_packet(const uint8_t* data, size_t len) override;
+
+    bool can_send_connection_close() const noexcept override;
+
+    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) override {
+        ngtcp2_path path{};
+        fill_path(path);
+        ngtcp2_pkt_info pkt_info{};
+        ngtcp2_ccerr ccerr{};
+        ngtcp2_ccerr_default(&ccerr);
+        ngtcp2_ccerr_set_application_error(&ccerr, 0, nullptr, 0);
+        return ngtcp2_conn_write_connection_close(
+          conn,
+          &path,
+          &pkt_info,
+          outbuf,
+          outbuf_size,
+          &ccerr,
+          now_ns());
+    }
 
     void on_stream_write_closed(stream_id sid) override {
         if (!engine || !conn) {
@@ -429,6 +481,10 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
             return;
         }
         engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), now_ns(), closing);
+    }
+
+    void request_close() override {
+        request_stop();
     }
 
     void cancel_transport_timer() {
@@ -488,7 +544,58 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         engine->fail_blocked_open_streams(error, detail);
     }
 
+    void request_stop() {
+        if (closing || stop_requested) {
+            return;
+        }
+        stop_requested = true;
+        fail_blocked_open_streams(quic_error::closed, "server connection stopping");
+        cancel_transport_timer();
+        wake_actor();
+    }
+
     bool active() const noexcept;
+    bool actor_active() const noexcept override {
+        return active();
+    }
+    bool actor_has_pending_work() const noexcept override {
+        return has_pending_actor_work();
+    }
+    future<> actor_wait_for_wakeup() override {
+        return wait_for_actor_wakeup();
+    }
+    bool actor_stop_requested() const noexcept override {
+        return stop_requested;
+    }
+    future<> actor_handle_stop_request() override;
+    bool actor_has_rx_event() const noexcept override {
+        return !rx_queue.empty();
+    }
+    future<> actor_handle_next_rx_event() override;
+    bool actor_has_transport_command() const noexcept override {
+        return runtime && runtime->has_pending_commands();
+    }
+    future<> actor_handle_next_transport_command() override {
+        if (!runtime) {
+            co_return;
+        }
+        auto cmd = runtime->poll_command();
+        if (!cmd) {
+            co_return;
+        }
+        co_await internal::handle_transport_command(*this, std::move(*cmd));
+    }
+    future<> actor_retry_blocked_open_streams() override {
+        co_await internal::retry_blocked_open_streams(*this, stream_type::bidirectional);
+        co_await internal::retry_blocked_open_streams(*this, stream_type::unidirectional);
+    }
+    bool actor_tick_pending() const noexcept override {
+        return engine->tick_pending();
+    }
+    void actor_clear_tick() noexcept override {
+        engine->clear_tick();
+    }
+    future<> actor_handle_timer_tick() override;
     void stop_transport() override;
     void fail(quic_error error, const sstring& detail);
     void fail_transport(quic_error error, sstring detail) override;
@@ -1070,200 +1177,8 @@ private:
         co_await internal::flush_pending_transport_packets(*conn);
     }
 
-    static future<> send_stream_message_actor(conn_ptr conn, quic_message msg) {
-        co_await internal::send_stream_message(*conn, std::move(msg));
-    }
-
-    static future<bool> open_stream_actor(conn_ptr conn, transport_command cmd) {
-        co_return co_await internal::open_stream(*conn, std::move(cmd));
-    }
-
-    static future<> reset_stream_actor(conn_ptr conn, stream_id sid, application_error_code app_error_code) {
-        co_await internal::reset_stream(*conn, sid, app_error_code);
-    }
-
-    static future<> stop_sending_actor(conn_ptr conn, stream_id sid, application_error_code app_error_code) {
-        co_await internal::stop_sending(*conn, sid, app_error_code);
-    }
-
-    static future<> retry_blocked_open_streams_actor(conn_ptr conn, stream_type type) {
-        co_await internal::retry_blocked_open_streams(*conn, type);
-    }
-
-    static future<> conn_handle_timer_actor(conn_ptr conn) {
-        if (!conn->active() || !conn->conn) {
-            co_return;
-        }
-        auto now_local = now_ns();
-        if (ngtcp2_conn_get_expiry(conn->conn) <= now_local) {
-            int rv = ngtcp2_conn_handle_expiry(conn->conn, now_local);
-            if (rv < 0) {
-                if (ngtcp2_is_idle_close(rv) || ngtcp2_is_draining(rv)) {
-                    quic_server_log.info("server timer expiry: closing/draining peer={} rv={}", conn->peer, rv);
-                    conn->stop_transport();
-                    co_return;
-                }
-                quic_server_log.warn("server timer expiry handling failed: peer={} rv={} msg={}",
-                  conn->peer, rv, ngtcp2_error_message(rv));
-                conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-                co_return;
-            }
-        }
-        co_await flush_pending_packets_actor(conn);
-        conn->rearm_transport_timer();
-    }
-
-    static future<> handle_conn_datagram_actor(conn_ptr conn, const socket_address& src, temporary_buffer<char> pkt) {
-        if (!conn->active() || !conn->conn) {
-            co_return;
-        }
-        quic_server_log.trace("server handle_conn_datagram_actor: peer={} src={} bytes={}", conn->peer, src, pkt.size());
-
-        sockaddr_storage peer_ss{};
-        socklen_t peer_ss_len = 0;
-        to_sockaddr_storage_v6(src, peer_ss, peer_ss_len);
-
-        ngtcp2_path path{};
-        init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&conn->local_ss), conn->local_ss_len);
-        init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&peer_ss), peer_ss_len);
-        ngtcp2_pkt_info pkt_info{};
-
-        int rv = ngtcp2_conn_read_pkt(
-          conn->conn, &path, &pkt_info, reinterpret_cast<const uint8_t*>(pkt.get()), pkt.size(), now_ns());
-        if (rv < 0) {
-            if (ngtcp2_is_draining(rv)) {
-                quic_server_log.info("server read_pkt draining: peer={}", conn->peer);
-                conn->stop_transport();
-                co_return;
-            }
-            quic_server_log.warn("server read_pkt failed: peer={} rv={} msg={}",
-              conn->peer, rv, ngtcp2_error_message(rv));
-            conn->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-            co_return;
-        }
-
-        sync_current_path(*conn);
-        co_await flush_pending_packets_actor(conn);
-        conn->rearm_transport_timer();
-    }
-
-    static future<> handle_transport_command_actor(conn_ptr conn, transport_command cmd) {
-        switch (cmd.op) {
-        case transport_command::kind::send:
-            co_await send_stream_message_actor(conn, std::move(cmd.msg));
-            break;
-        case transport_command::kind::open_stream:
-            (void)co_await open_stream_actor(conn, std::move(cmd));
-            break;
-        case transport_command::kind::reset_stream:
-            co_await reset_stream_actor(conn, cmd.msg.stream, cmd.app_error_code);
-            break;
-        case transport_command::kind::stop_sending:
-            co_await stop_sending_actor(conn, cmd.msg.stream, cmd.app_error_code);
-            break;
-        case transport_command::kind::close_connection:
-            conn->stop_requested = true;
-            break;
-        }
-    }
-
-    static future<> send_connection_close_actor(conn_ptr conn) {
-        if (!conn->conn || !conn->server) {
-            co_return;
-        }
-
-        auto& server = *conn->server;
-        auto& channel = server.channel();
-        if (channel.is_closed()) {
-            co_return;
-        }
-
-        ngtcp2_path path{};
-        conn->fill_path(path);
-        ngtcp2_pkt_info pkt_info{};
-        std::vector<uint8_t> outbuf(conn->tx_payload_limit);
-
-        ngtcp2_ccerr ccerr{};
-        ngtcp2_ccerr_default(&ccerr);
-        ngtcp2_ccerr_set_application_error(&ccerr, 0, nullptr, 0);
-
-        ngtcp2_ssize nwrite = ngtcp2_conn_write_connection_close(
-          conn->conn, &path, &pkt_info, outbuf.data(), outbuf.size(), &ccerr, now_ns());
-        if (nwrite == 0) {
-            quic_server_log.debug("server stop: no CONNECTION_CLOSE packet produced peer={}", conn->peer);
-            co_return;
-        }
-        if (nwrite < 0) {
-            quic_server_log.warn(
-              "server stop: failed to write CONNECTION_CLOSE peer={} nwrite={} msg={}",
-              conn->peer,
-              nwrite,
-              ngtcp2_error_message((int)nwrite));
-            co_return;
-        }
-
-        quic_server_log.info("server sent CONNECTION_CLOSE packet: peer={} bytes={}", conn->peer, nwrite);
-        co_await send_datagram(channel, conn->peer, outbuf.data(), static_cast<size_t>(nwrite));
-    }
-
     static future<> conn_actor_loop(conn_ptr conn) {
-        while (conn->active()) {
-            if (!conn->has_pending_actor_work()) {
-                co_await conn->wait_for_actor_wakeup();
-                if (!conn->active()) {
-                    co_return;
-                }
-            }
-
-            if (conn->stop_requested) {
-                auto stop_error = conn->stop_error;
-                auto stop_error_detail = conn->stop_error_detail;
-                conn->stop_requested = false;
-
-                co_await send_connection_close_actor(conn);
-
-                conn->closing = true;
-                conn->abort_event_queues(stop_error ? "server connection failed" : "server connection stopped");
-                if (conn->runtime && conn->runtime->is_open()) {
-                    if (stop_error) {
-                        conn->runtime->mark_error(*stop_error, stop_error_detail);
-                    } else {
-                        conn->runtime->mark_transport_closed();
-                    }
-                }
-
-                if (conn->server) {
-                    conn->server->unregister_connection(conn);
-                }
-                co_return;
-            }
-
-            while (conn->active() && !conn->stop_requested && !conn->rx_queue.empty()) {
-                auto evt = conn->rx_queue.pop();
-                if (!evt) {
-                    continue;
-                }
-                co_await handle_conn_datagram_actor(conn, evt->src, std::move(evt->packet));
-            }
-
-            while (conn->active() && !conn->stop_requested && conn->runtime && conn->runtime->has_pending_commands()) {
-                auto cmd = conn->runtime->poll_command();
-                if (!cmd) {
-                    break;
-                }
-                co_await handle_transport_command_actor(conn, std::move(*cmd));
-            }
-
-            if (conn->active() && !conn->stop_requested) {
-                co_await retry_blocked_open_streams_actor(conn, stream_type::bidirectional);
-                co_await retry_blocked_open_streams_actor(conn, stream_type::unidirectional);
-            }
-
-            if (conn->active() && !conn->stop_requested && conn->engine->tick_pending()) {
-                conn->engine->clear_tick();
-                co_await conn_handle_timer_actor(conn);
-            }
-        }
+        co_await internal::run_connection_actor(*conn);
     }
 
     void handle_datagram(net::datagram d) {
@@ -1356,6 +1271,51 @@ bool server_connection::active() const noexcept {
 
 future<> server_connection::send_datagram_packet(const uint8_t* data, size_t len) {
     return send_datagram(server->channel(), peer, data, len);
+}
+
+bool server_connection::can_send_connection_close() const noexcept {
+    return conn && server && !server->channel().is_closed();
+}
+
+future<> server_connection::actor_handle_next_rx_event() {
+    auto evt = rx_queue.pop();
+    if (!evt) {
+        co_return;
+    }
+    co_await internal::recv_transport_datagram(*this, evt->src, std::move(evt->packet));
+}
+
+future<> server_connection::actor_handle_stop_request() {
+    auto self = shared_from_this();
+    auto stop_error_local = stop_error;
+    auto stop_error_detail_local = stop_error_detail;
+    stop_requested = false;
+
+    co_await internal::send_connection_close(*this);
+
+    closing = true;
+    abort_event_queues(stop_error_local ? "server connection failed" : "server connection stopped");
+    if (runtime && runtime->is_open()) {
+        if (stop_error_local) {
+            runtime->mark_error(*stop_error_local, stop_error_detail_local);
+        } else {
+            runtime->mark_transport_closed();
+        }
+    }
+    if (engine) {
+        if (stop_error_local) {
+            engine->on_transport_closed(std::make_exception_ptr(quic_exception(*stop_error_local, stop_error_detail_local)));
+        } else {
+            engine->on_transport_closed(std::make_exception_ptr(quic_exception(quic_error::closed, "server connection stopped")));
+        }
+    }
+    if (server) {
+        server->unregister_connection(self);
+    }
+}
+
+future<> server_connection::actor_handle_timer_tick() {
+    co_await internal::handle_transport_timer(*this);
 }
 
 void server_connection::stop_transport() {

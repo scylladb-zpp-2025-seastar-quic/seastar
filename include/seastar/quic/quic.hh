@@ -229,10 +229,17 @@ public:
     virtual transport_open_stream_result try_open_stream(stream_type type) = 0;
     virtual int shutdown_stream_write(stream_id sid, application_error_code app_error_code) = 0;
     virtual int shutdown_stream_read(stream_id sid, application_error_code app_error_code) = 0;
+    virtual int read_transport_datagram(const socket_address& src, const char* data, size_t len) = 0;
+    virtual void sync_transport_path() = 0;
+    virtual uint64_t transport_expiry_ns() const noexcept = 0;
+    virtual int handle_transport_expiry(uint64_t now_ns) = 0;
 
     virtual future<> send_datagram_packet(const uint8_t* data, size_t len) = 0;
+    virtual bool can_send_connection_close() const noexcept = 0;
+    virtual int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
     virtual void on_stream_write_closed(stream_id sid) = 0;
     virtual void rearm_transport_timer() = 0;
+    virtual void request_close() = 0;
     virtual void stop_transport() = 0;
     virtual void fail_transport(quic_error error, sstring detail) = 0;
 
@@ -245,6 +252,25 @@ public:
     virtual std::optional<transport_command> pop_blocked_open_stream(stream_type type) = 0;
     virtual bool blocked_open_stream_retry_pending(stream_type type) const noexcept = 0;
     virtual void clear_blocked_open_stream_retry(stream_type type) noexcept = 0;
+};
+
+class connection_actor {
+public:
+    virtual ~connection_actor() = default;
+
+    virtual bool actor_active() const noexcept = 0;
+    virtual bool actor_has_pending_work() const noexcept = 0;
+    virtual future<> actor_wait_for_wakeup() = 0;
+    virtual bool actor_stop_requested() const noexcept = 0;
+    virtual future<> actor_handle_stop_request() = 0;
+    virtual bool actor_has_rx_event() const noexcept = 0;
+    virtual future<> actor_handle_next_rx_event() = 0;
+    virtual bool actor_has_transport_command() const noexcept = 0;
+    virtual future<> actor_handle_next_transport_command() = 0;
+    virtual future<> actor_retry_blocked_open_streams() = 0;
+    virtual bool actor_tick_pending() const noexcept = 0;
+    virtual void actor_clear_tick() noexcept = 0;
+    virtual future<> actor_handle_timer_tick() = 0;
 };
 
 class connection_engine {
@@ -305,6 +331,11 @@ future<bool> open_stream(connection_transport& transport, transport_command cmd)
 future<> reset_stream(connection_transport& transport, stream_id sid, application_error_code app_error_code);
 future<> stop_sending(connection_transport& transport, stream_id sid, application_error_code app_error_code);
 future<> retry_blocked_open_streams(connection_transport& transport, stream_type type);
+future<> handle_transport_command(connection_transport& transport, transport_command cmd);
+future<> recv_transport_datagram(connection_transport& transport, const socket_address& src, temporary_buffer<char> pkt);
+future<> handle_transport_timer(connection_transport& transport);
+future<> send_connection_close(connection_transport& transport);
+future<> run_connection_actor(connection_actor& actor);
 
 session_runtime_ptr make_session_runtime(connection_options options = {});
 

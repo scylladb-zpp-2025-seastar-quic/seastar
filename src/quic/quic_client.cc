@@ -210,7 +210,10 @@ struct rx_event {
     temporary_buffer<char> packet;
 };
 
-struct client_state : public enable_lw_shared_from_this<client_state>, public internal::connection_transport {
+struct client_state;
+void sync_current_path(client_state& st);
+
+struct client_state : public enable_lw_shared_from_this<client_state>, public internal::connection_transport, public internal::connection_actor {
     quic_client_config cfg{};
     internal::session_runtime_ptr runtime;
 
@@ -231,7 +234,6 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
 
     gate task_gate;
     queue<std::unique_ptr<rx_event>> rx_queue{1024};
-    std::deque<internal::transport_command> pre_handshake_ops;
     internal::connection_engine_ptr engine;
     bool queues_aborted = false;
     bool stop_requested = false;
@@ -293,7 +295,6 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
                || !rx_queue.empty()
                || (runtime && runtime->has_pending_commands())
                || engine->tick_pending()
-               || (handshake_done && !pre_handshake_ops.empty())
                || engine->has_blocked_open_stream_retry_work();
     }
 
@@ -366,8 +367,59 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         return ngtcp2_conn_shutdown_stream_read(conn, 0, sid, app_error_code);
     }
 
+    int read_transport_datagram(const socket_address& src, const char* data, size_t len) override {
+        sockaddr_storage remote_ss{};
+        socklen_t remote_ss_len = 0;
+        to_sockaddr_storage_v6(src, remote_ss, remote_ss_len);
+
+        ngtcp2_path path{};
+        init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&local_ss), local_ss_len);
+        init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&remote_ss), remote_ss_len);
+        ngtcp2_pkt_info pkt_info{};
+        return ngtcp2_conn_read_pkt(
+          conn,
+          &path,
+          &pkt_info,
+          reinterpret_cast<const uint8_t*>(data),
+          len,
+          now_ns());
+    }
+
+    void sync_transport_path() override {
+        sync_current_path(*this);
+    }
+
+    uint64_t transport_expiry_ns() const noexcept override {
+        return ngtcp2_conn_get_expiry(conn);
+    }
+
+    int handle_transport_expiry(uint64_t now_local) override {
+        return ngtcp2_conn_handle_expiry(conn, now_local);
+    }
+
     future<> send_datagram_packet(const uint8_t* data, size_t len) override {
         return send_datagram(channel, remote_address, data, len);
+    }
+
+    bool can_send_connection_close() const noexcept override {
+        return conn && channel_ready && !channel.is_closed();
+    }
+
+    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) override {
+        ngtcp2_path path{};
+        fill_path(path);
+        ngtcp2_pkt_info pkt_info{};
+        ngtcp2_ccerr ccerr{};
+        ngtcp2_ccerr_default(&ccerr);
+        ngtcp2_ccerr_set_application_error(&ccerr, 0, nullptr, 0);
+        return ngtcp2_conn_write_connection_close(
+          conn,
+          &path,
+          &pkt_info,
+          outbuf,
+          outbuf_size,
+          &ccerr,
+          now_ns());
     }
 
     void on_stream_write_closed(stream_id sid) override {
@@ -388,6 +440,10 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
             return;
         }
         engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), now_ns(), stopping);
+    }
+
+    void request_close() override {
+        request_stop();
     }
 
     void cancel_transport_timer() {
@@ -528,6 +584,74 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
 
     void fail_transport(quic_error err, sstring detail) override {
         fail(err, detail);
+    }
+
+    bool actor_active() const noexcept override {
+        return active();
+    }
+
+    bool actor_has_pending_work() const noexcept override {
+        return has_pending_actor_work();
+    }
+
+    future<> actor_wait_for_wakeup() override {
+        return wait_for_actor_wakeup();
+    }
+
+    bool actor_stop_requested() const noexcept override {
+        return stop_requested;
+    }
+
+    future<> actor_handle_stop_request() override {
+        co_await internal::send_connection_close(*this);
+        stop_transport();
+    }
+
+    bool actor_has_rx_event() const noexcept override {
+        return !rx_queue.empty();
+    }
+
+    future<> actor_handle_next_rx_event() override {
+        auto evt = rx_queue.pop();
+        if (!evt) {
+            co_return;
+        }
+        co_await internal::recv_transport_datagram(*this, evt->src, std::move(evt->packet));
+    }
+
+    bool actor_has_transport_command() const noexcept override {
+        return runtime && runtime->has_pending_commands();
+    }
+
+    future<> actor_handle_next_transport_command() override {
+        if (!runtime) {
+            co_return;
+        }
+        auto cmd = runtime->poll_command();
+        if (!cmd) {
+            co_return;
+        }
+        co_await internal::handle_transport_command(*this, std::move(*cmd));
+    }
+
+    future<> actor_retry_blocked_open_streams() override {
+        if (!handshake_done) {
+            co_return;
+        }
+        co_await internal::retry_blocked_open_streams(*this, stream_type::bidirectional);
+        co_await internal::retry_blocked_open_streams(*this, stream_type::unidirectional);
+    }
+
+    bool actor_tick_pending() const noexcept override {
+        return engine->tick_pending();
+    }
+
+    void actor_clear_tick() noexcept override {
+        engine->clear_tick();
+    }
+
+    future<> actor_handle_timer_tick() override {
+        co_await internal::handle_transport_timer(*this);
     }
 };
 
@@ -933,111 +1057,6 @@ future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
     co_await internal::flush_pending_transport_packets(*st);
 }
 
-future<> send_stream_message_actor(lw_shared_ptr<client_state> st, quic_message msg) {
-    co_await internal::send_stream_message(*st, std::move(msg));
-}
-
-future<bool> open_stream_actor(lw_shared_ptr<client_state> st, internal::transport_command cmd) {
-    co_return co_await internal::open_stream(*st, std::move(cmd));
-}
-
-future<> reset_stream_actor(lw_shared_ptr<client_state> st, stream_id sid, application_error_code app_error_code) {
-    co_await internal::reset_stream(*st, sid, app_error_code);
-}
-
-future<> stop_sending_actor(lw_shared_ptr<client_state> st, stream_id sid, application_error_code app_error_code) {
-    co_await internal::stop_sending(*st, sid, app_error_code);
-}
-
-future<> retry_blocked_open_streams_actor(lw_shared_ptr<client_state> st, stream_type type) {
-    co_await internal::retry_blocked_open_streams(*st, type);
-}
-
-future<> recv_datagram_actor(lw_shared_ptr<client_state> st, const socket_address& src, temporary_buffer<char> pkt) {
-    if (!st->active() || !st->conn) {
-        co_return;
-    }
-    quic_client_log.trace("client recv_datagram_actor: src={} bytes={}", src, pkt.size());
-
-    sockaddr_storage remote_ss{};
-    socklen_t remote_ss_len = 0;
-    to_sockaddr_storage_v6(src, remote_ss, remote_ss_len);
-
-    ngtcp2_path path{};
-    init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&st->local_ss), st->local_ss_len);
-    init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&remote_ss), remote_ss_len);
-    ngtcp2_pkt_info pkt_info{};
-    int rv = ngtcp2_conn_read_pkt(
-      st->conn, &path, &pkt_info, reinterpret_cast<const uint8_t*>(pkt.get()), pkt.size(), now_ns());
-    if (rv < 0) {
-        if (ngtcp2_is_draining(rv)) {
-            quic_client_log.info("client recv_datagram_actor: connection draining");
-            st->stop_transport();
-            co_return;
-        }
-        quic_client_log.warn("client recv_datagram_actor failed: rv={} msg={}", rv, ngtcp2_error_message(rv));
-        st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-        co_return;
-    }
-
-    sync_current_path(*st);
-    co_await flush_pending_packets_actor(st);
-    st->rearm_transport_timer();
-}
-
-future<> handle_timer_actor(lw_shared_ptr<client_state> st) {
-    if (!st->active() || !st->conn) {
-        co_return;
-    }
-
-    auto now_local = now_ns();
-    if (ngtcp2_conn_get_expiry(st->conn) <= now_local) {
-        int rv = ngtcp2_conn_handle_expiry(st->conn, now_local);
-        if (rv < 0) {
-            if (ngtcp2_is_idle_close(rv) || ngtcp2_is_draining(rv)) {
-                st->stop_transport();
-                co_return;
-            }
-            st->fail(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
-            co_return;
-        }
-    }
-    co_await flush_pending_packets_actor(st);
-    st->rearm_transport_timer();
-}
-
-future<> send_connection_close_actor(lw_shared_ptr<client_state> st) {
-    if (!st->conn || !st->channel_ready || st->channel.is_closed()) {
-        co_return;
-    }
-
-    ngtcp2_path path{};
-    st->fill_path(path);
-    ngtcp2_pkt_info pkt_info{};
-    std::vector<uint8_t> outbuf(st->tx_payload_limit);
-
-    ngtcp2_ccerr ccerr{};
-    ngtcp2_ccerr_default(&ccerr);
-    ngtcp2_ccerr_set_application_error(&ccerr, 0, nullptr, 0);
-
-    ngtcp2_ssize nwrite = ngtcp2_conn_write_connection_close(
-      st->conn, &path, &pkt_info, outbuf.data(), outbuf.size(), &ccerr, now_ns());
-    if (nwrite == 0) {
-        quic_client_log.debug("client stop: no CONNECTION_CLOSE packet produced");
-        co_return;
-    }
-    if (nwrite < 0) {
-        quic_client_log.warn(
-          "client stop: failed to write CONNECTION_CLOSE nwrite={} msg={}",
-          nwrite,
-          ngtcp2_error_message((int)nwrite));
-        co_return;
-    }
-
-    quic_client_log.info("client sent CONNECTION_CLOSE packet bytes={}", nwrite);
-    co_await send_datagram(st->channel, st->remote_address, outbuf.data(), static_cast<size_t>(nwrite));
-}
-
     future<> recv_loop(lw_shared_ptr<client_state> st) {
     while (st->active()) {
         net::datagram d(std::unique_ptr<net::datagram_impl>{});
@@ -1070,78 +1089,8 @@ future<> send_connection_close_actor(lw_shared_ptr<client_state> st) {
     }
 }
 
-future<> handle_transport_command_actor(lw_shared_ptr<client_state> st, internal::transport_command cmd) {
-    if (!st->handshake_done) {
-        st->pre_handshake_ops.push_back(std::move(cmd));
-        co_return;
-    }
-
-    switch (cmd.op) {
-    case internal::transport_command::kind::send:
-        co_await send_stream_message_actor(st, std::move(cmd.msg));
-        break;
-    case internal::transport_command::kind::open_stream:
-        (void)co_await open_stream_actor(st, std::move(cmd));
-        break;
-    case internal::transport_command::kind::reset_stream:
-        co_await reset_stream_actor(st, cmd.msg.stream, cmd.app_error_code);
-        break;
-    case internal::transport_command::kind::stop_sending:
-        co_await stop_sending_actor(st, cmd.msg.stream, cmd.app_error_code);
-        break;
-    case internal::transport_command::kind::close_connection:
-        st->request_stop();
-        break;
-    }
-}
-
 future<> actor_loop(lw_shared_ptr<client_state> st) {
-    while (st->active()) {
-        if (!st->has_pending_actor_work()) {
-            co_await st->wait_for_actor_wakeup();
-            if (!st->active()) {
-                co_return;
-            }
-        }
-
-        if (st->stop_requested) {
-            co_await send_connection_close_actor(st);
-            st->stop_transport();
-            co_return;
-        }
-
-        while (st->active() && !st->rx_queue.empty()) {
-            auto evt = st->rx_queue.pop();
-            if (!evt) {
-                continue;
-            }
-            co_await recv_datagram_actor(st, evt->src, std::move(evt->packet));
-        }
-
-        while (st->active() && st->runtime && st->runtime->has_pending_commands()) {
-            auto cmd = st->runtime->poll_command();
-            if (!cmd) {
-                break;
-            }
-            co_await handle_transport_command_actor(st, std::move(*cmd));
-        }
-
-        while (st->active() && st->handshake_done && !st->pre_handshake_ops.empty()) {
-            auto cmd = std::move(st->pre_handshake_ops.front());
-            st->pre_handshake_ops.pop_front();
-            co_await handle_transport_command_actor(st, std::move(cmd));
-        }
-
-        if (st->active() && st->handshake_done) {
-            co_await retry_blocked_open_streams_actor(st, stream_type::bidirectional);
-            co_await retry_blocked_open_streams_actor(st, stream_type::unidirectional);
-        }
-
-        if (st->active() && st->engine->tick_pending()) {
-            st->engine->clear_tick();
-            co_await handle_timer_actor(st);
-        }
-    }
+    co_await internal::run_connection_actor(*st);
 }
 
 void start_background_tasks(const lw_shared_ptr<client_state>& st) {

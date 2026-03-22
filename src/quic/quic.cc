@@ -59,8 +59,7 @@ public:
 
     future<> send(internal::quic_message msg) override {
         const auto msg_size = msg.payload.size();
-        while (_options.max_pending_send_bytes &&
-               _pending_send_bytes + msg_size > _options.max_pending_send_bytes) {
+        while (send_requires_wait(msg_size)) {
             throw_if_terminal("send");
             co_await _command_space_cv.wait();
         }
@@ -118,6 +117,7 @@ public:
             co_return;
         }
         _closing = true;
+        notify_terminal_waiters();
         _commands.emplace_back(transport_command{
           .op = transport_command::kind::close_connection,
         });
@@ -170,7 +170,7 @@ public:
         }
         _closed = true;
         drain_pending_open_streams(std::make_exception_ptr(quic_exception(quic_error::closed, "transport closed")));
-        _command_space_cv.signal();
+        notify_terminal_waiters();
     }
 
     void mark_error(quic_error error, sstring detail) override {
@@ -181,10 +181,21 @@ public:
         _error_detail = std::move(detail);
         _closed = true;
         drain_pending_open_streams(std::make_exception_ptr(quic_exception(_error, _error_detail)));
-        _command_space_cv.signal();
+        notify_terminal_waiters();
     }
 
 private:
+    bool send_requires_wait(size_t msg_size) const noexcept {
+        const auto limit = _options.max_pending_send_bytes;
+        if (!limit) {
+            return false;
+        }
+        if (msg_size > limit) {
+            return _pending_send_bytes != 0;
+        }
+        return _pending_send_bytes > limit - msg_size;
+    }
+
     void throw_if_terminal(const char* op) const {
         if (_error != quic_error::none) {
             throw quic_exception(_error, sstring(op) + ": " + _error_detail);
@@ -210,6 +221,10 @@ private:
         if (_command_notifier) {
             _command_notifier();
         }
+    }
+
+    void notify_terminal_waiters() noexcept {
+        _command_space_cv.broadcast();
     }
 
     connection_options _options;

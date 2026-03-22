@@ -44,6 +44,15 @@ namespace seastar::quic::experimental {
 
 namespace internal {
 
+namespace {
+
+uint64_t transport_now_ns() {
+    using namespace std::chrono;
+    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+} // namespace
+
 class receive_budget final : public enable_shared_from_this<receive_budget> {
 public:
     explicit receive_budget(size_t limit)
@@ -847,6 +856,115 @@ future<> retry_blocked_open_streams(connection_transport& transport, stream_type
         auto blocked = co_await open_stream(transport, std::move(*cmd));
         if (blocked) {
             co_return;
+        }
+    }
+}
+
+future<> handle_transport_command(connection_transport& transport, transport_command cmd) {
+    switch (cmd.op) {
+    case transport_command::kind::send:
+        co_await send_stream_message(transport, std::move(cmd.msg));
+        break;
+    case transport_command::kind::open_stream:
+        (void)co_await open_stream(transport, std::move(cmd));
+        break;
+    case transport_command::kind::reset_stream:
+        co_await reset_stream(transport, cmd.msg.stream, cmd.app_error_code);
+        break;
+    case transport_command::kind::stop_sending:
+        co_await stop_sending(transport, cmd.msg.stream, cmd.app_error_code);
+        break;
+    case transport_command::kind::close_connection:
+        transport.request_close();
+        break;
+    }
+}
+
+future<> recv_transport_datagram(connection_transport& transport, const socket_address& src, temporary_buffer<char> pkt) {
+    if (!transport.transport_active() || !transport.has_transport_connection()) {
+        co_return;
+    }
+
+    auto rv = transport.read_transport_datagram(src, pkt.get(), pkt.size());
+    if (rv < 0) {
+        if (ngtcp2_is_draining(rv)) {
+            transport.stop_transport();
+            co_return;
+        }
+        transport.fail_transport(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+        co_return;
+    }
+
+    transport.sync_transport_path();
+    co_await flush_pending_transport_packets(transport);
+    transport.rearm_transport_timer();
+}
+
+future<> handle_transport_timer(connection_transport& transport) {
+    if (!transport.transport_active() || !transport.has_transport_connection()) {
+        co_return;
+    }
+
+    auto now_local = transport_now_ns();
+    if (transport.transport_expiry_ns() <= now_local) {
+        auto rv = transport.handle_transport_expiry(now_local);
+        if (rv < 0) {
+            if (ngtcp2_is_idle_close(rv) || ngtcp2_is_draining(rv)) {
+                transport.stop_transport();
+                co_return;
+            }
+            transport.fail_transport(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+            co_return;
+        }
+    }
+
+    co_await flush_pending_transport_packets(transport);
+    transport.rearm_transport_timer();
+}
+
+future<> send_connection_close(connection_transport& transport) {
+    if (!transport.can_send_connection_close()) {
+        co_return;
+    }
+
+    std::vector<uint8_t> outbuf(transport.tx_payload_limit_bytes());
+    auto nwrite = transport.write_connection_close_packet(outbuf.data(), outbuf.size());
+    if (nwrite <= 0) {
+        co_return;
+    }
+
+    co_await transport.send_datagram_packet(outbuf.data(), static_cast<size_t>(nwrite));
+}
+
+future<> run_connection_actor(connection_actor& actor) {
+    while (actor.actor_active()) {
+        if (!actor.actor_has_pending_work()) {
+            co_await actor.actor_wait_for_wakeup();
+            if (!actor.actor_active()) {
+                co_return;
+            }
+        }
+
+        if (actor.actor_stop_requested()) {
+            co_await actor.actor_handle_stop_request();
+            co_return;
+        }
+
+        while (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_has_rx_event()) {
+            co_await actor.actor_handle_next_rx_event();
+        }
+
+        while (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_has_transport_command()) {
+            co_await actor.actor_handle_next_transport_command();
+        }
+
+        if (actor.actor_active() && !actor.actor_stop_requested()) {
+            co_await actor.actor_retry_blocked_open_streams();
+        }
+
+        if (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_tick_pending()) {
+            actor.actor_clear_tick();
+            co_await actor.actor_handle_timer_tick();
         }
     }
 }
