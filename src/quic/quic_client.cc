@@ -194,14 +194,12 @@ temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) 
     return result;
 }
 
-future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, const uint8_t* data, size_t len) {
-    if (len == 0) {
+future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {
+    if (packet.empty()) {
         co_return;
     }
-    quic_client_log.trace("udp send datagram: dst={} bytes={}", dst, len);
-    temporary_buffer<char> tb(len);
-    std::memcpy(tb.get_write(), data, len);
-    std::array<temporary_buffer<char>, 1> bufs{std::move(tb)};
+    quic_client_log.trace("udp send datagram: dst={} bytes={}", dst, packet.size());
+    std::array<temporary_buffer<char>, 1> bufs{std::move(packet)};
     co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
 }
 
@@ -243,6 +241,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
     bool stopping = false;
     bool handshake_done = false;
     size_t tx_payload_limit = default_udp_payload_size;
+    temporary_buffer<char> tx_packet_scratch;
 
     ~client_state() {
         fail_blocked_open_streams(quic_error::closed, "client state destroyed");
@@ -397,8 +396,12 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         return ngtcp2_conn_handle_expiry(conn, now_local);
     }
 
-    future<> send_datagram_packet(const uint8_t* data, size_t len) override {
-        return send_datagram(channel, remote_address, data, len);
+    temporary_buffer<char>& tx_packet_buffer() override {
+        return tx_packet_scratch;
+    }
+
+    future<> send_datagram_packet(temporary_buffer<char> packet) override {
+        return send_datagram(channel, remote_address, std::move(packet));
     }
 
     bool can_send_connection_close() const noexcept override {

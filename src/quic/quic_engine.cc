@@ -22,16 +22,17 @@
 #include <seastar/quic/quic.hh>
 
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 #include <ngtcp2/ngtcp2.h>
 
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/reactor.hh>
@@ -48,6 +49,38 @@ namespace {
 uint64_t transport_now_ns() {
     using namespace std::chrono;
     return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+temporary_buffer<char> coalesce_buffers(std::span<temporary_buffer<char>> bufs) {
+    if (bufs.empty()) {
+        return temporary_buffer<char>();
+    }
+    if (bufs.size() == 1) {
+        return std::move(bufs.front());
+    }
+
+    size_t total = 0;
+    for (const auto& buf : bufs) {
+        total += buf.size();
+    }
+
+    temporary_buffer<char> merged(total);
+    auto* dst = merged.get_write();
+    size_t offset = 0;
+    for (auto& buf : bufs) {
+        std::memcpy(dst + offset, buf.get(), buf.size());
+        offset += buf.size();
+    }
+    return merged;
+}
+
+temporary_buffer<char>& ensure_tx_packet_buffer(connection_transport& transport) {
+    auto required = transport.tx_payload_limit_bytes();
+    auto& scratch = transport.tx_packet_buffer();
+    if (scratch.size() < required) {
+        scratch = temporary_buffer<char>(required);
+    }
+    return scratch;
 }
 
 } // namespace
@@ -161,6 +194,7 @@ public:
     void on_reset(application_error_code app_error_code);
     void on_stop_sending_input(application_error_code app_error_code);
     void on_stop_sending_output(application_error_code app_error_code);
+    void on_batch_flush_error() noexcept;
     void on_transport_closed();
 
 private:
@@ -364,6 +398,10 @@ void stream_state::on_stop_sending_output(application_error_code) {
     _output_closed = true;
 }
 
+void stream_state::on_batch_flush_error() noexcept {
+    _output_closed = true;
+}
+
 void stream_state::on_transport_closed() {
     if (_transport_closed) {
         return;
@@ -399,16 +437,10 @@ public:
     }
 
     future<> put(std::span<temporary_buffer<char>> bufs) override {
-        std::vector<temporary_buffer<char>> owned;
-        owned.reserve(bufs.size());
-        for (auto& buf : bufs) {
-            owned.push_back(std::move(buf));
+        if (bufs.empty()) {
+            return make_ready_future<>();
         }
-        return do_with(std::move(owned), [this] (auto& stable) {
-            return do_for_each(stable, [this] (temporary_buffer<char>& buf) {
-                return _state->send_one(std::move(buf), false);
-            });
-        });
+        return _state->send_one(coalesce_buffers(bufs), false);
     }
 
     future<> close() override {
@@ -417,6 +449,14 @@ public:
 
     size_t buffer_size() const noexcept override {
         return 8192;
+    }
+
+    bool can_batch_flushes() const noexcept override {
+        return true;
+    }
+
+    void on_batch_flush_error() noexcept override {
+        _state->on_batch_flush_error();
     }
 
 private:
@@ -712,9 +752,11 @@ future<> flush_pending_transport_packets(connection_transport& transport) {
         co_return;
     }
 
-    std::vector<uint8_t> outbuf(transport.tx_payload_limit_bytes());
+    auto& outbuf = ensure_tx_packet_buffer(transport);
     while (transport.transport_active()) {
-        auto nwrite = transport.write_pending_packet(outbuf.data(), outbuf.size());
+        auto nwrite = transport.write_pending_packet(
+          reinterpret_cast<uint8_t*>(outbuf.get_write()),
+          outbuf.size());
         if (nwrite == 0) {
             co_return;
         }
@@ -731,7 +773,7 @@ future<> flush_pending_transport_packets(connection_transport& transport) {
               ngtcp2_error_message(static_cast<int>(nwrite)));
             co_return;
         }
-        co_await transport.send_datagram_packet(outbuf.data(), static_cast<size_t>(nwrite));
+        co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(nwrite)));
     }
 }
 
@@ -742,7 +784,7 @@ future<> send_stream_message(connection_transport& transport, quic_message msg) 
 
     size_t offset = 0;
     bool send_fin = msg.fin;
-    std::vector<uint8_t> outbuf(transport.tx_payload_limit_bytes());
+    auto& outbuf = ensure_tx_packet_buffer(transport);
 
     while (transport.transport_active()) {
         const bool remaining = offset < msg.payload.size();
@@ -757,7 +799,7 @@ future<> send_stream_message(connection_transport& transport, quic_message msg) 
           ptr,
           len,
           send_fin,
-          outbuf.data(),
+          reinterpret_cast<uint8_t*>(outbuf.get_write()),
           outbuf.size());
 
         if (result.nwrite < 0) {
@@ -790,7 +832,7 @@ future<> send_stream_message(connection_transport& transport, quic_message msg) 
         if (!remaining && send_fin) {
             send_fin = false;
         }
-        co_await transport.send_datagram_packet(outbuf.data(), static_cast<size_t>(result.nwrite));
+        co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(result.nwrite)));
 
         if (offset >= msg.payload.size() && !send_fin) {
             break;
@@ -939,16 +981,20 @@ future<> send_connection_close(connection_transport& transport) {
         co_return;
     }
 
-    std::vector<uint8_t> outbuf(transport.tx_payload_limit_bytes());
-    auto nwrite = transport.write_connection_close_packet(outbuf.data(), outbuf.size());
+    auto& outbuf = ensure_tx_packet_buffer(transport);
+    auto nwrite = transport.write_connection_close_packet(
+      reinterpret_cast<uint8_t*>(outbuf.get_write()),
+      outbuf.size());
     if (nwrite <= 0) {
         co_return;
     }
 
-    co_await transport.send_datagram_packet(outbuf.data(), static_cast<size_t>(nwrite));
+    co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(nwrite)));
 }
 
 future<> run_connection_actor(connection_actor& actor) {
+    constexpr size_t actor_batch_limit = 64;
+
     while (actor.actor_active()) {
         if (!actor.actor_has_pending_work()) {
             co_await actor.actor_wait_for_wakeup();
@@ -962,12 +1008,22 @@ future<> run_connection_actor(connection_actor& actor) {
             co_return;
         }
 
-        while (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_has_rx_event()) {
+        size_t rx_processed = 0;
+        while (actor.actor_active()
+               && !actor.actor_stop_requested()
+               && actor.actor_has_rx_event()
+               && rx_processed < actor_batch_limit) {
             co_await actor.actor_handle_next_rx_event();
+            ++rx_processed;
         }
 
-        while (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_has_transport_command()) {
+        size_t commands_processed = 0;
+        while (actor.actor_active()
+               && !actor.actor_stop_requested()
+               && actor.actor_has_transport_command()
+               && commands_processed < actor_batch_limit) {
             co_await actor.actor_handle_next_transport_command();
+            ++commands_processed;
         }
 
         if (actor.actor_active() && !actor.actor_stop_requested()) {
@@ -977,6 +1033,13 @@ future<> run_connection_actor(connection_actor& actor) {
         if (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_tick_pending()) {
             actor.actor_clear_tick();
             co_await actor.actor_handle_timer_tick();
+        }
+
+        if (actor.actor_active()
+            && !actor.actor_stop_requested()
+            && actor.actor_has_pending_work()
+            && (rx_processed == actor_batch_limit || commands_processed == actor_batch_limit)) {
+            co_await seastar::coroutine::maybe_yield();
         }
     }
 }

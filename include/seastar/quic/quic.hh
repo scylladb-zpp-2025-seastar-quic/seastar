@@ -233,8 +233,9 @@ public:
     virtual void sync_transport_path() = 0;
     virtual uint64_t transport_expiry_ns() const noexcept = 0;
     virtual int handle_transport_expiry(uint64_t now_ns) = 0;
+    virtual temporary_buffer<char>& tx_packet_buffer() = 0;
 
-    virtual future<> send_datagram_packet(const uint8_t* data, size_t len) = 0;
+    virtual future<> send_datagram_packet(temporary_buffer<char> packet) = 0;
     virtual bool can_send_connection_close() const noexcept = 0;
     virtual int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
     virtual void on_stream_write_closed(stream_id sid) = 0;
