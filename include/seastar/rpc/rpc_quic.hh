@@ -44,7 +44,6 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/log.hh>
-#include <seastar/quic/quic.hh>
 
 namespace bi = boost::intrusive;
 
@@ -110,12 +109,6 @@ struct resource_limits {
     isolation_function_alternatives isolate_connection = default_isolate_connection;
 };
 
-struct quic_transport_options {
-    bool enable = false;
-    quic::experimental::connection_options session_options{};
-    quic::experimental::stream_open_options stream_options{};
-};
-
 struct client_options {
     std::optional<net::tcp_keepalive_params> keepalive;
     bool tcp_nodelay = true;
@@ -129,7 +122,6 @@ struct client_options {
     sstring isolation_cookie;
     sstring metrics_domain = "default";
     bool send_handler_duration = true;
-    std::optional<quic_transport_options> quic;
 };
 
 /// @}
@@ -170,7 +162,6 @@ struct server_options {
     // Returning false will refuse the incoming connection.
     // Returning true will allow the mechanism to proceed.
     std::function<bool(const socket_address&)> filter_connection = {};
-    std::optional<quic_transport_options> quic;
 };
 
 /// @}
@@ -260,19 +251,22 @@ protected:
         {}
     };
     bool _error = false;
-    std::optional<socket_and_buffers> _connected;
-    std::optional<shared_promise<>> _negotiated = shared_promise<>();
+    std::optional<socket_and_buffers> _connected;                       // Reprezentator socketów.
+    std::optional<shared_promise<>> _negotiated = shared_promise<>();   // Future skończony gdy skończy się negocjacja.
     promise<> _stopped;
     stats _stats;
     const logger& _logger;
     // The owner of the pointer below is an instance of rpc::protocol<typename Serializer> class.
     // The type of the pointer is erased here, but the original type is Serializer
     void* _serializer;
+
+    // Outgoing_entry - przechowuje jeden pakiet danych z informacją o timeoutcie pakietu i funkcją wycofywania.
+    // Pakiety są wrzucany do kolejki _outgoing_queue.
     struct outgoing_entry : public bi::list_base_hook<bi::link_mode<bi::auto_unlink>> {
-        timer<rpc_clock_type> t;
+        timer<rpc_clock_type> t;        // Timer.
         snd_buf buf;
         promise<> done;
-        cancellable* pcancel = nullptr;
+        cancellable* pcancel = nullptr; // Obiekt, który pozwala usunąc pakiet z kolejki.
         outgoing_entry(snd_buf b) : buf(std::move(b)) {}
 
         outgoing_entry(outgoing_entry&&) = delete;
@@ -295,7 +289,8 @@ protected:
         using container_t = bi::list<outgoing_entry, bi::constant_time_size<false>>;
     };
     void withdraw(outgoing_entry::container_t::iterator it, std::exception_ptr ex = nullptr);
-    future<> _outgoing_queue_ready = _negotiated->get_shared_future();
+    future<> _outgoing_queue_ready = _negotiated->get_shared_future();  // Future mówiący czy top() kolejki skończył się wykonywać i czy kolejny może ruszyć.
+                                                                        // Początkowo wskazuje i czeka na zakończenie negocjacji, ale za pomocą std::emplace() zmienia swoje zadanie.
     outgoing_entry::container_t _outgoing_queue;
     size_t _outgoing_queue_size = 0;
     std::unique_ptr<compressor> _compressor;
@@ -305,8 +300,6 @@ protected:
     // stream related fields
     bool _is_stream = false;
     connection_id _id = invalid_connection_id;
-    std::shared_ptr<quic::experimental::connection> _quic_session;
-    quic::experimental::stream_open_options _quic_stream_options{};
 
     std::unordered_map<connection_id, xshard_connection_ptr> _streams;
     queue<rcv_buf> _stream_queue = queue<rcv_buf>(max_queued_stream_buffers);
@@ -323,6 +316,7 @@ protected:
         return _is_stream;
     }
 
+    // Wyjaśnienie dokładne funkcji po najechaniu na ich nazwy.
     snd_buf compress(snd_buf buf);
     future<> send_buffer(snd_buf buf);
     future<> send(snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr);
@@ -348,28 +342,6 @@ public:
     }
 
     void set_socket(connected_socket&& fd);
-    void attach_quic_session(std::shared_ptr<quic::experimental::connection> session,
-            quic::experimental::stream stream,
-            quic::experimental::stream_open_options opts = {}) {
-        _quic_session = std::move(session);
-        _quic_stream_options = std::move(opts);
-        set_socket(quic::experimental::to_connected_socket(std::move(stream)));
-    }
-    bool has_quic_session() const noexcept {
-        return static_cast<bool>(_quic_session);
-    }
-    std::shared_ptr<quic::experimental::connection> quic_session() const noexcept {
-        return _quic_session;
-    }
-    future<connected_socket> open_child_quic_stream(std::optional<quic::experimental::stream_open_options> opts = std::nullopt) {
-        if (!_quic_session) {
-            return make_exception_future<connected_socket>(std::runtime_error("QUIC session is not attached"));
-        }
-        quic::experimental::stream_open_options options = opts ? *opts : _quic_stream_options;
-        return _quic_session->open_stream(options).then([] (quic::experimental::stream child_stream) {
-            return make_ready_future<connected_socket>(quic::experimental::to_connected_socket(std::move(child_stream)));
-        });
-    }
     bool error() const noexcept { return _error; }
     void abort();
     future<> stop() noexcept;
@@ -531,6 +503,7 @@ public:
 } // namespace internal
 
 class client : public rpc::connection, public weakly_referencable<client> {
+    // Klient nawiązuje połączenie w connection jest logika samego przesłania danych.
     socket _socket;
     id_type _message_id = 1;
     struct reply_handler_base {

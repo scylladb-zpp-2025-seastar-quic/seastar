@@ -47,8 +47,6 @@ void logger::operator()(const socket_address& addr, log_level level, std::string
 
 no_wait_type no_wait;
 
-// dane wrzucamy do wektora bufs, dzieląc je przy okazji na fragmenty o wielkości chunk_size. BRAK ZMIAN.
-
 snd_buf::snd_buf(size_t size_) : size(size_) {
     if (size <= chunk_size) {
         bufs = temporary_buffer<char>(size);
@@ -66,7 +64,6 @@ snd_buf::snd_buf(size_t size_) : size(size_) {
 snd_buf::snd_buf(snd_buf&&) noexcept = default;
 snd_buf& snd_buf::operator=(snd_buf&&) noexcept = default;
 
-// Zwraca pierwszy blok danych. BRAK ZMIAN.
 temporary_buffer<char>& snd_buf::front() {
     auto* one = std::get_if<temporary_buffer<char>>(&bufs);
     if (one) {
@@ -79,7 +76,7 @@ temporary_buffer<char>& snd_buf::front() {
 namespace internal {
 
 // Make a copy of a remote buffer. No data is actually copied, only pointers and
-// a deleter of a new buffer takes care of deleting the original buffer. BRAK ZMIAN.
+// a deleter of a new buffer takes care of deleting the original buffer
 snd_buf make_shard_local_buffer_copy(snd_buf* org, std::function<deleter(snd_buf*)> make_deleter) {
     snd_buf buf(org->size);
     auto* one = std::get_if<temporary_buffer<char>>(&org->bufs);
@@ -101,7 +98,7 @@ snd_buf make_shard_local_buffer_copy(snd_buf* org, std::function<deleter(snd_buf
 }
 
 // Make a copy of a remote buffer. No data is actually copied, only pointers and
-// a deleter of a new buffer takes care of deleting the original buffer. BRAK ZMIAN
+// a deleter of a new buffer takes care of deleting the original buffer
 rcv_buf make_shard_local_buffer_copy(foreign_ptr<std::unique_ptr<rcv_buf>> org) {
     if (org.get_owner_shard() == this_shard_id()) {
         return std::move(*org);
@@ -127,7 +124,6 @@ rcv_buf make_shard_local_buffer_copy(foreign_ptr<std::unique_ptr<rcv_buf>> org) 
 
 } // namespace internal
 
-// Coś dziwnego z logami -> BRAK ZMIAN.
 static void log_exception(connection& c, log_level level, const char* log, std::exception_ptr eptr) {
     const char* s;
     try {
@@ -141,7 +137,6 @@ static void log_exception(connection& c, log_level level, const char* log, std::
     c.get_logger()(c.peer_address(), level, std::string_view(formatted.data(), formatted.size()));
 }
 
-// Kompresuje bufor. Rozumiem że ta 4 to jest Header size. BRAK ZMIAN. Dodatkowo zamienia na little-endian?
 snd_buf connection::compress(snd_buf buf) {
     if (_compressor) {
         buf = _compressor->compress(4, std::move(buf));
@@ -152,7 +147,6 @@ snd_buf connection::compress(snd_buf buf) {
     return buf;
 }
 
-// Funkcja dane z bufora do socketa przesyła. Najniższy poziom, operujemy na samych wektorach danych. BRAK ZMIAN.
 future<> connection::send_buffer(snd_buf buf) {
     auto* b = std::get_if<temporary_buffer<char>>(&buf.bufs);
     if (b) {
@@ -167,9 +161,6 @@ future<> connection::send_buffer(snd_buf buf) {
     }
 }
 
-// Wyżej poziomowa funkcja wysyłająca/przetwarzająca obiekt outgoing_entry.
-// Jeżeli timeouty są wynegocjowane to aktualizujemy czasy zanim wyślemy dane.
-// Dane zamin wyślemy funkcje send_buffer, compressujemy. Zwrcamy futura, który jest czekaniem na sflushowanie.
 future<> connection::send_entry(outgoing_entry& d) noexcept {
     return futurize_invoke([this, &d] {
         if (d.buf.size && _propagate_timeout) {
@@ -181,7 +172,7 @@ future<> connection::send_entry(outgoing_entry& d) noexcept {
                     left = std::chrono::duration_cast<std::chrono::milliseconds>(expire - timer<rpc_clock_type>::clock::now()).count();
                 }
                 write_le<uint64_t>(d.buf.front().get_write(), left);
-            } else {    // Serwer nie obsługuję timeotów, więc usuwamy pierwsze 8 bajtów z wiadomości, które zawierają ten czas.
+            } else {
                 d.buf.front().trim_front(sizeof(uint64_t));
                 d.buf.size -= sizeof(uint64_t);
             }
@@ -199,7 +190,6 @@ void connection::set_negotiated() noexcept {
     _negotiated = std::nullopt;
 }
 
-// Zamykanie socketa i Mechanizm wywalania pakietów z kolejki. BRAK ZMIAN
 future<> connection::stop_send_loop(std::exception_ptr ex) {
     _error = true;
     if (_connected) {
@@ -237,7 +227,6 @@ future<> connection::stop_send_loop(std::exception_ptr ex) {
     });
 }
 
-// Ustawianie numeru socketa. BRAK_ZMIAN
 void connection::set_socket(connected_socket&& fd) {
     if (_connected.has_value()) {
         throw std::runtime_error("already connected");
@@ -245,9 +234,6 @@ void connection::set_socket(connected_socket&& fd) {
     _connected.emplace(std::move(fd));
 }
 
-// Niskopoziomowa funkcja wysyłająca negotation frame do serwera.
-// Sprawdzamy jakie "feature RPC" ma mieć połączenie i tworzymy odpowiedni pakiet, który wyślemy.
-// Funckja bezpośrednio wysyła ten pakiet i go flushuje.
 future<> connection::send_negotiation_frame(feature_map features) {
     auto negotiation_frame_feature_record_size = [] (const feature_map::value_type& e) {
         return 8 + e.second.size();
@@ -272,7 +258,6 @@ future<> connection::send_negotiation_frame(feature_map features) {
     });
 }
 
-// Jakiś sposób na wyrzucanie pakietu z kolejki. BRAK ZMIAN wtw kiedy nie dodytamy outgoing entry.
 void connection::withdraw(outgoing_entry::container_t::iterator it, std::exception_ptr ex) {
     SEASTAR_ASSERT(it != _outgoing_queue.end());
 
@@ -299,19 +284,12 @@ void connection::withdraw(outgoing_entry::container_t::iterator it, std::excepti
     }
 }
 
-// Obsługuje mechanizm wrzucania/dodawania obiektów outgoing_entry do kolejki oraz ustawiania przy tworzeniu odpowiednich wartości.
-// std::exchange(_outgoing_queue_ready, d.done.get_future()) <- zamienia _outgoing_ na nowego future dodawanego pakietu.
-// W skrócie najwyższy stopień operowania na pakietach.
-// Wstawianie do kolejki i ustawianie kolejności wykonywania. 
 future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) {
     if (!_error) {
-        // Jeżeli timeout istnieje (sprawdzenie optional) oraz już minął to wysyłamy pusty zakończony future.
-        // Samentyka typu, jak przegapiliśmy to zakończ bez akcji.
         if (timeout && *timeout <= rpc_clock_type::now()) {
             return make_ready_future<>();
         }
 
-        // Tworzymy obiekt outgoing_entry i dodajemy go do kolejki.
         auto p = std::make_unique<outgoing_entry>(std::move(buf));
         auto& d = *p;
         _outgoing_queue.push_back(d);
@@ -324,7 +302,6 @@ future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point>
             }
         };
 
-        // Ustawiamy timeout jeżeli istnieją dla obiektu outgoing_entry oraz obiekt cancellable.
         if (timeout) {
             auto& t = d.t;
             t.set_callback(deleter);
@@ -340,20 +317,14 @@ future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point>
         // resolves. Next entry will need to do the same after this entry's done resolves.
         // Thus -- replace _outgoing_queue_ready with d's future and chain its continuation
         // on ..._ready's old value.
-        // .then() <- co się ma dziać gdy będzie czas na wykonanie d.
         return std::exchange(_outgoing_queue_ready, d.done.get_future()).then([this, p = std::move(p)] () mutable {
             _outgoing_queue_size--;
-            // Sprawdzenie, czy wpis nie został wcześniej wycofany.
             if (__builtin_expect(!p->is_linked(), false)) {
                 // If withdrawn the entry is unlinked and this lambda is fired right at once
                 return make_ready_future<>();
             }
-            
-            //  Od tego momentu wpis wszedł w etap, w którym nie można go już bezpiecznie anulować.
-            p->uncancellable();
 
-            // Wysyłamy pakiet korzystając z send_entry. Po wysłaniu sprawdzamy czy zakończyła się sukcesem czy błedem.
-            // Tutaj set_value() oznacza: "ten wpis się zakończył".
+            p->uncancellable();
             return send_entry(*p).then_wrapped([this, p = std::move(p)] (auto f) mutable {
                 if (f.failed()) {
                     f.ignore_ready_future();
@@ -367,7 +338,6 @@ future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point>
     }
 }
 
-// Dosłownie zamyka socketa.
 void connection::abort() {
     if (!_error) {
         _error = true;
@@ -375,7 +345,6 @@ void connection::abort() {
     }
 }
 
-// Wywołuje abort() ale handluje odpowiednie errory. Kończy połączenie.
 future<> connection::stop() noexcept {
     try {
         abort();
@@ -385,7 +354,6 @@ future<> connection::stop() noexcept {
     return _stopped.get_future();
 }
 
-// Sprawdza czy frame jest odpowiedniej wielkości.
 template<typename Connection>
 static bool verify_frame(Connection& c, temporary_buffer<char>& buf, size_t expected, const char* log) {
     if (buf.size() != expected) {
@@ -477,7 +445,6 @@ read_rcv_buf(input_stream<char>& in, uint32_t size) {
     });
 }
 
-// Czytanie ramki ze strumienia i zwracanie future z buforem lub pustego. Raczej nie będę tego zmieniać.
 template<typename FrameType>
 future<typename FrameType::return_type>
 connection::read_frame(socket_address info, input_stream<char>& in) {
@@ -568,14 +535,11 @@ struct stream_frame {
     }
 };
 
-// Parametryzujemy read_frame_compressed typem stream_frame i zwracamy.
 future<std::optional<rcv_buf>>
 connection::read_stream_frame_compressed(input_stream<char>& in) {
     return read_frame_compressed<stream_frame>(peer_address(), _compressor, in);
 }
 
-// Zamyka sink, wejście strumienia.
-// Jeżeli jest error to leci prosto do zatrzymania, wpp czeka na zakończenie/zamknięcie socketa.
 future<> connection::stream_close() {
     auto f = make_ready_future<>();
     if (!error()) {
@@ -588,11 +552,6 @@ future<> connection::stream_close() {
     return f.finally([this] () mutable { return stop(); });
 }
 
-// Z tego co rozumiem:
-// rcv_buf to struktura która jednocześnie trzyma dane oraz semafor.
-// Semafor ma role limitacji odbieranych danych. Przyjmuje pakiety dopóki ma jeszcze miejsce
-// (nie wykorzystał wszystkich swoich jednostek) wpp. trzeba czekać aż się zwolni.
-// Wtedy dopiero możemy wrzucić rcv_buf na kolejkę strumieni.
 future<> connection::stream_process_incoming(rcv_buf&& buf) {
     // we do not want to dead lock on huge packets, so let them in
     // but only one at a time
@@ -603,7 +562,6 @@ future<> connection::stream_process_incoming(rcv_buf&& buf) {
     });
 }
 
-// Połączenie odebrania compresji danych oraz wrzucenia do kolejki.
 future<> connection::handle_stream_frame() {
     return read_stream_frame_compressed(_connected->read_buf).then([this] (std::optional<rcv_buf> data) {
         if (!data) {
@@ -614,10 +572,6 @@ future<> connection::handle_stream_frame() {
     });
 }
 
-// Miejsce odpbioru danych ze wszystkich streamów.
-// Bierzemy dane z kolejki _stream_queue dopóki nie natrafimy na eof.
-// Jeżeli na niego natrafimy to oznacza, że nie ma już danych i wtedy
-// odkładamy znowu na początek kolejki EOF (buf (-1)).
 future<> connection::stream_receive(circular_buffer<foreign_ptr<std::unique_ptr<rcv_buf>>>& bufs) {
     return _stream_queue.not_empty().then([this, &bufs] {
         bool eof = !_stream_queue.consume([&bufs] (rcv_buf&& b) {
@@ -635,12 +589,10 @@ future<> connection::stream_receive(circular_buffer<foreign_ptr<std::unique_ptr<
     });
 }
 
-// Zapisujemy w mapie odpowiednie id do odpowiedniego sharda.
 void connection::register_stream(connection_id id, xshard_connection_ptr c) {
     _streams.emplace(id, std::move(c));
 }
 
-// Zwykłe wyszukiwanie sharda na podstawie id streamu.
 xshard_connection_ptr connection::get_stream(connection_id id) const {
     auto it = _streams.find(id);
     if (it == _streams.end()) {
@@ -707,13 +659,11 @@ struct request_frame_with_timeout : request_frame {
     }
 };
 
-// Encode + send.
 future<> client::request(uint64_t type, int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) {
     request_frame_with_timeout::encode_header(type, msg_id, buf);
     return send(std::move(buf), timeout, cancel);
 }
 
-// Ustawianie featurów na podstawie feature_map.
 void
 client::negotiate(feature_map provided) {
     // record features returned here
@@ -746,7 +696,6 @@ client::negotiate(feature_map provided) {
     }
 }
 
-// Wyższy poziom. Klient wysyła negation frame, serwer odsyła, wywołujemy funkcję co to wszystko zapisuje.
 future<> client::negotiate_protocol(feature_map features) {
     return send_negotiation_frame(std::move(features)).then([this] {
         return receive_negotiation_frame(*this, _connected->read_buf).then([this] (feature_map features) {
