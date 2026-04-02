@@ -586,7 +586,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         if (!cmd) {
             co_return;
         }
-        co_await internal::handle_transport_command(*this, std::move(*cmd));
+        co_await internal::handle_transport_command(*this, *this, std::move(*cmd));
     }
     future<> actor_retry_blocked_open_streams() override {
         co_await internal::retry_blocked_open_streams(*this, stream_type::bidirectional);
@@ -941,6 +941,8 @@ private:
             std::memcpy(tb.get_write(), data, datalen);
         }
         conn->engine->on_stream_data(sid, type, peer_initiated, std::move(tb), (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
+        ngtcp2_conn_extend_max_stream_offset(ngconn, sid, datalen);
+        ngtcp2_conn_extend_max_offset(ngconn, datalen);
         return 0;
     }
 

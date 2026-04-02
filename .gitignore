@@ -12,3 +12,5 @@ tags
 .vscode/
 compile_commands.json
 .cache
+server.crt
+server.key

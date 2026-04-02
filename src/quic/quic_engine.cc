@@ -38,6 +38,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/later.hh>
 #include <seastar/net/stack.hh>
 
 namespace seastar::quic::experimental {
@@ -777,7 +778,7 @@ future<> flush_pending_transport_packets(connection_transport& transport) {
     }
 }
 
-future<> send_stream_message(connection_transport& transport, quic_message msg) {
+future<> send_stream_message(connection_transport& transport, connection_actor& actor, quic_message msg) {
     if (!transport.has_transport_connection() || msg.stream == invalid_stream_id) {
         co_return;
     }
@@ -818,13 +819,39 @@ future<> send_stream_message(connection_transport& transport, quic_message msg) 
                 transport.rearm_transport_timer();
                 co_return;
             }
+            if (result.nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+                co_await flush_pending_transport_packets(transport);
+                co_await seastar::check_for_io_immediately();
+                co_await seastar::yield();
+                while (actor.actor_active() && actor.actor_has_rx_event()) {
+                    co_await actor.actor_handle_next_rx_event();
+                }
+                if (actor.actor_active() && actor.actor_tick_pending()) {
+                    actor.actor_clear_tick();
+                    co_await actor.actor_handle_timer_tick();
+                }
+                continue;
+            }
             transport.fail_transport(
               classify_ngtcp2_error(static_cast<int>(result.nwrite)),
               ngtcp2_error_message(static_cast<int>(result.nwrite)));
             co_return;
         }
         if (result.nwrite == 0) {
+            // Congestion window full or pacing — flush pending packets,
+            // then give the reactor a chance to poll I/O and run the recv
+            // loop so incoming ACKs can be received and processed.
             co_await flush_pending_transport_packets(transport);
+            // Force I/O poll + yield so recv_loop can push to rx queue.
+            co_await seastar::check_for_io_immediately();
+            co_await seastar::yield();
+            while (actor.actor_active() && actor.actor_has_rx_event()) {
+                co_await actor.actor_handle_next_rx_event();
+            }
+            if (actor.actor_active() && actor.actor_tick_pending()) {
+                actor.actor_clear_tick();
+                co_await actor.actor_handle_timer_tick();
+            }
             continue;
         }
 
@@ -914,10 +941,10 @@ future<> retry_blocked_open_streams(connection_transport& transport, stream_type
     }
 }
 
-future<> handle_transport_command(connection_transport& transport, transport_command cmd) {
+future<> handle_transport_command(connection_transport& transport, connection_actor& actor, transport_command cmd) {
     switch (cmd.op) {
     case transport_command::kind::send:
-        co_await send_stream_message(transport, std::move(cmd.msg));
+        co_await send_stream_message(transport, actor, std::move(cmd.msg));
         break;
     case transport_command::kind::open_stream:
         (void)co_await open_stream(transport, std::move(cmd));

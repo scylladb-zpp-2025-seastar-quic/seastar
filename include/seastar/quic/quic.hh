@@ -333,7 +333,7 @@ future<bool> open_stream(connection_transport& transport, transport_command cmd)
 future<> reset_stream(connection_transport& transport, stream_id sid, application_error_code app_error_code);
 future<> stop_sending(connection_transport& transport, stream_id sid, application_error_code app_error_code);
 future<> retry_blocked_open_streams(connection_transport& transport, stream_type type);
-future<> handle_transport_command(connection_transport& transport, transport_command cmd);
+future<> handle_transport_command(connection_transport& transport, connection_actor& actor, transport_command cmd);
 future<> recv_transport_datagram(connection_transport& transport, const socket_address& src, temporary_buffer<char> pkt);
 future<> handle_transport_timer(connection_transport& transport);
 future<> send_connection_close(connection_transport& transport);
