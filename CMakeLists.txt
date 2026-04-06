@@ -668,6 +668,10 @@ add_library (seastar
   include/seastar/util/short_streams.hh
   include/seastar/websocket/common.hh
   include/seastar/websocket/server.hh
+  include/seastar/quic/quic.hh
+  include/seastar/quic/quic_client.hh
+  include/seastar/quic/quic_server.hh
+  include/seastar/quic/quic_error.hh
   src/core/alien.cc
   src/core/file.cc
   src/core/fair_queue.cc
@@ -761,6 +765,11 @@ add_library (seastar
   src/websocket/parser.cc
   src/websocket/common.cc
   src/websocket/server.cc
+  src/quic/quic.cc
+  src/quic/quic_engine.cc
+  src/quic/quic_client.cc
+  src/quic/quic_server.cc
+  src/quic/quic_error.cc
   )
 
 if (Seastar_MODULE)
