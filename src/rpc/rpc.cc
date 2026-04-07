@@ -21,6 +21,46 @@ namespace seastar {
 
 namespace rpc {
 
+namespace {
+
+bool quic_enabled(const client_options& options) {
+    return options.quic && options.quic->enable;
+}
+
+bool quic_enabled(const server_options& options) {
+    return options.quic && options.quic->enable;
+}
+
+quic::experimental::quic_client_config make_quic_client_config(
+        const client_options& options,
+        const socket_address& remote,
+        const socket_address& local) {
+    quic::experimental::quic_client_config cfg;
+    cfg.remote_address = remote;
+    if (local != socket_address{}) {
+        cfg.local_address = local;
+    }
+    cfg.server_name = options.quic->server_name;
+    cfg.ca_file = options.quic->ca_file;
+    cfg.alpns = options.quic->alpns;
+    cfg.session_options = options.quic->session_options;
+    return cfg;
+}
+
+quic::experimental::quic_server_config make_quic_server_config(
+        const server_options& options,
+        const socket_address& listen_addr) {
+    quic::experimental::quic_server_config cfg;
+    cfg.listen_address = listen_addr;
+    cfg.crt_file = options.quic->crt_file;
+    cfg.key_file = options.quic->key_file;
+    cfg.alpns = options.quic->alpns;
+    cfg.session_options = options.quic->session_options;
+    return cfg;
+}
+
+} // anonymous namespace
+
 void logger::operator()(const client_info& info, id_type msg_id, const sstring& str) const {
     log(fmt::format("client {} msg_id {}:  {}", info.addr, msg_id, str));
 }
@@ -759,6 +799,7 @@ future<> client::negotiate_protocol(feature_map features) {
 //   le64 message ID
 //   le32 payload size
 //   ...  payload
+// Te strukty mają zadanie jak trait. Nie przechowują same w sobie danych ale definiują jak czytać i pisać dane z buforów.
 struct response_frame {
     using opt_buf_type = std::optional<rcv_buf>;
     using return_type = std::tuple<int64_t, std::optional<uint32_t>, opt_buf_type>;
@@ -866,6 +907,9 @@ void client::wait_timed_out(id_type id) {
 
 future<> client::stop() noexcept {
     _error = true;
+    if (_quic_session && !is_stream()) {
+        (void)_quic_session->close().handle_exception([] (std::exception_ptr) {});
+    }
     try {
         _socket.shutdown();
     } catch(...) {
@@ -1006,13 +1050,29 @@ client::client(const logger& l, void* s, client_options ops, socket socket, cons
 future<> client::loop(client_options ops, const socket_address& addr, const socket_address& local) {
     std::exception_ptr ep;
     try {
-        connected_socket fd = co_await _socket.connect(addr, local);
-        fd.set_nodelay(ops.tcp_nodelay);
-        if (ops.keepalive) {
-            fd.set_keepalive(true);
-            fd.set_keepalive_parameters(ops.keepalive.value());
+        if (quic_enabled(ops)) {
+            if (is_stream()) {
+                if (!_parent || !_parent->quic_session()) {
+                    throw std::runtime_error("QUIC stream RPC connection requires a live parent QUIC session");
+                }
+                auto fd = co_await _parent->open_child_quic_stream(ops.quic->stream_options);
+                attach_quic_session(_parent->quic_session(), std::move(fd), ops.quic->stream_options);
+            } else {
+                _quic_client = std::make_unique<quic::experimental::quic_client>();
+                auto session = std::make_shared<quic::experimental::connection>(
+                        co_await _quic_client->connect(make_quic_client_config(ops, addr, local)));
+                auto stream = co_await session->open_stream(ops.quic->stream_options);
+                attach_quic_session(session, quic::experimental::to_connected_socket(std::move(stream)), ops.quic->stream_options);
+            }
+        } else {
+            connected_socket fd = co_await _socket.connect(addr, local);
+            fd.set_nodelay(ops.tcp_nodelay);
+            if (ops.keepalive) {
+                fd.set_keepalive(true);
+                fd.set_keepalive_parameters(ops.keepalive.value());
+            }
+            set_socket(std::move(fd));
         }
-        set_socket(std::move(fd));
 
         feature_map features;
         if (_options.compressor_factory) {
@@ -1099,6 +1159,12 @@ future<> client::loop(client_options ops, const socket_address& addr, const sock
     }
     if (_compressor) {
         co_await _compressor->close();
+    }
+    if (_quic_session && !is_stream()) {
+        co_await _quic_session->close().handle_exception([] (std::exception_ptr) {});
+    }
+    if (_quic_client) {
+        co_await _quic_client->stop().handle_exception([] (std::exception_ptr) {});
     }
     _stopped.set_value();
 }
@@ -1323,6 +1389,9 @@ future<> server::connection::process() {
     if (_compressor) {
         co_await _compressor->close();
     }
+    if (_quic_session && !is_stream()) {
+        co_await _quic_session->close().handle_exception([] (std::exception_ptr) {});
+    }
     _stopped.set_value();
 }
 
@@ -1357,18 +1426,70 @@ future<> server::connection::abort_all_streams() {
     });
 }
 
+future<> server::accept_quic_stream(std::shared_ptr<quic::experimental::connection> session, connected_socket fd, socket_address addr) {
+    connection_id id = _options.streaming_domain
+            ? connection_id::make_id(_next_client_id++, uint16_t(this_shard_id()))
+            : connection_id::make_invalid_id(_next_client_id++);
+    auto conn = _proto.make_server_connection(*this, std::move(fd), std::move(addr), id);
+    conn->set_quic_session(session, _options.quic->stream_options);
+    auto r = _conns.emplace(id, conn);
+    SEASTAR_ASSERT(r.second);
+    (void)conn->process();
+    return make_ready_future<>();
+}
+
+future<> server::accept_quic_session(std::shared_ptr<quic::experimental::connection> session) {
+    auto addr = session->peer_address();
+    auto main_stream = co_await session->accept_stream();
+    co_await accept_quic_stream(session, quic::experimental::to_connected_socket(std::move(main_stream)), addr);
+    while (session->is_open() && !_shutdown) {
+        quic::experimental::stream child_stream;
+        try {
+            child_stream = co_await session->accept_stream();
+        } catch (...) {
+            break;
+        }
+        co_await accept_quic_stream(session, quic::experimental::to_connected_socket(std::move(child_stream)), addr);
+    }
+}
+
 thread_local std::unordered_map<streaming_domain_type, server*> server::_servers;
 
 server::server(protocol_base* proto, const socket_address& addr, resource_limits limits)
-        : server(proto, seastar::listen(addr, listen_options{true}), limits, server_options{})
-{}
+        : _proto(*proto)
+        , _ss(seastar::listen(addr, listen_options{true}))
+        , _listen_addr(addr)
+        , _limits(limits)
+        , _resources_available(limits.max_memory)
+{
+    if (_options.streaming_domain) {
+        if (_servers.find(*_options.streaming_domain) != _servers.end()) {
+            throw std::runtime_error(format("An RPC server with the streaming domain {} is already exist", *_options.streaming_domain));
+        }
+        _servers[*_options.streaming_domain] = this;
+    }
+    accept();
+}
 
 server::server(protocol_base* proto, server_options opts, const socket_address& addr, resource_limits limits)
-        : server(proto, seastar::listen(addr, listen_options{true, opts.load_balancing_algorithm}), limits, opts)
-{}
+        : _proto(*proto)
+        , _ss(quic_enabled(opts) ? server_socket() : seastar::listen(addr, listen_options{true, opts.load_balancing_algorithm}))
+        , _listen_addr(addr)
+        , _limits(limits)
+        , _resources_available(limits.max_memory)
+        , _options(std::move(opts))
+{
+    if (_options.streaming_domain) {
+        if (_servers.find(*_options.streaming_domain) != _servers.end()) {
+            throw std::runtime_error(format("An RPC server with the streaming domain {} is already exist", *_options.streaming_domain));
+        }
+        _servers[*_options.streaming_domain] = this;
+    }
+    accept();
+}
 
 server::server(protocol_base* proto, server_socket ss, resource_limits limits, server_options opts)
-        : _proto(*proto), _ss(std::move(ss)), _limits(limits), _resources_available(limits.max_memory), _options(opts)
+        : _proto(*proto), _ss(std::move(ss)), _listen_addr(_ss.local_address()), _limits(limits), _resources_available(limits.max_memory), _options(std::move(opts))
 {
     if (_options.streaming_domain) {
         if (_servers.find(*_options.streaming_domain) != _servers.end()) {
@@ -1387,6 +1508,31 @@ void server::accept() {
     // Run asynchronously in background.
     // Communicate result via __ss_stopped.
     // The caller has to call server::stop() to synchronize.
+    if (quic_enabled(_options)) {
+        _quic_server = std::make_unique<quic::experimental::quic_server>();
+        (void)_quic_server->start(make_quic_server_config(_options, _listen_addr)).then([this] {
+            return keep_doing([this] () mutable {
+                return _quic_server->accept().then([this] (quic::experimental::connection session) mutable {
+                    auto peer = session.peer_address();
+                    if (_options.filter_connection && !_options.filter_connection(peer)) {
+                        return session.close();
+                    }
+                    auto shared_session = std::make_shared<quic::experimental::connection>(std::move(session));
+                    return with_gate(_session_gate, [this, shared_session = std::move(shared_session)] () mutable {
+                        return accept_quic_session(std::move(shared_session));
+                    }).handle_exception([] (std::exception_ptr) {});
+                });
+            });
+        }).then_wrapped([this] (future<>&& f) {
+            try {
+                f.get();
+                SEASTAR_ASSERT(false);
+            } catch (...) {
+                _ss_stopped.set_value();
+            }
+        });
+        return;
+    }
     (void)keep_doing([this] () mutable {
         return _ss.accept().then([this] (accept_result ar) mutable {
             if (_options.filter_connection && !_options.filter_connection(ar.remote_address)) {
@@ -1419,7 +1565,13 @@ future<> server::shutdown() {
         return make_ready_future<>();
     }
 
-    _ss.abort_accept();
+    if (quic_enabled(_options)) {
+        if (_quic_server) {
+            (void)_quic_server->stop().handle_exception([] (std::exception_ptr) {});
+        }
+    } else {
+        _ss.abort_accept();
+    }
     _resources_available.broken();
     if (_options.streaming_domain) {
         _servers.erase(*_options.streaming_domain);
@@ -1428,6 +1580,8 @@ future<> server::shutdown() {
         return parallel_for_each(_conns | boost::adaptors::map_values, [] (shared_ptr<connection> conn) {
             return conn->stop();
         });
+    }).then([this] {
+        return _session_gate.close();
     }).finally([this] {
         _shutdown = true;
     });
