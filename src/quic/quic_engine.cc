@@ -25,6 +25,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -251,7 +252,10 @@ private:
     bool _can_read = true;
     bool _can_write = true;
 
-    queue<temporary_buffer<char>> _read_queue{1024};
+    // Receive backpressure is already enforced by _receive_budget in bytes.
+    // A small fixed fragment-count cap overflows single bidi streams when
+    // larger UDP payloads are enabled, even though the byte budget still has room.
+    queue<temporary_buffer<char>> _read_queue{std::numeric_limits<size_t>::max()};
     shared_promise<> _input_shutdown;
     bool _input_shutdown_notified = false;
     bool _output_closed = false;
