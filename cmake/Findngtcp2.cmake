@@ -34,7 +34,14 @@ set (NGTCP2_BUILD_TESTING
   BOOL 
   "Disable tests")
 
+# Seastar is typically built as a shared library in this tree, so the static
+# ngtcp2 archives must be compiled as PIC to be linkable into libseastar.so.
+set (_ngtcp2_old_pic ${CMAKE_POSITION_INDEPENDENT_CODE})
+set (CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 add_subdirectory (ngtcp2)
+
+set (CMAKE_POSITION_INDEPENDENT_CODE ${_ngtcp2_old_pic})
 
 set (NGTCP2_SRC "${CMAKE_CURRENT_SOURCE_DIR}/ngtcp2")
 set (NGTCP2_BIN "${CMAKE_CURRENT_BINARY_DIR}/ngtcp2")
@@ -47,6 +54,12 @@ set (ngtcp2_INCLUDE_DIRS
 )
 
 if (TARGET ngtcp2_static AND TARGET ngtcp2_crypto_gnutls_static)
+  set_target_properties (
+    ngtcp2_static
+    ngtcp2_crypto_gnutls_static
+    PROPERTIES
+      POSITION_INDEPENDENT_CODE ON)
+
   add_library (ngtcp2::ngtcp2 INTERFACE IMPORTED)
 
   set_target_properties (ngtcp2::ngtcp2 PROPERTIES

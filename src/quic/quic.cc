@@ -135,6 +135,9 @@ public:
         }
         auto cmd = std::move(_commands.front());
         _commands.pop_front();
+        if (_commands.empty()) {
+            _command_ready_notification_pending = false;
+        }
         if (cmd.op == transport_command::kind::send) {
             _pending_send_bytes -= cmd.msg.payload.size();
             _command_space_cv.signal();
@@ -144,6 +147,9 @@ public:
 
     void set_command_notifier(std::function<void()> notifier) override {
         _command_notifier = std::move(notifier);
+        if (_command_notifier && _command_ready_notification_pending) {
+            _command_notifier();
+        }
     }
 
     void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override {
@@ -218,6 +224,10 @@ private:
     }
 
     void notify_command_ready() {
+        if (_command_ready_notification_pending) {
+            return;
+        }
+        _command_ready_notification_pending = true;
         if (_command_notifier) {
             _command_notifier();
         }
@@ -240,6 +250,7 @@ private:
     std::deque<transport_command> _commands;
     size_t _pending_send_bytes = 0;
     std::function<void()> _command_notifier;
+    bool _command_ready_notification_pending = false;
 
     condition_variable _command_space_cv;
 };

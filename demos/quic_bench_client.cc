@@ -68,6 +68,15 @@ using bm_clock   = std::chrono::steady_clock;
 using time_point = bm_clock::time_point;
 using us_t       = std::chrono::microseconds;
 
+static constexpr size_t throughput_buffer_size = 256 * 1024;
+static constexpr uint64_t throughput_stream_window = 8 * 1024 * 1024;
+static constexpr uint64_t throughput_connection_window = 64 * 1024 * 1024;
+static constexpr uint64_t throughput_max_stream_window = 16 * 1024 * 1024;
+static constexpr uint64_t throughput_stream_limit = 1024;
+static constexpr size_t throughput_ack_thresh = 8;
+static constexpr size_t throughput_udp_payload_size = 65527;
+static constexpr size_t throughput_tx_udp_payload_size = 4096;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -86,6 +95,13 @@ static stream_type parse_stream_type(const std::string& s) {
     if (s == "bidi") { return stream_type::bidirectional; }
     if (s == "uni")  { return stream_type::unidirectional; }
     throw std::runtime_error("Unknown stream-type '" + s + "': expected bidi or uni");
+}
+
+static size_t resolve_throughput_flush_messages(size_t configured, size_t msg_size) {
+    if (configured > 0) {
+        return configured;
+    }
+    return std::max<size_t>(1, throughput_buffer_size / std::max<size_t>(msg_size, 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -111,23 +127,33 @@ static future<> run_bidi_throughput_stream(
         lw_shared_ptr<connection> conn,
         const std::vector<char>&  msg,
         time_point                deadline,
+        size_t                    flush_messages,
         throughput_result&        result) {
 
     auto s   = co_await conn->open_stream({.type = stream_type::bidirectional});
     auto inp = make_lw_shared<input_stream<char>>(s.input());
-    auto out = make_lw_shared<output_stream<char>>(s.output(8192));
+    // Match the TLS/TCP benchmark buffering in throughput mode.
+    auto out = make_lw_shared<output_stream<char>>(s.output(throughput_buffer_size));
     auto bytes_rx = make_lw_shared<uint64_t>(0);
     auto bytes_tx = make_lw_shared<uint64_t>(0);
     auto msgs_tx  = make_lw_shared<uint64_t>(0);
 
     // Sender: write until deadline, then close the output half.
     auto sender = [out, bytes_tx, msgs_tx, deadline,
-                   data = msg.data(), sz = msg.size()]() -> future<> {
+                   data = msg.data(), sz = msg.size(), flush_messages]() -> future<> {
+        size_t pending_messages = 0;
         while (bm_clock::now() < deadline) {
             co_await out->write(data, sz);
-            co_await out->flush();
             *bytes_tx += sz;
             ++(*msgs_tx);
+            ++pending_messages;
+            if (pending_messages >= flush_messages) {
+                co_await out->flush();
+                pending_messages = 0;
+            }
+        }
+        if (pending_messages > 0) {
+            co_await out->flush();
         }
         co_await out->close();
     };
@@ -158,16 +184,25 @@ static future<> run_uni_throughput_stream(
         lw_shared_ptr<connection> conn,
         const std::vector<char>&  msg,
         time_point                deadline,
+        size_t                    flush_messages,
         throughput_result&        result) {
 
     auto s   = co_await conn->open_stream({.type = stream_type::unidirectional});
-    auto out = s.output(256 * 1024);
+    auto out = s.output(throughput_buffer_size);
     try {
+        size_t pending_messages = 0;
         while (bm_clock::now() < deadline) {
             co_await out.write(msg.data(), msg.size());
-            co_await out.flush();
             result.bytes_sent += msg.size();
             ++result.messages_sent;
+            ++pending_messages;
+            if (pending_messages >= flush_messages) {
+                co_await out.flush();
+                pending_messages = 0;
+            }
+        }
+        if (pending_messages > 0) {
+            co_await out.flush();
         }
         co_await out.close();
     } catch (const quic_exception& e) {
@@ -229,6 +264,7 @@ static future<> run_connection_throughput(
         stream_type              stype,
         const std::vector<char>& msg,
         time_point               deadline,
+        size_t                   flush_messages,
         throughput_result&       result) {
 
     quic_client client;
@@ -240,9 +276,9 @@ static future<> run_connection_throughput(
         futs.reserve(n_streams);
         for (int i = 0; i < n_streams; ++i) {
             if (stype == stream_type::bidirectional) {
-                futs.push_back(run_bidi_throughput_stream(conn, msg, deadline, result));
+                futs.push_back(run_bidi_throughput_stream(conn, msg, deadline, flush_messages, result));
             } else {
-                futs.push_back(run_uni_throughput_stream(conn, msg, deadline, result));
+                futs.push_back(run_uni_throughput_stream(conn, msg, deadline, flush_messages, result));
             }
         }
 
@@ -394,6 +430,8 @@ int main(int argc, char** argv) {
          "Number of concurrent streams per connection")
         ("message-size", bpo::value<size_t>()->default_value(65536),
          "Size of each message in bytes (throughput default: 64 KiB)")
+        ("throughput-flush-messages", bpo::value<size_t>()->default_value(0),
+         "Flush throughput output every N messages (0 = auto, about one output buffer)")
         ("duration", bpo::value<unsigned>()->default_value(10),
          "Benchmark duration in seconds");
 
@@ -410,6 +448,7 @@ int main(int argc, char** argv) {
             auto n_conns     = cfg["connections"].as<int>();
             auto n_streams   = cfg["streams-per-conn"].as<int>();
             auto msg_size    = cfg["message-size"].as<size_t>();
+            auto flush_messages_cfg = cfg["throughput-flush-messages"].as<size_t>();
             auto dur_s       = cfg["duration"].as<unsigned>();
 
             if (mode != "throughput" && mode != "latency") {
@@ -429,6 +468,7 @@ int main(int argc, char** argv) {
 
             // Build the message payload once (filled with 'Q').
             const std::vector<char> msg(msg_size, 'Q');
+            const auto flush_messages = resolve_throughput_flush_messages(flush_messages_cfg, msg_size);
 
             // Base client config – each connection gets its own quic_client.
             quic_client_config base_cfg;
@@ -439,19 +479,28 @@ int main(int argc, char** argv) {
             }
             // Transport limits tuned for the actor-based transport engine.
             base_cfg.session_options.max_pending_send_bytes    = 4 * 1024 * 1024;
-            base_cfg.session_options.max_pending_receive_bytes = 4 * 1024 * 1024;
-            base_cfg.session_options.transport.initial_max_stream_data_bidi_local  = 1 * 1024 * 1024;
-            base_cfg.session_options.transport.initial_max_stream_data_bidi_remote = 1 * 1024 * 1024;
-            base_cfg.session_options.transport.initial_max_data         = 4 * 1024 * 1024;
-            base_cfg.session_options.transport.initial_max_streams_bidi = 1024;
+            base_cfg.session_options.max_pending_receive_bytes = 64 * 1024 * 1024;
+            base_cfg.session_options.transport.initial_max_stream_data_bidi_local  = throughput_stream_window;
+            base_cfg.session_options.transport.initial_max_stream_data_bidi_remote = throughput_stream_window;
+            base_cfg.session_options.transport.initial_max_stream_data_uni         = throughput_stream_window;
+            base_cfg.session_options.transport.initial_max_data         = throughput_connection_window;
+            base_cfg.session_options.transport.initial_max_streams_bidi = throughput_stream_limit;
+            base_cfg.session_options.transport.initial_max_streams_uni  = throughput_stream_limit;
+            base_cfg.session_options.transport.max_window = throughput_connection_window;
+            base_cfg.session_options.transport.max_stream_window = throughput_max_stream_window;
+            base_cfg.session_options.transport.ack_thresh = throughput_ack_thresh;
+            base_cfg.session_options.transport.congestion_control = congestion_control_algorithm::bbr;
+            base_cfg.session_options.transport.max_udp_payload_size = throughput_udp_payload_size;
+            base_cfg.session_options.transport.max_tx_udp_payload_size = throughput_tx_udp_payload_size;
+            base_cfg.session_options.transport.disable_tx_udp_payload_size_shaping = true;
 
             const auto deadline = bm_clock::now() + std::chrono::seconds(dur_s);
 
             fmt::print(
-                "[client] mode={} stream-type={} conns={} streams/conn={} msg={}B dur={}s\n",
+                "[client] mode={} stream-type={} conns={} streams/conn={} msg={}B dur={}s flush-msgs={}\n",
                 mode,
                 stype == stream_type::bidirectional ? "bidi" : "uni",
-                n_conns, n_streams, msg_size, dur_s);
+                n_conns, n_streams, msg_size, dur_s, flush_messages);
             std::cout.flush();
 
             // ------------------------------------------------------------------
@@ -466,7 +515,7 @@ int main(int argc, char** argv) {
                 for (int c = 0; c < n_conns; ++c) {
                     conn_futs.push_back(
                         run_connection_throughput(
-                            base_cfg, n_streams, stype, msg, deadline, total));
+                            base_cfg, n_streams, stype, msg, deadline, flush_messages, total));
                 }
                 auto conn_results = co_await when_all(conn_futs.begin(), conn_futs.end());
                 for (auto& f : conn_results) {

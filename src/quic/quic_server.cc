@@ -61,6 +61,8 @@ constexpr size_t max_cid_len = 20;
 constexpr size_t server_short_cid_len = 8;
 constexpr size_t max_udp_payload_size = 65527;
 constexpr size_t default_udp_payload_size = 1200;
+constexpr size_t default_max_tx_udp_payload_size = 1452;
+constexpr size_t max_tx_packet_pool_size = 128;
 
 static logger quic_server_log("quic_server");
 using transport_command = internal::transport_command;
@@ -127,6 +129,29 @@ void* mem_realloc(void* ptr, size_t s, void*) {
     return std::realloc(ptr, s);
 }
 
+size_t normalize_udp_payload_size(size_t requested, size_t fallback) noexcept {
+    auto value = requested == 0 ? fallback : requested;
+    if (value < default_udp_payload_size) {
+        return default_udp_payload_size;
+    }
+    if (value > max_udp_payload_size) {
+        return max_udp_payload_size;
+    }
+    return value;
+}
+
+ngtcp2_cc_algo to_ngtcp2_cc_algo(congestion_control_algorithm algo) noexcept {
+    switch (algo) {
+    case congestion_control_algorithm::reno:
+        return NGTCP2_CC_ALGO_RENO;
+    case congestion_control_algorithm::bbr:
+        return NGTCP2_CC_ALGO_BBR;
+    case congestion_control_algorithm::cubic:
+    default:
+        return NGTCP2_CC_ALGO_CUBIC;
+    }
+}
+
 const ngtcp2_mem* ngtcp2_mem_for_thread() {
     thread_local const ngtcp2_mem mem = {
       nullptr,
@@ -178,10 +203,29 @@ std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
     }
 }
 
-temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) {
+struct queued_datagram_packet {
+    temporary_buffer<char> storage;
+    size_t size = 0;
+};
+
+temporary_buffer<char> linearize_packet(
+  std::span<temporary_buffer<char>> bufs,
+  internal::transport_debug_stats* stats = nullptr) {
+    if (bufs.empty()) {
+        return {};
+    }
+    if (bufs.size() == 1) {
+        return std::move(bufs.front());
+    }
+
     size_t total = 0;
     for (const auto& b : bufs) {
         total += b.size();
+    }
+
+    if (stats) {
+        ++stats->rx_linearized_packets;
+        stats->rx_linearized_bytes += total;
     }
 
     temporary_buffer<char> result(total);
@@ -194,13 +238,27 @@ temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) 
     return result;
 }
 
-future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {
-    if (packet.empty()) {
-        co_return;
+temporary_buffer<char> copy_or_share_stream_payload(
+  temporary_buffer<char>& current_rx_packet,
+  const uint8_t* data,
+  size_t datalen,
+  internal::transport_debug_stats& stats) {
+    if (!datalen) {
+        return {};
     }
-    quic_server_log.trace("udp send datagram: dst={} bytes={}", dst, packet.size());
-    std::array<temporary_buffer<char>, 1> bufs{std::move(packet)};
-    co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
+
+    if (!current_rx_packet.empty()) {
+        const auto packet_begin = reinterpret_cast<uintptr_t>(current_rx_packet.get());
+        const auto packet_end = packet_begin + current_rx_packet.size();
+        const auto data_begin = reinterpret_cast<uintptr_t>(data);
+        if (data_begin >= packet_begin && data_begin <= packet_end && datalen <= packet_end - data_begin) {
+            return current_rx_packet.share(data_begin - packet_begin, datalen);
+        }
+    }
+
+    ++stats.rx_fallback_copy_events;
+    stats.rx_fallback_copy_bytes += datalen;
+    return temporary_buffer<char>(reinterpret_cast<const char*>(data), datalen);
 }
 
 std::string cid_key(const uint8_t* data, size_t len) {
@@ -293,10 +351,16 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
     bool handshake_done = false;
     bool accepted_to_listener = false;
     size_t tx_payload_limit = default_udp_payload_size;
-    temporary_buffer<char> tx_packet_scratch;
+    std::shared_ptr<internal::transport_debug_stats> stats = std::make_shared<internal::transport_debug_stats>();
+    bool transport_stats_logged = false;
+    std::vector<temporary_buffer<char>> tx_packet_pool;
+    std::deque<queued_datagram_packet> tx_datagram_queue;
+    std::optional<internal::blocked_send_state> blocked_send;
+    temporary_buffer<char> current_rx_packet;
     std::unordered_set<std::string> mapped_dcids;
 
     ~server_connection() {
+        log_transport_stats("destroyed");
         fail_blocked_open_streams(quic_error::closed, "server connection destroyed");
         abort_event_queues("server connection destroyed");
         if (runtime) {
@@ -334,12 +398,20 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return tx_payload_limit;
     }
 
+    internal::transport_debug_stats& debug_stats() noexcept override {
+        return *stats;
+    }
+
+    bool has_blocked_send() const noexcept {
+        return blocked_send.has_value();
+    }
+
     bool has_pending_actor_work() const noexcept {
         return stop_requested
                || !rx_queue.empty()
-               || (runtime && runtime->has_pending_commands())
                || engine->tick_pending()
-               || engine->has_blocked_open_stream_retry_work();
+               || engine->has_blocked_open_stream_retry_work()
+               || (!has_blocked_send() && runtime && runtime->has_pending_commands());
     }
 
     future<> wait_for_actor_wakeup() {
@@ -348,6 +420,20 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
 
     void wake_actor() {
         engine->wake_actor();
+    }
+
+    temporary_buffer<char> acquire_tx_packet_buffer() override {
+        const auto required = tx_payload_limit_bytes();
+        while (!tx_packet_pool.empty()) {
+            auto packet = std::move(tx_packet_pool.back());
+            tx_packet_pool.pop_back();
+            if (packet.size() >= required) {
+                ++stats->tx_packet_buffer_reuses;
+                return packet;
+            }
+        }
+        ++stats->tx_packet_buffer_allocations;
+        return temporary_buffer<char>(required);
     }
 
     int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override {
@@ -441,11 +527,13 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return ngtcp2_conn_handle_expiry(conn, now_local);
     }
 
-    temporary_buffer<char>& tx_packet_buffer() override {
-        return tx_packet_scratch;
+    future<> send_datagram_packet(temporary_buffer<char> packet, size_t packet_size) override;
+
+    bool has_queued_datagram_packets() const noexcept override {
+        return !tx_datagram_queue.empty();
     }
 
-    future<> send_datagram_packet(temporary_buffer<char> packet) override;
+    future<> flush_datagram_packets() override;
 
     bool can_send_connection_close() const noexcept override;
 
@@ -490,10 +578,45 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         request_stop();
     }
 
+    void recycle_tx_packet_buffer(temporary_buffer<char> packet) noexcept {
+        if (!packet || packet.size() < tx_payload_limit_bytes() || tx_packet_pool.size() >= max_tx_packet_pool_size) {
+            return;
+        }
+        ++stats->tx_packet_buffer_recycles;
+        tx_packet_pool.emplace_back(std::move(packet));
+    }
+
     void cancel_transport_timer() {
         if (engine) {
             engine->cancel_timer();
         }
+    }
+
+    void log_transport_stats(const char* reason) {
+        if (transport_stats_logged || !stats) {
+            return;
+        }
+        transport_stats_logged = true;
+        quic_server_log.info(
+          "server transport stats: reason={} peer={} tx_payload_limit={} tx_packets={} tx_bytes={} tx_copy_bytes={} tx_copy_events={} tx_blocked_events={} tx_zero_write_events={} tx_packet_buffer_allocations={} tx_packet_buffer_reuses={} tx_packet_buffer_recycles={} rx_packets={} rx_bytes={} rx_linearized_packets={} rx_linearized_bytes={} rx_fallback_copy_events={} rx_fallback_copy_bytes={}",
+          reason,
+          peer,
+          stats->negotiated_tx_payload_limit,
+          stats->tx_packets,
+          stats->tx_bytes,
+          stats->tx_copy_bytes,
+          stats->tx_copy_events,
+          stats->tx_blocked_events,
+          stats->tx_zero_write_events,
+          stats->tx_packet_buffer_allocations,
+          stats->tx_packet_buffer_reuses,
+          stats->tx_packet_buffer_recycles,
+          stats->rx_packets,
+          stats->rx_bytes,
+          stats->rx_linearized_packets,
+          stats->rx_linearized_bytes,
+          stats->rx_fallback_copy_events,
+          stats->rx_fallback_copy_bytes);
     }
 
     void abort_event_queues(const char* why) {
@@ -575,8 +698,22 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return !rx_queue.empty();
     }
     future<> actor_handle_next_rx_event() override;
+    bool actor_has_blocked_send() const noexcept override {
+        return has_blocked_send();
+    }
+    void actor_defer_blocked_send(internal::blocked_send_state state) override {
+        blocked_send = std::move(state);
+    }
+    future<> actor_handle_blocked_send() override {
+        if (!blocked_send) {
+            co_return;
+        }
+        auto state = std::move(*blocked_send);
+        blocked_send.reset();
+        co_await internal::send_stream_message(*this, *this, std::move(state));
+    }
     bool actor_has_transport_command() const noexcept override {
-        return runtime && runtime->has_pending_commands();
+        return !has_blocked_send() && runtime && runtime->has_pending_commands();
     }
     future<> actor_handle_next_transport_command() override {
         if (!runtime) {
@@ -936,10 +1073,7 @@ private:
         quic_server_log.trace("server recv_stream_data: peer={} sid={} bytes={}", conn->peer, sid, datalen);
         auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
         auto peer_initiated = !ngtcp2_conn_is_local_stream(ngconn, sid);
-        temporary_buffer<char> tb(datalen);
-        if (datalen) {
-            std::memcpy(tb.get_write(), data, datalen);
-        }
+        auto tb = copy_or_share_stream_payload(conn->current_rx_packet, data, datalen, *conn->stats);
         conn->engine->on_stream_data(sid, type, peer_initiated, std::move(tb), (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
         ngtcp2_conn_extend_max_stream_offset(ngconn, sid, datalen);
         ngtcp2_conn_extend_max_offset(ngconn, datalen);
@@ -1058,7 +1192,7 @@ private:
         auto conn = make_lw_shared<server_connection>();
         conn->server = this;
         conn->runtime = internal::make_session_runtime(_cfg.session_options);
-        conn->engine = internal::make_connection_engine(conn->runtime, _cfg.session_options);
+        conn->engine = internal::make_connection_engine(conn->runtime, _cfg.session_options, conn->stats);
         conn->runtime->set_command_notifier([raw = conn.get()] {
             raw->wake_actor();
         });
@@ -1111,7 +1245,16 @@ private:
 
         ngtcp2_settings settings{};
         ngtcp2_settings_default(&settings);
+        settings.cc_algo = to_ngtcp2_cc_algo(_cfg.session_options.transport.congestion_control);
         settings.initial_ts = now_ns();
+        settings.max_window = _cfg.session_options.transport.max_window;
+        settings.max_stream_window = _cfg.session_options.transport.max_stream_window;
+        settings.ack_thresh = _cfg.session_options.transport.ack_thresh;
+        settings.max_tx_udp_payload_size = normalize_udp_payload_size(
+          _cfg.session_options.transport.max_tx_udp_payload_size,
+          default_max_tx_udp_payload_size);
+        settings.no_tx_udp_payload_size_shaping =
+          _cfg.session_options.transport.disable_tx_udp_payload_size_shaping ? 1 : 0;
 
         ngtcp2_transport_params params{};
         ngtcp2_transport_params_default(&params);
@@ -1127,6 +1270,9 @@ private:
         params.initial_max_streams_bidi = _cfg.session_options.transport.initial_max_streams_bidi;
         params.initial_max_streams_uni = _cfg.session_options.transport.initial_max_streams_uni;
         params.max_idle_timeout = _cfg.session_options.transport.max_idle_timeout_ns;
+        params.max_udp_payload_size = normalize_udp_payload_size(
+          _cfg.session_options.transport.max_udp_payload_size,
+          max_udp_payload_size);
         params.disable_active_migration = 1;
 
         ngtcp2_path path{};
@@ -1151,20 +1297,22 @@ private:
 
         auto payload = ngtcp2_conn_get_path_max_tx_udp_payload_size(conn->conn);
         if (payload == 0) {
-            payload = default_udp_payload_size;
+            payload = ngtcp2_conn_get_max_tx_udp_payload_size(conn->conn);
         }
-        if (payload > max_udp_payload_size) {
-            payload = max_udp_payload_size;
-        }
+        payload = normalize_udp_payload_size(payload, default_udp_payload_size);
         conn->tx_payload_limit = payload;
+        conn->stats->negotiated_tx_payload_limit = conn->tx_payload_limit;
 
         map_dcid(conn, odcid.data, odcid.datalen);
         map_dcid(conn, scid.data, scid.datalen);
         _conns.push_back(conn);
         quic_server_log.info(
-          "server connection initialized: peer={} tx_payload_limit={} active_conns={} odcid_len={} scid_len={}",
+          "server connection initialized: peer={} tx_payload_limit={} max_tx_udp_payload_size={} max_udp_payload_size={} tx_payload_shaping_disabled={} active_conns={} odcid_len={} scid_len={}",
           conn->peer,
           conn->tx_payload_limit,
+          settings.max_tx_udp_payload_size,
+          params.max_udp_payload_size,
+          bool(settings.no_tx_udp_payload_size_shaping),
           _conns.size(),
           odcid.datalen,
           scid.datalen);
@@ -1186,15 +1334,20 @@ private:
 
     static future<> flush_pending_packets_actor(conn_ptr conn) {
         co_await internal::flush_pending_transport_packets(*conn);
+        if (conn->has_queued_datagram_packets()) {
+            co_await conn->flush_datagram_packets();
+        }
     }
 
     static future<> conn_actor_loop(conn_ptr conn) {
-        co_await internal::run_connection_actor(*conn);
+        co_await internal::run_connection_actor(*conn, *conn);
     }
 
     void handle_datagram(net::datagram d) {
         auto src = d.get_src();
-        auto pkt = linearize_packet(d.get_buffers());
+        auto bufs = d.get_buffers();
+        const bool was_linearized = bufs.size() > 1;
+        auto pkt = linearize_packet(bufs);
         const auto* data = reinterpret_cast<const uint8_t*>(pkt.get());
         const size_t len = pkt.size();
         quic_server_log.trace("server received datagram: src={} bytes={}", src, len);
@@ -1231,6 +1384,12 @@ private:
         }
 
         try {
+            if (was_linearized) {
+                ++conn->stats->rx_linearized_packets;
+                conn->stats->rx_linearized_bytes += len;
+            }
+            ++conn->stats->rx_packets;
+            conn->stats->rx_bytes += len;
             auto evt = std::make_unique<conn_rx_event>(conn_rx_event{src, std::move(pkt)});
             if (!conn->rx_queue.push(std::move(evt))) {
                 quic_server_log.warn("server rx queue full: peer={} queued={} max={}", conn->peer, conn->rx_queue.size(), conn->rx_queue.max_size());
@@ -1288,8 +1447,32 @@ bool server_connection::active() const noexcept {
     return !closing && runtime && runtime->is_open() && server;
 }
 
-future<> server_connection::send_datagram_packet(temporary_buffer<char> packet) {
-    return send_datagram(server->channel(), peer, std::move(packet));
+future<> server_connection::send_datagram_packet(temporary_buffer<char> packet, size_t packet_size) {
+    if (packet_size && !packet.empty()) {
+        tx_datagram_queue.emplace_back(queued_datagram_packet{
+          .storage = std::move(packet),
+          .size = packet_size,
+        });
+    } else {
+        recycle_tx_packet_buffer(std::move(packet));
+    }
+    return make_ready_future<>();
+}
+
+future<> server_connection::flush_datagram_packets() {
+    if (tx_datagram_queue.empty()) {
+        co_return;
+    }
+
+    while (!tx_datagram_queue.empty()) {
+        auto packet = std::move(tx_datagram_queue.front());
+        tx_datagram_queue.pop_front();
+        auto view = packet.storage.share(0, packet.size);
+        co_await server->channel().send(peer, std::span<temporary_buffer<char>>(&view, 1));
+        ++stats->tx_packets;
+        stats->tx_bytes += packet.size;
+        recycle_tx_packet_buffer(std::move(packet.storage));
+    }
 }
 
 bool server_connection::can_send_connection_close() const noexcept {
@@ -1301,7 +1484,14 @@ future<> server_connection::actor_handle_next_rx_event() {
     if (!evt) {
         co_return;
     }
-    co_await internal::recv_transport_datagram(*this, evt->src, std::move(evt->packet));
+    current_rx_packet = evt->packet.share();
+    try {
+        co_await internal::recv_transport_datagram(*this, evt->src, std::move(evt->packet));
+    } catch (...) {
+        current_rx_packet = {};
+        throw;
+    }
+    current_rx_packet = {};
 }
 
 future<> server_connection::actor_handle_stop_request() {
@@ -1311,6 +1501,7 @@ future<> server_connection::actor_handle_stop_request() {
     stop_requested = false;
 
     co_await internal::send_connection_close(*this);
+    log_transport_stats(stop_error_local ? "failed" : "stopped");
 
     closing = true;
     abort_event_queues(stop_error_local ? "server connection failed" : "server connection stopped");

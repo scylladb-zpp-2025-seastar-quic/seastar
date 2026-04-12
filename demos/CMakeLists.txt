@@ -102,6 +102,12 @@ seastar_add_demo (tls_simple_client
     tls_echo_server.hh
     tls_simple_client_demo.cc)
 
+seastar_add_demo (tls_bench_server
+  SOURCES tls_bench_server.cc)
+
+seastar_add_demo (tls_bench_client
+  SOURCES tls_bench_client.cc)
+
 seastar_add_demo (udp_client
   SOURCES udp_client_demo.cc)
 

@@ -10,6 +10,8 @@
 #   --connections   N                          (default: 1)
 #   --streams       N   streams per connection (default: 1)
 #   --message-size  N   bytes                  (default: 65536)
+#   --throughput-flush-messages N              (default: 0 = auto)
+#   --throughput-flush-bytes    N              (default: 0 = auto)
 #   --duration      N   seconds                (default: 10)
 #   --address       IPv6                       (default: ::1)
 #   --port          N                          (default: 4444)
@@ -30,6 +32,8 @@ STREAM_TYPE=bidi
 CONNECTIONS=1
 STREAMS=1
 MESSAGE_SIZE=65536
+THROUGHPUT_FLUSH_MESSAGES=0
+THROUGHPUT_FLUSH_BYTES=0
 DURATION=10
 ADDRESS="::1"
 PORT=4444
@@ -53,6 +57,8 @@ while [[ $# -gt 0 ]]; do
         --connections)    CONNECTIONS="$2";   shift 2 ;;
         --streams)        STREAMS="$2";       shift 2 ;;
         --message-size)   MESSAGE_SIZE="$2";  shift 2 ;;
+        --throughput-flush-messages) THROUGHPUT_FLUSH_MESSAGES="$2"; shift 2 ;;
+        --throughput-flush-bytes)    THROUGHPUT_FLUSH_BYTES="$2";    shift 2 ;;
         --duration)       DURATION="$2";      shift 2 ;;
         --address)        ADDRESS="$2";       shift 2 ;;
         --port)           PORT="$2";          shift 2 ;;
@@ -121,6 +127,7 @@ info "Starting server  [${ADDRESS}]:${PORT}  smp=${SMP}"
     --port "$PORT" \
     --crt "$CRT" \
     --key "$KEY" \
+    --throughput-flush-bytes "$THROUGHPUT_FLUSH_BYTES" \
     --stats-interval "$STATS_INTERVAL" \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -161,6 +168,7 @@ CLIENT_EXIT=0
     --connections "$CONNECTIONS" \
     --streams-per-conn "$STREAMS" \
     --message-size "$MESSAGE_SIZE" \
+    --throughput-flush-messages "$THROUGHPUT_FLUSH_MESSAGES" \
     --duration "$DURATION" \
     2>&1 | grep -v '^INFO\|^WARN\|^DEBUG\|^TRACE' \
     || CLIENT_EXIT=$?

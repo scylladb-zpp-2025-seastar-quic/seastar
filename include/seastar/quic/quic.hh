@@ -50,6 +50,12 @@ enum class stream_type : uint8_t {
     unidirectional,
 };
 
+enum class congestion_control_algorithm : uint8_t {
+    cubic,
+    reno,
+    bbr,
+};
+
 struct transport_config {
     uint64_t max_idle_timeout_ns = 60ULL * 1000 * 1000 * 1000;
     uint64_t initial_max_stream_data_bidi_local = 256 * 1024;
@@ -58,6 +64,13 @@ struct transport_config {
     uint64_t initial_max_data = 4 * 1024 * 1024;
     uint64_t initial_max_streams_bidi = 128;
     uint64_t initial_max_streams_uni = 128;
+    uint64_t max_window = 0;
+    uint64_t max_stream_window = 0;
+    size_t ack_thresh = 2;
+    congestion_control_algorithm congestion_control = congestion_control_algorithm::cubic;
+    size_t max_udp_payload_size = 65527;
+    size_t max_tx_udp_payload_size = 1452;
+    bool disable_tx_udp_payload_size_shaping = false;
 };
 
 struct connection_options {
@@ -174,6 +187,12 @@ struct transport_command {
     std::shared_ptr<promise<stream_id>> open_result;
 };
 
+struct blocked_send_state {
+    quic_message msg;
+    size_t offset = 0;
+    bool send_fin = false;
+};
+
 class session_runtime {
 public:
     virtual ~session_runtime() = default;
@@ -209,6 +228,25 @@ struct transport_open_stream_result {
     stream_id sid = invalid_stream_id;
 };
 
+struct transport_debug_stats {
+    uint64_t negotiated_tx_payload_limit = 0;
+    uint64_t tx_packets = 0;
+    uint64_t tx_bytes = 0;
+    uint64_t tx_copy_bytes = 0;
+    uint64_t tx_copy_events = 0;
+    uint64_t tx_blocked_events = 0;
+    uint64_t tx_zero_write_events = 0;
+    uint64_t tx_packet_buffer_allocations = 0;
+    uint64_t tx_packet_buffer_reuses = 0;
+    uint64_t tx_packet_buffer_recycles = 0;
+    uint64_t rx_packets = 0;
+    uint64_t rx_bytes = 0;
+    uint64_t rx_linearized_packets = 0;
+    uint64_t rx_linearized_bytes = 0;
+    uint64_t rx_fallback_copy_events = 0;
+    uint64_t rx_fallback_copy_bytes = 0;
+};
+
 class connection_transport {
 public:
     virtual ~connection_transport() = default;
@@ -217,7 +255,9 @@ public:
     virtual bool has_transport_connection() const noexcept = 0;
     virtual bool can_retry_blocked_open_streams() const noexcept = 0;
     virtual size_t tx_payload_limit_bytes() const noexcept = 0;
+    virtual transport_debug_stats& debug_stats() noexcept = 0;
 
+    virtual temporary_buffer<char> acquire_tx_packet_buffer() = 0;
     virtual int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
     virtual transport_stream_write_result write_stream_packet(
       stream_id sid,
@@ -233,9 +273,10 @@ public:
     virtual void sync_transport_path() = 0;
     virtual uint64_t transport_expiry_ns() const noexcept = 0;
     virtual int handle_transport_expiry(uint64_t now_ns) = 0;
-    virtual temporary_buffer<char>& tx_packet_buffer() = 0;
 
-    virtual future<> send_datagram_packet(temporary_buffer<char> packet) = 0;
+    virtual future<> send_datagram_packet(temporary_buffer<char> packet, size_t packet_size) = 0;
+    virtual bool has_queued_datagram_packets() const noexcept = 0;
+    virtual future<> flush_datagram_packets() = 0;
     virtual bool can_send_connection_close() const noexcept = 0;
     virtual int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
     virtual void on_stream_write_closed(stream_id sid) = 0;
@@ -266,6 +307,9 @@ public:
     virtual future<> actor_handle_stop_request() = 0;
     virtual bool actor_has_rx_event() const noexcept = 0;
     virtual future<> actor_handle_next_rx_event() = 0;
+    virtual bool actor_has_blocked_send() const noexcept = 0;
+    virtual void actor_defer_blocked_send(blocked_send_state state) = 0;
+    virtual future<> actor_handle_blocked_send() = 0;
     virtual bool actor_has_transport_command() const noexcept = 0;
     virtual future<> actor_handle_next_transport_command() = 0;
     virtual future<> actor_retry_blocked_open_streams() = 0;
@@ -276,7 +320,10 @@ public:
 
 class connection_engine {
 public:
-    explicit connection_engine(session_runtime_ptr runtime, connection_options options = {});
+    explicit connection_engine(
+      session_runtime_ptr runtime,
+      connection_options options = {},
+      std::shared_ptr<transport_debug_stats> debug_stats = {});
     ~connection_engine();
 
     connection_engine(const connection_engine&) = delete;
@@ -325,10 +372,13 @@ private:
     std::unique_ptr<impl> _impl;
 };
 
-connection_engine_ptr make_connection_engine(session_runtime_ptr runtime, connection_options options = {});
+connection_engine_ptr make_connection_engine(
+  session_runtime_ptr runtime,
+  connection_options options = {},
+  std::shared_ptr<transport_debug_stats> debug_stats = {});
 
 future<> flush_pending_transport_packets(connection_transport& transport);
-future<> send_stream_message(connection_transport& transport, quic_message msg);
+future<> send_stream_message(connection_transport& transport, connection_actor& actor, blocked_send_state state);
 future<bool> open_stream(connection_transport& transport, transport_command cmd);
 future<> reset_stream(connection_transport& transport, stream_id sid, application_error_code app_error_code);
 future<> stop_sending(connection_transport& transport, stream_id sid, application_error_code app_error_code);
@@ -337,7 +387,7 @@ future<> handle_transport_command(connection_transport& transport, connection_ac
 future<> recv_transport_datagram(connection_transport& transport, const socket_address& src, temporary_buffer<char> pkt);
 future<> handle_transport_timer(connection_transport& transport);
 future<> send_connection_close(connection_transport& transport);
-future<> run_connection_actor(connection_actor& actor);
+future<> run_connection_actor(connection_transport& transport, connection_actor& actor);
 
 session_runtime_ptr make_session_runtime(connection_options options = {});
 

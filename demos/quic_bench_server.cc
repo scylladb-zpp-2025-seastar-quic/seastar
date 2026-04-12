@@ -53,6 +53,16 @@ using namespace seastar;
 using namespace seastar::quic::experimental;
 namespace bpo = boost::program_options;
 
+static constexpr size_t throughput_buffer_size = 256 * 1024;
+static constexpr uint64_t throughput_stream_window = 8 * 1024 * 1024;
+static constexpr uint64_t throughput_connection_window = 64 * 1024 * 1024;
+static constexpr uint64_t throughput_max_stream_window = 16 * 1024 * 1024;
+static constexpr uint64_t throughput_stream_limit = 1024;
+static constexpr size_t throughput_ack_thresh = 8;
+static constexpr size_t throughput_udp_payload_size = 65527;
+static constexpr size_t throughput_tx_udp_payload_size = 4096;
+static size_t g_throughput_flush_bytes = throughput_buffer_size;
+
 static socket_address parse_ipv6_address(const std::string& ip, uint16_t port) {
     sockaddr_in6 sa{};
     sa.sin6_family = AF_INET6;
@@ -76,7 +86,9 @@ static server_stats g_stats;
 // Echo all data on a bidirectional stream.
 static future<> handle_bidi_stream(seastar::quic::experimental::stream s) {
     auto input = s.input();
-    auto output = s.output();
+    // Match the TLS/TCP benchmark buffering in throughput mode.
+    auto output = s.output(throughput_buffer_size);
+    size_t buffered_echo_bytes = 0;
     try {
         while (true) {
             auto buf = co_await input.read();
@@ -85,8 +97,15 @@ static future<> handle_bidi_stream(seastar::quic::experimental::stream s) {
             }
             g_stats.bytes_received += buf.size();
             co_await output.write(buf.get(), buf.size());
-            co_await output.flush();
+            buffered_echo_bytes += buf.size();
+            if (buffered_echo_bytes >= g_throughput_flush_bytes) {
+                co_await output.flush();
+                buffered_echo_bytes = 0;
+            }
             g_stats.bytes_echoed += buf.size();
+        }
+        if (buffered_echo_bytes > 0) {
+            co_await output.flush();
         }
     } catch (const quic_exception& e) {
         if (e.code() != quic_error::closed) {
@@ -213,6 +232,8 @@ int main(int argc, char** argv) {
          "PEM certificate file")
         ("key,k", bpo::value<std::string>()->default_value("server.key"),
          "PEM private-key file")
+        ("throughput-flush-bytes", bpo::value<size_t>()->default_value(0),
+         "Flush echoed throughput data every N bytes (0 = auto, one output buffer)")
         ("stats-interval", bpo::value<unsigned>()->default_value(1),
          "Throughput stats printing interval in seconds (0 to disable)");
 
@@ -230,7 +251,9 @@ int main(int argc, char** argv) {
             auto port          = cfg["port"].as<uint16_t>();
             auto crt           = cfg["crt"].as<std::string>();
             auto key           = cfg["key"].as<std::string>();
+            auto flush_bytes   = cfg["throughput-flush-bytes"].as<size_t>();
             auto stats_intv    = cfg["stats-interval"].as<unsigned>();
+            g_throughput_flush_bytes = flush_bytes > 0 ? flush_bytes : throughput_buffer_size;
 
             quic_server_config server_cfg;
             server_cfg.listen_address = parse_ipv6_address(address, port);
@@ -238,11 +261,20 @@ int main(int argc, char** argv) {
             server_cfg.key_file = key;
             // Increase transport limits for high-throughput benchmarking.
             server_cfg.session_options.max_pending_send_bytes    = 4 * 1024 * 1024;
-            server_cfg.session_options.max_pending_receive_bytes = 4 * 1024 * 1024;
-            server_cfg.session_options.transport.initial_max_stream_data_bidi_local  = 1 * 1024 * 1024;
-            server_cfg.session_options.transport.initial_max_stream_data_bidi_remote = 1 * 1024 * 1024;
-            server_cfg.session_options.transport.initial_max_data          = 4 * 1024 * 1024;
-            server_cfg.session_options.transport.initial_max_streams_bidi  = 1024;
+            server_cfg.session_options.max_pending_receive_bytes = 64 * 1024 * 1024;
+            server_cfg.session_options.transport.initial_max_stream_data_bidi_local  = throughput_stream_window;
+            server_cfg.session_options.transport.initial_max_stream_data_bidi_remote = throughput_stream_window;
+            server_cfg.session_options.transport.initial_max_stream_data_uni         = throughput_stream_window;
+            server_cfg.session_options.transport.initial_max_data          = throughput_connection_window;
+            server_cfg.session_options.transport.initial_max_streams_bidi  = throughput_stream_limit;
+            server_cfg.session_options.transport.initial_max_streams_uni   = throughput_stream_limit;
+            server_cfg.session_options.transport.max_window = throughput_connection_window;
+            server_cfg.session_options.transport.max_stream_window = throughput_max_stream_window;
+            server_cfg.session_options.transport.ack_thresh = throughput_ack_thresh;
+            server_cfg.session_options.transport.congestion_control = congestion_control_algorithm::bbr;
+            server_cfg.session_options.transport.max_udp_payload_size = throughput_udp_payload_size;
+            server_cfg.session_options.transport.max_tx_udp_payload_size = throughput_tx_udp_payload_size;
+            server_cfg.session_options.transport.disable_tx_udp_payload_size_shaping = true;
 
             co_await server.start(std::move(server_cfg));
             accept_task.emplace(accept_loop(server, sessions));
@@ -251,6 +283,7 @@ int main(int argc, char** argv) {
             }
 
             fmt::print("[server] QUIC bench server listening on [{}]:{}\n", address, port);
+            fmt::print("[server] throughput flush-bytes={}\n", g_throughput_flush_bytes);
             fmt::print("[server] Ctrl-C to stop.\n");
             std::cout.flush();
 
