@@ -340,7 +340,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
     sockaddr_storage peer_ss{};
     socklen_t peer_ss_len = 0;
 
-    queue<std::unique_ptr<conn_rx_event>> rx_queue{1024};
+    queue<conn_rx_event> rx_queue{1024};
     bool queues_aborted = false;
     bool unregistered = false;
     bool stop_requested = false;
@@ -449,7 +449,8 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size) override {
+      size_t outbuf_size,
+      bool more = false) override {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -459,7 +460,13 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
             vec.base = reinterpret_cast<uint8_t*>(const_cast<char*>(data));
             vec.len = len;
         }
-        auto flags = (!len && fin) ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
+        uint32_t flags = 0;
+        if (!len && fin) {
+            flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+        }
+        if (more) {
+            flags |= NGTCP2_WRITE_STREAM_FLAG_MORE;
+        }
         auto nwrite = ngtcp2_conn_writev_stream(
           conn,
           &path,
@@ -1250,6 +1257,9 @@ private:
         settings.max_window = _cfg.session_options.transport.max_window;
         settings.max_stream_window = _cfg.session_options.transport.max_stream_window;
         settings.ack_thresh = _cfg.session_options.transport.ack_thresh;
+        if (_cfg.session_options.transport.initial_rtt_ns > 0) {
+            settings.initial_rtt = _cfg.session_options.transport.initial_rtt_ns;
+        }
         settings.max_tx_udp_payload_size = normalize_udp_payload_size(
           _cfg.session_options.transport.max_tx_udp_payload_size,
           default_max_tx_udp_payload_size);
@@ -1390,8 +1400,7 @@ private:
             }
             ++conn->stats->rx_packets;
             conn->stats->rx_bytes += len;
-            auto evt = std::make_unique<conn_rx_event>(conn_rx_event{src, std::move(pkt)});
-            if (!conn->rx_queue.push(std::move(evt))) {
+            if (!conn->rx_queue.push(conn_rx_event{src, std::move(pkt)})) {
                 quic_server_log.warn("server rx queue full: peer={} queued={} max={}", conn->peer, conn->rx_queue.size(), conn->rx_queue.max_size());
                 conn->fail(quic_error::io, "server rx queue is full");
                 return;
@@ -1464,14 +1473,28 @@ future<> server_connection::flush_datagram_packets() {
         co_return;
     }
 
+    static constexpr size_t max_batch = 64;
+
     while (!tx_datagram_queue.empty()) {
-        auto packet = std::move(tx_datagram_queue.front());
-        tx_datagram_queue.pop_front();
-        auto view = packet.storage.share(0, packet.size);
-        co_await server->channel().send(peer, std::span<temporary_buffer<char>>(&view, 1));
-        ++stats->tx_packets;
-        stats->tx_bytes += packet.size;
-        recycle_tx_packet_buffer(std::move(packet.storage));
+        temporary_buffer<char> views[max_batch];
+        temporary_buffer<char> storages[max_batch];
+        size_t count = 0;
+
+        while (!tx_datagram_queue.empty() && count < max_batch) {
+            auto packet = std::move(tx_datagram_queue.front());
+            tx_datagram_queue.pop_front();
+            views[count] = packet.storage.share(0, packet.size);
+            ++stats->tx_packets;
+            stats->tx_bytes += packet.size;
+            storages[count] = std::move(packet.storage);
+            ++count;
+        }
+
+        co_await server->channel().send_datagrams(peer, std::span<temporary_buffer<char>>(views, count));
+
+        for (size_t i = 0; i < count; ++i) {
+            recycle_tx_packet_buffer(std::move(storages[i]));
+        }
     }
 }
 
@@ -1480,13 +1503,13 @@ bool server_connection::can_send_connection_close() const noexcept {
 }
 
 future<> server_connection::actor_handle_next_rx_event() {
-    auto evt = rx_queue.pop();
-    if (!evt) {
+    if (rx_queue.empty()) {
         co_return;
     }
-    current_rx_packet = evt->packet.share();
+    auto evt = rx_queue.pop();
+    current_rx_packet = evt.packet.share();
     try {
-        co_await internal::recv_transport_datagram(*this, evt->src, std::move(evt->packet));
+        co_await internal::recv_transport_datagram(*this, evt.src, std::move(evt.packet));
     } catch (...) {
         current_rx_packet = {};
         throw;

@@ -114,6 +114,7 @@ public:
     future<> connect(socket_address& sa);
     future<temporary_buffer<char>> recv_some(internal::buffer_allocator* ba);
     future<size_t> sendmsg(struct msghdr *msg);
+    future<int> sendmmsg(struct mmsghdr *msgvec, unsigned int vlen);
     future<size_t> recvmsg(struct msghdr *msg);
     future<size_t> sendto(socket_address addr, const void* buf, size_t len);
     future<> poll_rdhup();
@@ -193,6 +194,9 @@ public:
     }
     future<size_t> sendmsg(struct msghdr *msg) {
         return _s->sendmsg(msg);
+    }
+    future<int> sendmmsg(struct mmsghdr *msgvec, unsigned int vlen) {
+        return _s->sendmmsg(msgvec, vlen);
     }
     future<size_t> recvmsg(struct msghdr *msg) {
         return _s->recvmsg(msg);

@@ -67,6 +67,7 @@ struct transport_config {
     uint64_t max_window = 0;
     uint64_t max_stream_window = 0;
     size_t ack_thresh = 2;
+    uint64_t initial_rtt_ns = 0; // 0 = use ngtcp2 default (333ms)
     congestion_control_algorithm congestion_control = congestion_control_algorithm::cubic;
     size_t max_udp_payload_size = 65527;
     size_t max_tx_udp_payload_size = 1452;
@@ -265,7 +266,8 @@ public:
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size) = 0;
+      size_t outbuf_size,
+      bool more = false) = 0;
     virtual transport_open_stream_result try_open_stream(stream_type type) = 0;
     virtual int shutdown_stream_write(stream_id sid, application_error_code app_error_code) = 0;
     virtual int shutdown_stream_read(stream_id sid, application_error_code app_error_code) = 0;

@@ -503,6 +503,18 @@ future<size_t> pollable_fd_state::sendmsg(struct msghdr* msg) {
     });
 }
 
+future<int> pollable_fd_state::sendmmsg(struct mmsghdr* msgvec, unsigned int vlen) {
+    maybe_no_more_send();
+    return engine().writeable(*this).then([this, msgvec, vlen] () mutable -> future<int> {
+        auto r = fd.sendmmsg(msgvec, vlen, 0);
+        if (!r) {
+            return sendmmsg(msgvec, vlen);
+        }
+        speculate_epoll(EPOLLOUT);
+        return make_ready_future<int>(*r);
+    });
+}
+
 future<size_t> pollable_fd_state::sendto(socket_address addr, const void* buf, size_t len) {
     maybe_no_more_send();
     return engine().writeable(*this).then([this, buf, len, addr] () mutable {

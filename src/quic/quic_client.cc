@@ -264,7 +264,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
     gnutls_session_t tls = nullptr;
 
     gate task_gate;
-    queue<std::unique_ptr<rx_event>> rx_queue{1024};
+    queue<rx_event> rx_queue{1024};
     internal::connection_engine_ptr engine;
     bool queues_aborted = false;
     bool stop_requested = false;
@@ -379,7 +379,8 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size) override {
+      size_t outbuf_size,
+      bool more = false) override {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -389,7 +390,13 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
             vec.base = reinterpret_cast<uint8_t*>(const_cast<char*>(data));
             vec.len = len;
         }
-        auto flags = (!len && fin) ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
+        uint32_t flags = 0;
+        if (!len && fin) {
+            flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+        }
+        if (more) {
+            flags |= NGTCP2_WRITE_STREAM_FLAG_MORE;
+        }
         auto nwrite = ngtcp2_conn_writev_stream(
           conn,
           &path,
@@ -478,14 +485,28 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
             co_return;
         }
 
+        static constexpr size_t max_batch = 64;
+
         while (!tx_datagram_queue.empty()) {
-            auto packet = std::move(tx_datagram_queue.front());
-            tx_datagram_queue.pop_front();
-            auto view = packet.storage.share(0, packet.size);
-            co_await channel.send(remote_address, std::span<temporary_buffer<char>>(&view, 1));
-            ++stats->tx_packets;
-            stats->tx_bytes += packet.size;
-            recycle_tx_packet_buffer(std::move(packet.storage));
+            temporary_buffer<char> views[max_batch];
+            temporary_buffer<char> storages[max_batch];
+            size_t count = 0;
+
+            while (!tx_datagram_queue.empty() && count < max_batch) {
+                auto packet = std::move(tx_datagram_queue.front());
+                tx_datagram_queue.pop_front();
+                views[count] = packet.storage.share(0, packet.size);
+                ++stats->tx_packets;
+                stats->tx_bytes += packet.size;
+                storages[count] = std::move(packet.storage);
+                ++count;
+            }
+
+            co_await channel.send_datagrams(remote_address, std::span<temporary_buffer<char>>(views, count));
+
+            for (size_t i = 0; i < count; ++i) {
+                recycle_tx_packet_buffer(std::move(storages[i]));
+            }
         }
     }
 
@@ -738,13 +759,13 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
     }
 
     future<> actor_handle_next_rx_event() override {
-        auto evt = rx_queue.pop();
-        if (!evt) {
+        if (rx_queue.empty()) {
             co_return;
         }
-        current_rx_packet = evt->packet.share();
+        auto evt = rx_queue.pop();
+        current_rx_packet = evt.packet.share();
         try {
-            co_await internal::recv_transport_datagram(*this, evt->src, std::move(evt->packet));
+            co_await internal::recv_transport_datagram(*this, evt.src, std::move(evt.packet));
         } catch (...) {
             current_rx_packet = {};
             throw;
@@ -1181,6 +1202,9 @@ void init_client_connection(client_state& st) {
     settings.max_window = st.cfg.session_options.transport.max_window;
     settings.max_stream_window = st.cfg.session_options.transport.max_stream_window;
     settings.ack_thresh = st.cfg.session_options.transport.ack_thresh;
+    if (st.cfg.session_options.transport.initial_rtt_ns > 0) {
+        settings.initial_rtt = st.cfg.session_options.transport.initial_rtt_ns;
+    }
     settings.max_tx_udp_payload_size = normalize_udp_payload_size(
       st.cfg.session_options.transport.max_tx_udp_payload_size,
       default_max_tx_udp_payload_size);
@@ -1273,8 +1297,7 @@ future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
         quic_client_log.trace("client recv_loop datagram: src={} bytes={}", src, pkt.size());
 
         try {
-            auto evt = std::make_unique<rx_event>(rx_event{src, std::move(pkt)});
-            co_await st->rx_queue.push_eventually(std::move(evt));
+            co_await st->rx_queue.push_eventually(rx_event{src, std::move(pkt)});
             st->wake_actor();
         } catch (...) {
             if (st->stopping || !st->runtime || !st->runtime->is_open()) {

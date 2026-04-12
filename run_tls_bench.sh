@@ -40,7 +40,7 @@ STATS_INTERVAL=2
 NO_COLOR=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build/release"
+BUILD_DIR="${SCRIPT_DIR}/build/dev"
 CRT="${SCRIPT_DIR}/server.crt"
 KEY="${SCRIPT_DIR}/server.key"
 CA="${SCRIPT_DIR}/server.crt"

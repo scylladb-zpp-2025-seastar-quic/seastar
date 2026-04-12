@@ -43,7 +43,7 @@ NO_COLOR=0
 
 # Try to find the build dir relative to this script's location.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build/release"
+BUILD_DIR="${SCRIPT_DIR}/build/dev"
 CRT="${SCRIPT_DIR}/server.crt"
 KEY="${SCRIPT_DIR}/server.key"
 

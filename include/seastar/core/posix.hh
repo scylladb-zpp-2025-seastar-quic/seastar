@@ -276,6 +276,14 @@ public:
         throw_system_error_on(r == -1, "sendmsg");
         return { size_t(r) };
     }
+    std::optional<int> sendmmsg(struct mmsghdr* msgvec, unsigned int vlen, int flags) {
+        auto r = ::sendmmsg(_fd, msgvec, vlen, flags);
+        if (r == -1 && errno == EAGAIN) {
+            return {};
+        }
+        throw_system_error_on(r == -1, "sendmmsg");
+        return { r };
+    }
     void bind(sockaddr& sa, socklen_t sl) {
         auto r = ::bind(_fd, &sa, sl);
         throw_system_error_on(r == -1, "bind");

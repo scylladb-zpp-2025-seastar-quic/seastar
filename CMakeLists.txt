@@ -638,6 +638,7 @@ add_library (seastar
   include/seastar/rpc/lz4_compressor.hh
   include/seastar/rpc/lz4_fragmented_compressor.hh
   include/seastar/rpc/multi_algo_compressor_factory.hh
+  include/seastar/rpc/rpc_quic_adapters.hh
   include/seastar/rpc/rpc.hh
   include/seastar/rpc/rpc_impl.hh
   include/seastar/rpc/rpc_types.hh
@@ -753,6 +754,7 @@ add_library (seastar
   src/rpc/lz4_compressor.cc
   src/rpc/lz4_fragmented_compressor.cc
   src/rpc/rpc.cc
+  src/rpc/rpc_quic_adapters.cc
   src/util/alloc_failure_injector.cc
   src/util/backtrace.cc
   src/util/conversions.cc

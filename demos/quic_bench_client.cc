@@ -76,6 +76,7 @@ static constexpr uint64_t throughput_stream_limit = 1024;
 static constexpr size_t throughput_ack_thresh = 8;
 static constexpr size_t throughput_udp_payload_size = 65527;
 static constexpr size_t throughput_tx_udp_payload_size = 4096;
+static constexpr uint64_t throughput_initial_rtt_ns = 0; // 0 = ngtcp2 default (333ms)
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -489,6 +490,7 @@ int main(int argc, char** argv) {
             base_cfg.session_options.transport.max_window = throughput_connection_window;
             base_cfg.session_options.transport.max_stream_window = throughput_max_stream_window;
             base_cfg.session_options.transport.ack_thresh = throughput_ack_thresh;
+            base_cfg.session_options.transport.initial_rtt_ns = throughput_initial_rtt_ns;
             base_cfg.session_options.transport.congestion_control = congestion_control_algorithm::bbr;
             base_cfg.session_options.transport.max_udp_payload_size = throughput_udp_payload_size;
             base_cfg.session_options.transport.max_tx_udp_payload_size = throughput_tx_udp_payload_size;

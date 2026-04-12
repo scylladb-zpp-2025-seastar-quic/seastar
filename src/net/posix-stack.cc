@@ -1073,6 +1073,7 @@ public:
     virtual future<datagram> receive() override;
     virtual future<> send(const socket_address& dst, const char *msg) override;
     virtual future<> send(const socket_address& dst, std::span<temporary_buffer<char>> bufs) override;
+    virtual future<> send_datagrams(const socket_address& dst, std::span<temporary_buffer<char>> datagrams) override;
     virtual void shutdown_input() override {
         _fd.shutdown(SHUT_RD, pollable_fd::shutdown_kernel_only::no);
     }
@@ -1106,6 +1107,46 @@ future<> posix_datagram_channel::send(const socket_address& dst, std::span<tempo
     bytes_sent[sg_id] += len;
     return _fd.sendmsg(&_send._hdr)
             .then([len, del = std::move(del) ] (size_t size) { SEASTAR_ASSERT(size == len); });
+}
+
+future<> posix_datagram_channel::send_datagrams(const socket_address& dst, std::span<temporary_buffer<char>> datagrams) {
+    if (datagrams.empty()) {
+        co_return;
+    }
+    if (datagrams.size() == 1) {
+        co_await send(dst, datagrams);
+        co_return;
+    }
+
+    socket_address resolved_dst = dst;
+    resolve_outgoing_address(resolved_dst);
+    auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+
+    size_t sent = 0;
+    while (sent < datagrams.size()) {
+        static constexpr size_t max_batch = 64;
+        size_t batch_size = std::min(datagrams.size() - sent, max_batch);
+
+        struct iovec iovs[max_batch];
+        struct mmsghdr msgs[max_batch];
+        size_t total_bytes = 0;
+
+        for (size_t i = 0; i < batch_size; ++i) {
+            auto& buf = datagrams[sent + i];
+            iovs[i].iov_base = const_cast<char*>(buf.get());
+            iovs[i].iov_len = buf.size();
+            std::memset(&msgs[i], 0, sizeof(struct mmsghdr));
+            msgs[i].msg_hdr.msg_name = &resolved_dst.u.sa;
+            msgs[i].msg_hdr.msg_namelen = resolved_dst.addr_length;
+            msgs[i].msg_hdr.msg_iov = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            total_bytes += buf.size();
+        }
+
+        int n = co_await _fd.sendmmsg(msgs, static_cast<unsigned int>(batch_size));
+        bytes_sent[sg_id] += total_bytes;
+        sent += static_cast<size_t>(n);
+    }
 }
 
 udp_channel

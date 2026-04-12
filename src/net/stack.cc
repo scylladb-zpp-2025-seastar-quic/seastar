@@ -85,6 +85,16 @@ future<> net::datagram_channel::send(const socket_address& dst, std::span<tempor
     return _impl->send(dst, bufs);
 }
 
+future<> net::datagram_channel::send_datagrams(const socket_address& dst, std::span<temporary_buffer<char>> datagrams) {
+    return _impl->send_datagrams(dst, datagrams);
+}
+
+future<> net::datagram_channel_impl::send_datagrams(const socket_address& dst, std::span<temporary_buffer<char>> datagrams) {
+    for (auto& buf : datagrams) {
+        co_await send(dst, std::span<temporary_buffer<char>>(&buf, 1));
+    }
+}
+
 bool net::datagram_channel::is_closed() const {
     return _impl->is_closed();
 }

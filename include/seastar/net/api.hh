@@ -151,6 +151,8 @@ public:
      * \return A future that completes when the send operation is finished.
      */
     future<> send(const socket_address& dst, std::span<temporary_buffer<char>> bufs);
+    /// Send multiple datagrams to the same destination in a single batch.
+    future<> send_datagrams(const socket_address& dst, std::span<temporary_buffer<char>> datagrams);
     bool is_closed() const;
     /// Causes a pending receive() to complete (possibly with an exception)
     void shutdown_input();

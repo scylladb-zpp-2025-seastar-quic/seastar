@@ -61,6 +61,7 @@ static constexpr uint64_t throughput_stream_limit = 1024;
 static constexpr size_t throughput_ack_thresh = 8;
 static constexpr size_t throughput_udp_payload_size = 65527;
 static constexpr size_t throughput_tx_udp_payload_size = 4096;
+static constexpr uint64_t throughput_initial_rtt_ns = 0; // 0 = ngtcp2 default (333ms)
 static size_t g_throughput_flush_bytes = throughput_buffer_size;
 
 static socket_address parse_ipv6_address(const std::string& ip, uint16_t port) {
@@ -271,6 +272,7 @@ int main(int argc, char** argv) {
             server_cfg.session_options.transport.max_window = throughput_connection_window;
             server_cfg.session_options.transport.max_stream_window = throughput_max_stream_window;
             server_cfg.session_options.transport.ack_thresh = throughput_ack_thresh;
+            server_cfg.session_options.transport.initial_rtt_ns = throughput_initial_rtt_ns;
             server_cfg.session_options.transport.congestion_control = congestion_control_algorithm::bbr;
             server_cfg.session_options.transport.max_udp_payload_size = throughput_udp_payload_size;
             server_cfg.session_options.transport.max_tx_udp_payload_size = throughput_tx_udp_payload_size;

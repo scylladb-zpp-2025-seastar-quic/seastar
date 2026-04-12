@@ -81,6 +81,10 @@ public:
     // The ownership of temporary_buffer-s referenced by span must be transferred
     // synchronously before returning the future
     virtual future<> send(const socket_address& dst, std::span<temporary_buffer<char>> bufs) = 0;
+    /// Send multiple datagrams to the same destination in a single batch.
+    /// Each temporary_buffer in the span represents one complete datagram.
+    /// Default implementation sends each datagram individually.
+    virtual future<> send_datagrams(const socket_address& dst, std::span<temporary_buffer<char>> datagrams);
     virtual void shutdown_input() = 0;
     virtual void shutdown_output() = 0;
     virtual bool is_closed() const = 0;
