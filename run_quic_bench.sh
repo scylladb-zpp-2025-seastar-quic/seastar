@@ -15,7 +15,7 @@
 #   --duration      N   seconds                (default: 10)
 #   --address       IPv6                       (default: ::1)
 #   --port          N                          (default: 4444)
-#   --build-dir     path to build/release      (default: auto-detect)
+#   --build-dir     path to build/dev          (default: build/dev)
 #   --crt           PEM cert (server TLS)
 #   --key           PEM key  (server TLS)
 #   --smp           CPU cores for each process (default: 1)

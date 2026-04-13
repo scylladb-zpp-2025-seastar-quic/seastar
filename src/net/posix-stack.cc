@@ -34,6 +34,7 @@ module;
 #include <linux/if.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <linux/udp.h>
 #include <arpa/inet.h>
 #include <net/route.h>
 #include <netinet/tcp.h>
@@ -966,6 +967,7 @@ struct cmsg_with_pktinfo {
 class posix_datagram_channel : public datagram_channel_impl {
 private:
     static constexpr int MAX_DATAGRAM_SIZE = 65507;
+    static constexpr size_t MAX_SEND_BATCH = 64;
     struct recv_ctx {
         struct msghdr _hdr;
         struct iovec _iov;
@@ -1046,6 +1048,8 @@ private:
     recv_ctx _recv;
     send_ctx _send;
     bool _closed;
+    bool _udp_segment_supported = true;
+    bool _udp_segment_fallback_logged = false;
 public:
     /// Creates a channel that is not bound to any socket address. The channel
     /// can be used to communicate with adressess that belong to the \param
@@ -1089,6 +1093,9 @@ public:
         SEASTAR_ASSERT(_address.u.sas.ss_family != AF_INET6 || (_address.addr_length > 20));
         return _address;
     }
+
+private:
+    future<bool> try_send_udp_segment(const socket_address& dst, std::span<temporary_buffer<char>> datagrams, size_t& sent);
 };
 
 future<> posix_datagram_channel::send(const socket_address& dst, const char *message) {
@@ -1124,11 +1131,14 @@ future<> posix_datagram_channel::send_datagrams(const socket_address& dst, std::
 
     size_t sent = 0;
     while (sent < datagrams.size()) {
-        static constexpr size_t max_batch = 64;
-        size_t batch_size = std::min(datagrams.size() - sent, max_batch);
+        if (co_await try_send_udp_segment(resolved_dst, datagrams.subspan(sent), sent)) {
+            continue;
+        }
 
-        struct iovec iovs[max_batch];
-        struct mmsghdr msgs[max_batch];
+        size_t batch_size = std::min(datagrams.size() - sent, MAX_SEND_BATCH);
+
+        struct iovec iovs[MAX_SEND_BATCH];
+        struct mmsghdr msgs[MAX_SEND_BATCH];
         size_t total_bytes = 0;
 
         for (size_t i = 0; i < batch_size; ++i) {
@@ -1147,6 +1157,90 @@ future<> posix_datagram_channel::send_datagrams(const socket_address& dst, std::
         bytes_sent[sg_id] += total_bytes;
         sent += static_cast<size_t>(n);
     }
+}
+
+future<bool> posix_datagram_channel::try_send_udp_segment(
+  const socket_address& dst,
+  std::span<temporary_buffer<char>> datagrams,
+  size_t& sent) {
+#ifndef UDP_SEGMENT
+    co_return false;
+#else
+    if (!_udp_segment_supported || datagrams.size() < 2) {
+        co_return false;
+    }
+
+    const auto segment_size = datagrams.front().size();
+    if (!segment_size || segment_size > std::numeric_limits<uint16_t>::max()) {
+        co_return false;
+    }
+
+    size_t batch_size = 1;
+    while (batch_size < datagrams.size()
+           && batch_size < MAX_SEND_BATCH
+           && datagrams[batch_size].size() == segment_size) {
+        ++batch_size;
+    }
+
+    if (batch_size == 1) {
+        co_return false;
+    }
+
+    if (batch_size < datagrams.size()
+        && batch_size < MAX_SEND_BATCH
+        && datagrams[batch_size].size() < segment_size) {
+        ++batch_size;
+    }
+
+    struct iovec iovs[MAX_SEND_BATCH];
+    struct msghdr hdr;
+    alignas(struct cmsghdr) char cmsg_storage[CMSG_SPACE(sizeof(uint16_t))];
+    std::memset(&hdr, 0, sizeof(hdr));
+    std::memset(cmsg_storage, 0, sizeof(cmsg_storage));
+
+    size_t total_bytes = 0;
+    for (size_t i = 0; i < batch_size; ++i) {
+        auto& buf = datagrams[i];
+        iovs[i].iov_base = const_cast<char*>(buf.get());
+        iovs[i].iov_len = buf.size();
+        total_bytes += buf.size();
+    }
+
+    hdr.msg_name = const_cast<sockaddr*>(&dst.u.sa);
+    hdr.msg_namelen = dst.addr_length;
+    hdr.msg_iov = iovs;
+    hdr.msg_iovlen = batch_size;
+    hdr.msg_control = cmsg_storage;
+    hdr.msg_controllen = sizeof(cmsg_storage);
+
+    auto* cmsg = CMSG_FIRSTHDR(&hdr);
+    SEASTAR_ASSERT(cmsg);
+    cmsg->cmsg_level = IPPROTO_UDP;
+    cmsg->cmsg_type = UDP_SEGMENT;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    *reinterpret_cast<uint16_t*>(CMSG_DATA(cmsg)) = static_cast<uint16_t>(segment_size);
+
+    try {
+        auto written = co_await _fd.sendmsg(&hdr);
+        SEASTAR_ASSERT(written == total_bytes);
+        auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+        bytes_sent[sg_id] += total_bytes;
+        sent += batch_size;
+        co_return true;
+    } catch (const std::system_error& e) {
+        _udp_segment_supported = false;
+        if (!_udp_segment_fallback_logged) {
+            _udp_segment_fallback_logged = true;
+            seastar_logger.debug(
+              "UDP_SEGMENT disabled for datagram channel after send failure: {} (segments={}, segment_size={}, total_bytes={})",
+              e.code().message(),
+              batch_size,
+              segment_size,
+              total_bytes);
+        }
+        co_return false;
+    }
+#endif
 }
 
 udp_channel
