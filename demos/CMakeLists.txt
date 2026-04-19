@@ -132,6 +132,9 @@ seastar_add_demo (quic_server
 seastar_add_demo (quic_client
   SOURCES quic_client_demo.cc)
 
+seastar_add_demo (rpc_quic_v1
+  SOURCES rpc_demo_quic_v1.cc)
+
 if (Seastar_MODULE)
   add_executable (hello_cxx_module)
   target_sources (hello_cxx_module
