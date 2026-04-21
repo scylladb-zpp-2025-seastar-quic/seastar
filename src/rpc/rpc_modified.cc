@@ -21,6 +21,46 @@ namespace seastar {
 
 namespace rpc {
 
+namespace {
+
+bool quic_enabled(const client_options& options) {
+    return options.quic && options.quic->enable;
+}
+
+bool quic_enabled(const server_options& options) {
+    return options.quic && options.quic->enable;
+}
+
+quic::experimental::quic_client_config make_quic_client_config(
+        const client_options& options,
+        const socket_address& remote,
+        const socket_address& local) {
+    quic::experimental::quic_client_config cfg;
+    cfg.remote_address = remote;
+    if (local != socket_address{}) {
+        cfg.local_address = local;
+    }
+    cfg.server_name = options.quic->server_name;
+    cfg.ca_file = options.quic->ca_file;
+    cfg.alpns = options.quic->alpns;
+    cfg.session_options = options.quic->session_options;
+    return cfg;
+}
+
+quic::experimental::quic_server_config make_quic_server_config(
+        const server_options& options,
+        const socket_address& listen_addr) {
+    quic::experimental::quic_server_config cfg;
+    cfg.listen_address = listen_addr;
+    cfg.crt_file = options.quic->crt_file;
+    cfg.key_file = options.quic->key_file;
+    cfg.alpns = options.quic->alpns;
+    cfg.session_options = options.quic->session_options;
+    return cfg;
+}
+
+} // anonymous namespace
+
 void logger::operator()(const client_info& info, id_type msg_id, const sstring& str) const {
     log(fmt::format("client {} msg_id {}:  {}", info.addr, msg_id, str));
 }
@@ -47,6 +87,8 @@ void logger::operator()(const socket_address& addr, log_level level, std::string
 
 no_wait_type no_wait;
 
+// dane wrzucamy do wektora bufs, dzieląc je przy okazji na fragmenty o wielkości chunk_size. BRAK ZMIAN.
+
 snd_buf::snd_buf(size_t size_) : size(size_) {
     if (size <= chunk_size) {
         bufs = temporary_buffer<char>(size);
@@ -64,6 +106,7 @@ snd_buf::snd_buf(size_t size_) : size(size_) {
 snd_buf::snd_buf(snd_buf&&) noexcept = default;
 snd_buf& snd_buf::operator=(snd_buf&&) noexcept = default;
 
+// Zwraca pierwszy blok danych. BRAK ZMIAN.
 temporary_buffer<char>& snd_buf::front() {
     auto* one = std::get_if<temporary_buffer<char>>(&bufs);
     if (one) {
@@ -76,7 +119,7 @@ temporary_buffer<char>& snd_buf::front() {
 namespace internal {
 
 // Make a copy of a remote buffer. No data is actually copied, only pointers and
-// a deleter of a new buffer takes care of deleting the original buffer
+// a deleter of a new buffer takes care of deleting the original buffer. BRAK ZMIAN.
 snd_buf make_shard_local_buffer_copy(snd_buf* org, std::function<deleter(snd_buf*)> make_deleter) {
     snd_buf buf(org->size);
     auto* one = std::get_if<temporary_buffer<char>>(&org->bufs);
@@ -98,7 +141,7 @@ snd_buf make_shard_local_buffer_copy(snd_buf* org, std::function<deleter(snd_buf
 }
 
 // Make a copy of a remote buffer. No data is actually copied, only pointers and
-// a deleter of a new buffer takes care of deleting the original buffer
+// a deleter of a new buffer takes care of deleting the original buffer. BRAK ZMIAN
 rcv_buf make_shard_local_buffer_copy(foreign_ptr<std::unique_ptr<rcv_buf>> org) {
     if (org.get_owner_shard() == this_shard_id()) {
         return std::move(*org);
@@ -124,6 +167,7 @@ rcv_buf make_shard_local_buffer_copy(foreign_ptr<std::unique_ptr<rcv_buf>> org) 
 
 } // namespace internal
 
+// Coś dziwnego z logami -> BRAK ZMIAN.
 static void log_exception(connection& c, log_level level, const char* log, std::exception_ptr eptr) {
     const char* s;
     try {
@@ -137,6 +181,7 @@ static void log_exception(connection& c, log_level level, const char* log, std::
     c.get_logger()(c.peer_address(), level, std::string_view(formatted.data(), formatted.size()));
 }
 
+// Kompresuje bufor. Rozumiem że ta 4 to jest Header size. BRAK ZMIAN. Dodatkowo zamienia na little-endian?
 snd_buf connection::compress(snd_buf buf) {
     if (_compressor) {
         buf = _compressor->compress(4, std::move(buf));
@@ -147,6 +192,7 @@ snd_buf connection::compress(snd_buf buf) {
     return buf;
 }
 
+// Funkcja dane z bufora do socketa przesyła. Najniższy poziom, operujemy na samych wektorach danych. BRAK ZMIAN.
 future<> connection::send_buffer(snd_buf buf) {
     auto* b = std::get_if<temporary_buffer<char>>(&buf.bufs);
     if (b) {
@@ -161,6 +207,9 @@ future<> connection::send_buffer(snd_buf buf) {
     }
 }
 
+// Wyżej poziomowa funkcja wysyłająca/przetwarzająca obiekt outgoing_entry.
+// Jeżeli timeouty są wynegocjowane to aktualizujemy czasy zanim wyślemy dane.
+// Dane zamin wyślemy funkcje send_buffer, compressujemy. Zwrcamy futura, który jest czekaniem na sflushowanie.
 future<> connection::send_entry(outgoing_entry& d) noexcept {
     return futurize_invoke([this, &d] {
         if (d.buf.size && _propagate_timeout) {
@@ -172,7 +221,7 @@ future<> connection::send_entry(outgoing_entry& d) noexcept {
                     left = std::chrono::duration_cast<std::chrono::milliseconds>(expire - timer<rpc_clock_type>::clock::now()).count();
                 }
                 write_le<uint64_t>(d.buf.front().get_write(), left);
-            } else {
+            } else {    // Serwer nie obsługuję timeotów, więc usuwamy pierwsze 8 bajtów z wiadomości, które zawierają ten czas.
                 d.buf.front().trim_front(sizeof(uint64_t));
                 d.buf.size -= sizeof(uint64_t);
             }
@@ -190,6 +239,7 @@ void connection::set_negotiated() noexcept {
     _negotiated = std::nullopt;
 }
 
+// Zamykanie socketa i Mechanizm wywalania pakietów z kolejki. BRAK ZMIAN
 future<> connection::stop_send_loop(std::exception_ptr ex) {
     _error = true;
     if (_connected) {
@@ -227,6 +277,7 @@ future<> connection::stop_send_loop(std::exception_ptr ex) {
     });
 }
 
+// Ustawianie numeru socketa. BRAK_ZMIAN
 void connection::set_socket(connected_socket&& fd) {
     if (_connected.has_value()) {
         throw std::runtime_error("already connected");
@@ -234,6 +285,9 @@ void connection::set_socket(connected_socket&& fd) {
     _connected.emplace(std::move(fd));
 }
 
+// Niskopoziomowa funkcja wysyłająca negotation frame do serwera.
+// Sprawdzamy jakie "feature RPC" ma mieć połączenie i tworzymy odpowiedni pakiet, który wyślemy.
+// Funckja bezpośrednio wysyła ten pakiet i go flushuje.
 future<> connection::send_negotiation_frame(feature_map features) {
     auto negotiation_frame_feature_record_size = [] (const feature_map::value_type& e) {
         return 8 + e.second.size();
@@ -258,6 +312,7 @@ future<> connection::send_negotiation_frame(feature_map features) {
     });
 }
 
+// Jakiś sposób na wyrzucanie pakietu z kolejki. BRAK ZMIAN wtw kiedy nie dodytamy outgoing entry.
 void connection::withdraw(outgoing_entry::container_t::iterator it, std::exception_ptr ex) {
     SEASTAR_ASSERT(it != _outgoing_queue.end());
 
@@ -284,12 +339,19 @@ void connection::withdraw(outgoing_entry::container_t::iterator it, std::excepti
     }
 }
 
+// Obsługuje mechanizm wrzucania/dodawania obiektów outgoing_entry do kolejki oraz ustawiania przy tworzeniu odpowiednich wartości.
+// std::exchange(_outgoing_queue_ready, d.done.get_future()) <- zamienia _outgoing_ na nowego future dodawanego pakietu.
+// W skrócie najwyższy stopień operowania na pakietach.
+// Wstawianie do kolejki i ustawianie kolejności wykonywania. 
 future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) {
     if (!_error) {
+        // Jeżeli timeout istnieje (sprawdzenie optional) oraz już minął to wysyłamy pusty zakończony future.
+        // Samentyka typu, jak przegapiliśmy to zakończ bez akcji.
         if (timeout && *timeout <= rpc_clock_type::now()) {
             return make_ready_future<>();
         }
 
+        // Tworzymy obiekt outgoing_entry i dodajemy go do kolejki.
         auto p = std::make_unique<outgoing_entry>(std::move(buf));
         auto& d = *p;
         _outgoing_queue.push_back(d);
@@ -302,6 +364,7 @@ future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point>
             }
         };
 
+        // Ustawiamy timeout jeżeli istnieją dla obiektu outgoing_entry oraz obiekt cancellable.
         if (timeout) {
             auto& t = d.t;
             t.set_callback(deleter);
@@ -317,14 +380,20 @@ future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point>
         // resolves. Next entry will need to do the same after this entry's done resolves.
         // Thus -- replace _outgoing_queue_ready with d's future and chain its continuation
         // on ..._ready's old value.
+        // .then() <- co się ma dziać gdy będzie czas na wykonanie d.
         return std::exchange(_outgoing_queue_ready, d.done.get_future()).then([this, p = std::move(p)] () mutable {
             _outgoing_queue_size--;
+            // Sprawdzenie, czy wpis nie został wcześniej wycofany.
             if (__builtin_expect(!p->is_linked(), false)) {
                 // If withdrawn the entry is unlinked and this lambda is fired right at once
                 return make_ready_future<>();
             }
-
+            
+            //  Od tego momentu wpis wszedł w etap, w którym nie można go już bezpiecznie anulować.
             p->uncancellable();
+
+            // Wysyłamy pakiet korzystając z send_entry. Po wysłaniu sprawdzamy czy zakończyła się sukcesem czy błedem.
+            // Tutaj set_value() oznacza: "ten wpis się zakończył".
             return send_entry(*p).then_wrapped([this, p = std::move(p)] (auto f) mutable {
                 if (f.failed()) {
                     f.ignore_ready_future();
@@ -338,6 +407,7 @@ future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point>
     }
 }
 
+// Dosłownie zamyka socketa.
 void connection::abort() {
     if (!_error) {
         _error = true;
@@ -345,6 +415,7 @@ void connection::abort() {
     }
 }
 
+// Wywołuje abort() ale handluje odpowiednie errory. Kończy połączenie.
 future<> connection::stop() noexcept {
     try {
         abort();
@@ -354,6 +425,7 @@ future<> connection::stop() noexcept {
     return _stopped.get_future();
 }
 
+// Sprawdza czy frame jest odpowiedniej wielkości.
 template<typename Connection>
 static bool verify_frame(Connection& c, temporary_buffer<char>& buf, size_t expected, const char* log) {
     if (buf.size() != expected) {
@@ -445,6 +517,7 @@ read_rcv_buf(input_stream<char>& in, uint32_t size) {
     });
 }
 
+// Czytanie ramki ze strumienia i zwracanie future z buforem lub pustego. Raczej nie będę tego zmieniać.
 template<typename FrameType>
 future<typename FrameType::return_type>
 connection::read_frame(socket_address info, input_stream<char>& in) {
@@ -535,11 +608,14 @@ struct stream_frame {
     }
 };
 
+// Parametryzujemy read_frame_compressed typem stream_frame i zwracamy.
 future<std::optional<rcv_buf>>
 connection::read_stream_frame_compressed(input_stream<char>& in) {
     return read_frame_compressed<stream_frame>(peer_address(), _compressor, in);
 }
 
+// Zamyka sink, wejście strumienia.
+// Jeżeli jest error to leci prosto do zatrzymania, wpp czeka na zakończenie/zamknięcie socketa.
 future<> connection::stream_close() {
     auto f = make_ready_future<>();
     if (!error()) {
@@ -552,6 +628,11 @@ future<> connection::stream_close() {
     return f.finally([this] () mutable { return stop(); });
 }
 
+// Z tego co rozumiem:
+// rcv_buf to struktura która jednocześnie trzyma dane oraz semafor.
+// Semafor ma role limitacji odbieranych danych. Przyjmuje pakiety dopóki ma jeszcze miejsce
+// (nie wykorzystał wszystkich swoich jednostek) wpp. trzeba czekać aż się zwolni.
+// Wtedy dopiero możemy wrzucić rcv_buf na kolejkę strumieni.
 future<> connection::stream_process_incoming(rcv_buf&& buf) {
     // we do not want to dead lock on huge packets, so let them in
     // but only one at a time
@@ -562,6 +643,7 @@ future<> connection::stream_process_incoming(rcv_buf&& buf) {
     });
 }
 
+// Połączenie odebrania compresji danych oraz wrzucenia do kolejki.
 future<> connection::handle_stream_frame() {
     return read_stream_frame_compressed(_connected->read_buf).then([this] (std::optional<rcv_buf> data) {
         if (!data) {
@@ -572,6 +654,10 @@ future<> connection::handle_stream_frame() {
     });
 }
 
+// Miejsce odpbioru danych ze wszystkich streamów.
+// Bierzemy dane z kolejki _stream_queue dopóki nie natrafimy na eof.
+// Jeżeli na niego natrafimy to oznacza, że nie ma już danych i wtedy
+// odkładamy znowu na początek kolejki EOF (buf (-1)).
 future<> connection::stream_receive(circular_buffer<foreign_ptr<std::unique_ptr<rcv_buf>>>& bufs) {
     return _stream_queue.not_empty().then([this, &bufs] {
         bool eof = !_stream_queue.consume([&bufs] (rcv_buf&& b) {
@@ -589,10 +675,12 @@ future<> connection::stream_receive(circular_buffer<foreign_ptr<std::unique_ptr<
     });
 }
 
+// Zapisujemy w mapie odpowiednie id do odpowiedniego sharda.
 void connection::register_stream(connection_id id, xshard_connection_ptr c) {
     _streams.emplace(id, std::move(c));
 }
 
+// Zwykłe wyszukiwanie sharda na podstawie id streamu.
 xshard_connection_ptr connection::get_stream(connection_id id) const {
     auto it = _streams.find(id);
     if (it == _streams.end()) {
@@ -659,11 +747,13 @@ struct request_frame_with_timeout : request_frame {
     }
 };
 
+// Encode + send.
 future<> client::request(uint64_t type, int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) {
     request_frame_with_timeout::encode_header(type, msg_id, buf);
     return send(std::move(buf), timeout, cancel);
 }
 
+// Ustawianie featurów na podstawie feature_map.
 void
 client::negotiate(feature_map provided) {
     // record features returned here
@@ -696,6 +786,7 @@ client::negotiate(feature_map provided) {
     }
 }
 
+// Wyższy poziom. Klient wysyła negation frame, serwer odsyła, wywołujemy funkcję co to wszystko zapisuje.
 future<> client::negotiate_protocol(feature_map features) {
     return send_negotiation_frame(std::move(features)).then([this] {
         return receive_negotiation_frame(*this, _connected->read_buf).then([this] (feature_map features) {
@@ -708,6 +799,7 @@ future<> client::negotiate_protocol(feature_map features) {
 //   le64 message ID
 //   le32 payload size
 //   ...  payload
+// Te strukty mają zadanie jak trait. Nie przechowują same w sobie danych ale definiują jak czytać i pisać dane z buforów.
 struct response_frame {
     using opt_buf_type = std::optional<rcv_buf>;
     using return_type = std::tuple<int64_t, std::optional<uint32_t>, opt_buf_type>;
@@ -815,6 +907,9 @@ void client::wait_timed_out(id_type id) {
 
 future<> client::stop() noexcept {
     _error = true;
+    if (_quic_session && !is_stream()) {
+        (void)_quic_session->close().handle_exception([] (std::exception_ptr) {});
+    }
     try {
         _socket.shutdown();
     } catch(...) {
@@ -955,13 +1050,29 @@ client::client(const logger& l, void* s, client_options ops, socket socket, cons
 future<> client::loop(client_options ops, const socket_address& addr, const socket_address& local) {
     std::exception_ptr ep;
     try {
-        connected_socket fd = co_await _socket.connect(addr, local);
-        fd.set_nodelay(ops.tcp_nodelay);
-        if (ops.keepalive) {
-            fd.set_keepalive(true);
-            fd.set_keepalive_parameters(ops.keepalive.value());
+        if (quic_enabled(ops)) {
+            if (is_stream()) {
+                if (!_parent || !_parent->quic_session()) {
+                    throw std::runtime_error("QUIC stream RPC connection requires a live parent QUIC session");
+                }
+                auto fd = co_await _parent->open_child_quic_stream(ops.quic->stream_options);
+                attach_quic_session(_parent->quic_session(), std::move(fd), ops.quic->stream_options);
+            } else {
+                _quic_client = std::make_unique<quic::experimental::quic_client>();
+                auto session = std::make_shared<quic::experimental::connection>(
+                        co_await _quic_client->connect(make_quic_client_config(ops, addr, local)));
+                auto stream = co_await session->open_stream(ops.quic->stream_options);
+                attach_quic_session(session, quic::experimental::to_connected_socket(std::move(stream)), ops.quic->stream_options);
+            }
+        } else {
+            connected_socket fd = co_await _socket.connect(addr, local);
+            fd.set_nodelay(ops.tcp_nodelay);
+            if (ops.keepalive) {
+                fd.set_keepalive(true);
+                fd.set_keepalive_parameters(ops.keepalive.value());
+            }
+            set_socket(std::move(fd));
         }
-        set_socket(std::move(fd));
 
         feature_map features;
         if (_options.compressor_factory) {
@@ -1048,6 +1159,12 @@ future<> client::loop(client_options ops, const socket_address& addr, const sock
     }
     if (_compressor) {
         co_await _compressor->close();
+    }
+    if (_quic_session && !is_stream()) {
+        co_await _quic_session->close().handle_exception([] (std::exception_ptr) {});
+    }
+    if (_quic_client) {
+        co_await _quic_client->stop().handle_exception([] (std::exception_ptr) {});
     }
     _stopped.set_value();
 }
@@ -1272,6 +1389,9 @@ future<> server::connection::process() {
     if (_compressor) {
         co_await _compressor->close();
     }
+    if (_quic_session && !is_stream()) {
+        co_await _quic_session->close().handle_exception([] (std::exception_ptr) {});
+    }
     _stopped.set_value();
 }
 
@@ -1306,18 +1426,70 @@ future<> server::connection::abort_all_streams() {
     });
 }
 
+future<> server::accept_quic_stream(std::shared_ptr<quic::experimental::connection> session, connected_socket fd, socket_address addr) {
+    connection_id id = _options.streaming_domain
+            ? connection_id::make_id(_next_client_id++, uint16_t(this_shard_id()))
+            : connection_id::make_invalid_id(_next_client_id++);
+    auto conn = _proto.make_server_connection(*this, std::move(fd), std::move(addr), id);
+    conn->set_quic_session(session, _options.quic->stream_options);
+    auto r = _conns.emplace(id, conn);
+    SEASTAR_ASSERT(r.second);
+    (void)conn->process();
+    return make_ready_future<>();
+}
+
+future<> server::accept_quic_session(std::shared_ptr<quic::experimental::connection> session) {
+    auto addr = session->peer_address();
+    auto main_stream = co_await session->accept_stream();
+    co_await accept_quic_stream(session, quic::experimental::to_connected_socket(std::move(main_stream)), addr);
+    while (session->is_open() && !_shutdown) {
+        quic::experimental::stream child_stream;
+        try {
+            child_stream = co_await session->accept_stream();
+        } catch (...) {
+            break;
+        }
+        co_await accept_quic_stream(session, quic::experimental::to_connected_socket(std::move(child_stream)), addr);
+    }
+}
+
 thread_local std::unordered_map<streaming_domain_type, server*> server::_servers;
 
 server::server(protocol_base* proto, const socket_address& addr, resource_limits limits)
-        : server(proto, seastar::listen(addr, listen_options{true}), limits, server_options{})
-{}
+        : _proto(*proto)
+        , _ss(seastar::listen(addr, listen_options{true}))
+        , _listen_addr(addr)
+        , _limits(limits)
+        , _resources_available(limits.max_memory)
+{
+    if (_options.streaming_domain) {
+        if (_servers.find(*_options.streaming_domain) != _servers.end()) {
+            throw std::runtime_error(format("An RPC server with the streaming domain {} is already exist", *_options.streaming_domain));
+        }
+        _servers[*_options.streaming_domain] = this;
+    }
+    accept();
+}
 
 server::server(protocol_base* proto, server_options opts, const socket_address& addr, resource_limits limits)
-        : server(proto, seastar::listen(addr, listen_options{true, opts.load_balancing_algorithm}), limits, opts)
-{}
+        : _proto(*proto)
+        , _ss(quic_enabled(opts) ? server_socket() : seastar::listen(addr, listen_options{true, opts.load_balancing_algorithm}))
+        , _listen_addr(addr)
+        , _limits(limits)
+        , _resources_available(limits.max_memory)
+        , _options(std::move(opts))
+{
+    if (_options.streaming_domain) {
+        if (_servers.find(*_options.streaming_domain) != _servers.end()) {
+            throw std::runtime_error(format("An RPC server with the streaming domain {} is already exist", *_options.streaming_domain));
+        }
+        _servers[*_options.streaming_domain] = this;
+    }
+    accept();
+}
 
 server::server(protocol_base* proto, server_socket ss, resource_limits limits, server_options opts)
-        : _proto(*proto), _ss(std::move(ss)), _limits(limits), _resources_available(limits.max_memory), _options(opts)
+        : _proto(*proto), _ss(std::move(ss)), _listen_addr(_ss.local_address()), _limits(limits), _resources_available(limits.max_memory), _options(std::move(opts))
 {
     if (_options.streaming_domain) {
         if (_servers.find(*_options.streaming_domain) != _servers.end()) {
@@ -1336,6 +1508,31 @@ void server::accept() {
     // Run asynchronously in background.
     // Communicate result via __ss_stopped.
     // The caller has to call server::stop() to synchronize.
+    if (quic_enabled(_options)) {
+        _quic_server = std::make_unique<quic::experimental::quic_server>();
+        (void)_quic_server->start(make_quic_server_config(_options, _listen_addr)).then([this] {
+            return keep_doing([this] () mutable {
+                return _quic_server->accept().then([this] (quic::experimental::connection session) mutable {
+                    auto peer = session.peer_address();
+                    if (_options.filter_connection && !_options.filter_connection(peer)) {
+                        return session.close();
+                    }
+                    auto shared_session = std::make_shared<quic::experimental::connection>(std::move(session));
+                    return with_gate(_session_gate, [this, shared_session = std::move(shared_session)] () mutable {
+                        return accept_quic_session(std::move(shared_session));
+                    }).handle_exception([] (std::exception_ptr) {});
+                });
+            });
+        }).then_wrapped([this] (future<>&& f) {
+            try {
+                f.get();
+                SEASTAR_ASSERT(false);
+            } catch (...) {
+                _ss_stopped.set_value();
+            }
+        });
+        return;
+    }
     (void)keep_doing([this] () mutable {
         return _ss.accept().then([this] (accept_result ar) mutable {
             if (_options.filter_connection && !_options.filter_connection(ar.remote_address)) {
@@ -1368,7 +1565,13 @@ future<> server::shutdown() {
         return make_ready_future<>();
     }
 
-    _ss.abort_accept();
+    if (quic_enabled(_options)) {
+        if (_quic_server) {
+            (void)_quic_server->stop().handle_exception([] (std::exception_ptr) {});
+        }
+    } else {
+        _ss.abort_accept();
+    }
     _resources_available.broken();
     if (_options.streaming_domain) {
         _servers.erase(*_options.streaming_domain);
@@ -1377,6 +1580,8 @@ future<> server::shutdown() {
         return parallel_for_each(_conns | boost::adaptors::map_values, [] (shared_ptr<connection> conn) {
             return conn->stop();
         });
+    }).then([this] {
+        return _session_gate.close();
     }).finally([this] {
         _shutdown = true;
     });

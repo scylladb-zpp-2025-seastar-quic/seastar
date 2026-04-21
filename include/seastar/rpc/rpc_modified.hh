@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include <list>
 #include <variant>
+#include <vector>
 #include <boost/intrusive/list.hpp>
 #include <seastar/core/future.hh>
 #include <seastar/core/seastar.hh>
@@ -44,6 +45,9 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/log.hh>
+#include <seastar/quic/quic.hh>
+#include <seastar/quic/quic_client.hh>
+#include <seastar/quic/quic_server.hh>
 
 namespace bi = boost::intrusive;
 
@@ -109,6 +113,17 @@ struct resource_limits {
     isolation_function_alternatives isolate_connection = default_isolate_connection;
 };
 
+struct quic_transport_options {
+    bool enable = false;
+    std::vector<sstring> alpns = {sstring("h3")};
+    sstring server_name = "localhost";
+    std::optional<sstring> ca_file{};
+    sstring crt_file;
+    sstring key_file;
+    quic::experimental::connection_options session_options{};
+    quic::experimental::stream_open_options stream_options{};
+};
+
 struct client_options {
     std::optional<net::tcp_keepalive_params> keepalive;
     bool tcp_nodelay = true;
@@ -122,6 +137,7 @@ struct client_options {
     sstring isolation_cookie;
     sstring metrics_domain = "default";
     bool send_handler_duration = true;
+    std::optional<quic_transport_options> quic;
 };
 
 /// @}
@@ -162,6 +178,7 @@ struct server_options {
     // Returning false will refuse the incoming connection.
     // Returning true will allow the mechanism to proceed.
     std::function<bool(const socket_address&)> filter_connection = {};
+    std::optional<quic_transport_options> quic;
 };
 
 /// @}
@@ -296,6 +313,8 @@ protected:
     // stream related fields
     bool _is_stream = false;
     connection_id _id = invalid_connection_id;
+    std::shared_ptr<quic::experimental::connection> _quic_session;
+    quic::experimental::stream_open_options _quic_stream_options{};
 
     std::unordered_map<connection_id, xshard_connection_ptr> _streams;
     queue<rcv_buf> _stream_queue = queue<rcv_buf>(max_queued_stream_buffers);
@@ -337,6 +356,32 @@ public:
     }
 
     void set_socket(connected_socket&& fd);
+    void set_quic_session(std::shared_ptr<quic::experimental::connection> session,
+            quic::experimental::stream_open_options opts = {}) {
+        _quic_session = std::move(session);
+        _quic_stream_options = std::move(opts);
+    }
+    void attach_quic_session(std::shared_ptr<quic::experimental::connection> session,
+            connected_socket&& fd,
+            quic::experimental::stream_open_options opts = {}) {
+        set_quic_session(std::move(session), std::move(opts));
+        set_socket(std::move(fd));
+    }
+    bool has_quic_session() const noexcept {
+        return static_cast<bool>(_quic_session);
+    }
+    std::shared_ptr<quic::experimental::connection> quic_session() const noexcept {
+        return _quic_session;
+    }
+    future<connected_socket> open_child_quic_stream(std::optional<quic::experimental::stream_open_options> opts = std::nullopt) {
+        if (!_quic_session) {
+            return make_exception_future<connected_socket>(std::runtime_error("QUIC session is not attached"));
+        }
+        quic::experimental::stream_open_options options = opts ? *opts : _quic_stream_options;
+        return _quic_session->open_stream(options).then([] (quic::experimental::stream child_stream) {
+            return make_ready_future<connected_socket>(quic::experimental::to_connected_socket(std::move(child_stream)));
+        });
+    }
     bool error() const noexcept { return _error; }
     void abort();
     future<> stop() noexcept;
@@ -559,6 +604,7 @@ private:
     socket_address _server_addr, _local_addr;
     client_options _options;
     weak_ptr<client> _parent; // for stream clients
+    std::unique_ptr<quic::experimental::quic_client> _quic_client;
 
     metrics _metrics;
 
@@ -711,14 +757,17 @@ public:
 private:
     protocol_base& _proto;
     server_socket _ss;
+    socket_address _listen_addr;
     resource_limits _limits;
     rpc_semaphore _resources_available;
     std::unordered_map<connection_id, shared_ptr<connection>> _conns;
     promise<> _ss_stopped;
     gate _reply_gate;
+    gate _session_gate;
     server_options _options;
     bool _shutdown = false;
     uint64_t _next_client_id = 1;
+    std::unique_ptr<quic::experimental::quic_server> _quic_server;
 
 public:
     server(protocol_base* proto, const socket_address& addr, resource_limits memory_limit = resource_limits());
@@ -762,6 +811,11 @@ public:
     gate& reply_gate() {
         return _reply_gate;
     }
+
+private:
+    future<> accept_quic_session(std::shared_ptr<quic::experimental::connection> session);
+    future<> accept_quic_stream(std::shared_ptr<quic::experimental::connection> session, connected_socket fd, socket_address addr);
+
     friend connection;
     friend client;
 };
