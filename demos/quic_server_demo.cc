@@ -39,14 +39,29 @@ using namespace seastar;
 using namespace seastar::quic::experimental;
 namespace bpo = boost::program_options;
 
-static socket_address parse_ipv6_address(const std::string& ip, uint16_t port) {
-    sockaddr_in6 sa{};
-    sa.sin6_family = AF_INET6;
-    sa.sin6_port = htons(port);
-    if (inet_pton(AF_INET6, ip.c_str(), &sa.sin6_addr) != 1) {
-        throw std::runtime_error("Invalid IPv6 address: " + ip);
+static socket_address parse_ip_address(const std::string& ip, uint16_t port) {
+    sockaddr_in6 sa6{};
+    sa6.sin6_family = AF_INET6;
+    sa6.sin6_port = htons(port);
+    if (inet_pton(AF_INET6, ip.c_str(), &sa6.sin6_addr) == 1) {
+        return socket_address(sa6);
     }
-    return socket_address(sa);
+
+    sockaddr_in sa4{};
+    sa4.sin_family = AF_INET;
+    sa4.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &sa4.sin_addr) == 1) {
+        return socket_address(sa4);
+    }
+
+    throw std::runtime_error("Invalid IP address: " + ip);
+}
+
+static std::string format_endpoint(const std::string& ip, uint16_t port) {
+    if (ip.find(':') != std::string::npos) {
+        return "[" + ip + "]:" + std::to_string(port);
+    }
+    return ip + ":" + std::to_string(port);
 }
 
 static future<> handle_stream(seastar::quic::experimental::stream quic_stream, bool verbose, uint64_t conn_id, uint64_t stream_no) {
@@ -155,7 +170,7 @@ static future<> accept_loop(quic_server& server, gate& sessions, bool verbose) {
 int main(int argc, char** argv) {
     app_template app;
     app.add_options()
-      ("address", bpo::value<std::string>()->default_value("::1"), "Server IPv6 address")
+      ("address", bpo::value<std::string>()->default_value("::1"), "Server IP address")
       ("port", bpo::value<uint16_t>()->default_value(4444), "Server UDP port")
       ("crt", bpo::value<std::string>()->default_value("server.crt"), "PEM certificate file")
       ("key,k", bpo::value<std::string>()->default_value("server.key"), "PEM key file")
@@ -177,14 +192,14 @@ int main(int argc, char** argv) {
             verbose = cfg["verbose"].as<bool>();
 
             quic_server_config server_cfg;
-            server_cfg.listen_address = parse_ipv6_address(address, port);
+            server_cfg.listen_address = parse_ip_address(address, port);
             server_cfg.crt_file = crt;
             server_cfg.key_file = key;
 
             co_await server.start(std::move(server_cfg));
             accept_task.emplace(accept_loop(server, sessions, verbose));
 
-            std::cout << "QUIC server listening on [" << address << "]:" << port << "\n";
+            std::cout << "QUIC server listening on " << format_endpoint(address, port) << "\n";
             std::cout.flush();
 
             seastar_apps_lib::stop_signal stop_signal;

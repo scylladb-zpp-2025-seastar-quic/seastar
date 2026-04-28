@@ -51,9 +51,10 @@ enum class stream_type : uint8_t {
 };
 
 enum class congestion_control_algorithm : uint8_t {
-    cubic,
     reno,
+    cubic,
     bbr,
+    bbr2,
 };
 
 struct transport_config {
@@ -64,14 +65,15 @@ struct transport_config {
     uint64_t initial_max_data = 4 * 1024 * 1024;
     uint64_t initial_max_streams_bidi = 128;
     uint64_t initial_max_streams_uni = 128;
-    uint64_t max_window = 0;
-    uint64_t max_stream_window = 0;
-    size_t ack_thresh = 2;
-    uint64_t initial_rtt_ns = 0; // 0 = use ngtcp2 default (333ms)
-    congestion_control_algorithm congestion_control = congestion_control_algorithm::cubic;
-    size_t max_udp_payload_size = 65527;
-    size_t max_tx_udp_payload_size = 1452;
+    std::optional<size_t> max_tx_udp_payload_size{};
+    std::optional<uint64_t> max_udp_payload_size{};
+    std::optional<uint64_t> initial_rtt_ns{};
+    std::optional<uint64_t> max_window{};
+    std::optional<uint64_t> max_stream_window{};
+    std::optional<size_t> ack_thresh{};
+    std::optional<congestion_control_algorithm> congestion_control{};
     bool disable_tx_udp_payload_size_shaping = false;
+    bool disable_pmtud = false;
 };
 
 struct connection_options {
@@ -176,6 +178,7 @@ struct transport_command {
     enum class kind : uint8_t {
         send,
         open_stream,
+        consume_stream_data,
         reset_stream,
         stop_sending,
         close_connection,
@@ -184,14 +187,9 @@ struct transport_command {
     kind op = kind::send;
     quic_message msg;
     stream_type type = stream_type::bidirectional;
+    size_t consumed_bytes = 0;
     application_error_code app_error_code = 0;
     std::shared_ptr<promise<stream_id>> open_result;
-};
-
-struct blocked_send_state {
-    quic_message msg;
-    size_t offset = 0;
-    bool send_fin = false;
 };
 
 class session_runtime {
@@ -205,6 +203,8 @@ public:
 
     virtual future<> send(quic_message msg) = 0;
     virtual future<stream_id> open_stream(stream_type type) = 0;
+    virtual void complete_send_bytes(size_t len) = 0;
+    virtual void consume_stream_data(stream_id sid, size_t len) = 0;
     virtual future<> reset_stream(stream_id sid, application_error_code app_error_code) = 0;
     virtual future<> stop_sending(stream_id sid, application_error_code app_error_code) = 0;
     virtual future<> close() = 0;
@@ -217,6 +217,10 @@ public:
     virtual void mark_transport_ready(socket_address local, socket_address peer, sstring selected_alpn) = 0;
     virtual void mark_transport_closed() = 0;
     virtual void mark_error(quic_error error, sstring detail) = 0;
+    virtual bool transport_terminal() const noexcept = 0;
+    virtual bool transport_failed() const noexcept = 0;
+    virtual quic_error transport_error() const noexcept = 0;
+    virtual sstring transport_error_detail() const = 0;
 };
 
 struct transport_stream_write_result {
@@ -229,25 +233,6 @@ struct transport_open_stream_result {
     stream_id sid = invalid_stream_id;
 };
 
-struct transport_debug_stats {
-    uint64_t negotiated_tx_payload_limit = 0;
-    uint64_t tx_packets = 0;
-    uint64_t tx_bytes = 0;
-    uint64_t tx_copy_bytes = 0;
-    uint64_t tx_copy_events = 0;
-    uint64_t tx_blocked_events = 0;
-    uint64_t tx_zero_write_events = 0;
-    uint64_t tx_packet_buffer_allocations = 0;
-    uint64_t tx_packet_buffer_reuses = 0;
-    uint64_t tx_packet_buffer_recycles = 0;
-    uint64_t rx_packets = 0;
-    uint64_t rx_bytes = 0;
-    uint64_t rx_linearized_packets = 0;
-    uint64_t rx_linearized_bytes = 0;
-    uint64_t rx_fallback_copy_events = 0;
-    uint64_t rx_fallback_copy_bytes = 0;
-};
-
 class connection_transport {
 public:
     virtual ~connection_transport() = default;
@@ -256,9 +241,7 @@ public:
     virtual bool has_transport_connection() const noexcept = 0;
     virtual bool can_retry_blocked_open_streams() const noexcept = 0;
     virtual size_t tx_payload_limit_bytes() const noexcept = 0;
-    virtual transport_debug_stats& debug_stats() noexcept = 0;
 
-    virtual temporary_buffer<char> acquire_tx_packet_buffer() = 0;
     virtual int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
     virtual transport_stream_write_result write_stream_packet(
       stream_id sid,
@@ -266,19 +249,19 @@ public:
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size,
-      bool more = false) = 0;
+      size_t outbuf_size) = 0;
     virtual transport_open_stream_result try_open_stream(stream_type type) = 0;
+    virtual void complete_send_bytes(size_t len) = 0;
+    virtual int consume_stream_data(stream_id sid, size_t len) = 0;
     virtual int shutdown_stream_write(stream_id sid, application_error_code app_error_code) = 0;
     virtual int shutdown_stream_read(stream_id sid, application_error_code app_error_code) = 0;
     virtual int read_transport_datagram(const socket_address& src, const char* data, size_t len) = 0;
     virtual void sync_transport_path() = 0;
     virtual uint64_t transport_expiry_ns() const noexcept = 0;
     virtual int handle_transport_expiry(uint64_t now_ns) = 0;
+    virtual temporary_buffer<char>& tx_packet_buffer() = 0;
 
-    virtual future<> send_datagram_packet(temporary_buffer<char> packet, size_t packet_size) = 0;
-    virtual bool has_queued_datagram_packets() const noexcept = 0;
-    virtual future<> flush_datagram_packets() = 0;
+    virtual future<> send_datagram_packet(temporary_buffer<char> packet) = 0;
     virtual bool can_send_connection_close() const noexcept = 0;
     virtual int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
     virtual void on_stream_write_closed(stream_id sid) = 0;
@@ -307,11 +290,10 @@ public:
     virtual future<> actor_wait_for_wakeup() = 0;
     virtual bool actor_stop_requested() const noexcept = 0;
     virtual future<> actor_handle_stop_request() = 0;
+    virtual bool actor_transport_terminal() const noexcept = 0;
+    virtual future<> actor_handle_transport_terminal() = 0;
     virtual bool actor_has_rx_event() const noexcept = 0;
     virtual future<> actor_handle_next_rx_event() = 0;
-    virtual bool actor_has_blocked_send() const noexcept = 0;
-    virtual void actor_defer_blocked_send(blocked_send_state state) = 0;
-    virtual future<> actor_handle_blocked_send() = 0;
     virtual bool actor_has_transport_command() const noexcept = 0;
     virtual future<> actor_handle_next_transport_command() = 0;
     virtual future<> actor_retry_blocked_open_streams() = 0;
@@ -322,10 +304,7 @@ public:
 
 class connection_engine {
 public:
-    explicit connection_engine(
-      session_runtime_ptr runtime,
-      connection_options options = {},
-      std::shared_ptr<transport_debug_stats> debug_stats = {});
+    explicit connection_engine(session_runtime_ptr runtime, connection_options options = {});
     ~connection_engine();
 
     connection_engine(const connection_engine&) = delete;
@@ -374,22 +353,20 @@ private:
     std::unique_ptr<impl> _impl;
 };
 
-connection_engine_ptr make_connection_engine(
-  session_runtime_ptr runtime,
-  connection_options options = {},
-  std::shared_ptr<transport_debug_stats> debug_stats = {});
+connection_engine_ptr make_connection_engine(session_runtime_ptr runtime, connection_options options = {});
 
 future<> flush_pending_transport_packets(connection_transport& transport);
-future<> send_stream_message(connection_transport& transport, connection_actor& actor, blocked_send_state state);
+future<std::optional<quic_message>> send_stream_message(connection_transport& transport, quic_message msg);
 future<bool> open_stream(connection_transport& transport, transport_command cmd);
+future<> consume_stream_data(connection_transport& transport, stream_id sid, size_t len);
 future<> reset_stream(connection_transport& transport, stream_id sid, application_error_code app_error_code);
 future<> stop_sending(connection_transport& transport, stream_id sid, application_error_code app_error_code);
 future<> retry_blocked_open_streams(connection_transport& transport, stream_type type);
-future<> handle_transport_command(connection_transport& transport, connection_actor& actor, transport_command cmd);
+future<std::optional<transport_command>> handle_transport_command(connection_transport& transport, transport_command cmd);
 future<> recv_transport_datagram(connection_transport& transport, const socket_address& src, temporary_buffer<char> pkt);
 future<> handle_transport_timer(connection_transport& transport);
 future<> send_connection_close(connection_transport& transport);
-future<> run_connection_actor(connection_transport& transport, connection_actor& actor);
+future<> run_connection_actor(connection_actor& actor);
 
 session_runtime_ptr make_session_runtime(connection_options options = {});
 

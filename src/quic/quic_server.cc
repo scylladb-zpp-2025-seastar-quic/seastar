@@ -61,8 +61,6 @@ constexpr size_t max_cid_len = 20;
 constexpr size_t server_short_cid_len = 8;
 constexpr size_t max_udp_payload_size = 65527;
 constexpr size_t default_udp_payload_size = 1200;
-constexpr size_t default_max_tx_udp_payload_size = 1452;
-constexpr size_t max_tx_packet_pool_size = 128;
 
 static logger quic_server_log("quic_server");
 using transport_command = internal::transport_command;
@@ -129,29 +127,6 @@ void* mem_realloc(void* ptr, size_t s, void*) {
     return std::realloc(ptr, s);
 }
 
-size_t normalize_udp_payload_size(size_t requested, size_t fallback) noexcept {
-    auto value = requested == 0 ? fallback : requested;
-    if (value < default_udp_payload_size) {
-        return default_udp_payload_size;
-    }
-    if (value > max_udp_payload_size) {
-        return max_udp_payload_size;
-    }
-    return value;
-}
-
-ngtcp2_cc_algo to_ngtcp2_cc_algo(congestion_control_algorithm algo) noexcept {
-    switch (algo) {
-    case congestion_control_algorithm::reno:
-        return NGTCP2_CC_ALGO_RENO;
-    case congestion_control_algorithm::bbr:
-        return NGTCP2_CC_ALGO_BBR;
-    case congestion_control_algorithm::cubic:
-    default:
-        return NGTCP2_CC_ALGO_CUBIC;
-    }
-}
-
 const ngtcp2_mem* ngtcp2_mem_for_thread() {
     thread_local const ngtcp2_mem mem = {
       nullptr,
@@ -168,11 +143,36 @@ void init_ngtcp2_addr(ngtcp2_addr* addr, const sockaddr* sa, size_t len) {
     addr->addrlen = static_cast<socklen_t>(len);
 }
 
-void to_sockaddr_storage_v6(const socket_address& sa, sockaddr_storage& out, socklen_t& outlen) {
+void to_sockaddr_storage(const socket_address& sa, sockaddr_storage& out, socklen_t& outlen) {
     std::memset(&out, 0, sizeof(out));
-    auto in6 = sa.as_posix_sockaddr_in6();
-    std::memcpy(&out, &in6, sizeof(in6));
-    outlen = sizeof(in6);
+    switch (sa.family()) {
+    case AF_INET: {
+        auto in = sa.as_posix_sockaddr_in();
+        std::memcpy(&out, &in, sizeof(in));
+        outlen = sizeof(in);
+        return;
+    }
+    case AF_INET6: {
+        auto in6 = sa.as_posix_sockaddr_in6();
+        std::memcpy(&out, &in6, sizeof(in6));
+        outlen = sizeof(in6);
+        return;
+    }
+    default:
+        throw_quic_error(quic_error::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
+    }
+}
+
+void validate_ip_socket_address(const socket_address& sa, std::string_view what) {
+    switch (sa.family()) {
+    case AF_INET:
+    case AF_INET6:
+        return;
+    default:
+        throw_quic_error(
+          quic_error::invalid_argument,
+          sstring(what) + " must be an IPv4 or IPv6 socket address");
+    }
 }
 
 std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
@@ -203,16 +203,9 @@ std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
     }
 }
 
-struct queued_datagram_packet {
-    temporary_buffer<char> storage;
-    size_t size = 0;
-};
-
-temporary_buffer<char> linearize_packet(
-  std::span<temporary_buffer<char>> bufs,
-  internal::transport_debug_stats* stats = nullptr) {
+temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) {
     if (bufs.empty()) {
-        return {};
+        return temporary_buffer<char>();
     }
     if (bufs.size() == 1) {
         return std::move(bufs.front());
@@ -221,11 +214,6 @@ temporary_buffer<char> linearize_packet(
     size_t total = 0;
     for (const auto& b : bufs) {
         total += b.size();
-    }
-
-    if (stats) {
-        ++stats->rx_linearized_packets;
-        stats->rx_linearized_bytes += total;
     }
 
     temporary_buffer<char> result(total);
@@ -238,27 +226,31 @@ temporary_buffer<char> linearize_packet(
     return result;
 }
 
-temporary_buffer<char> copy_or_share_stream_payload(
-  temporary_buffer<char>& current_rx_packet,
-  const uint8_t* data,
-  size_t datalen,
-  internal::transport_debug_stats& stats) {
-    if (!datalen) {
-        return {};
+ngtcp2_cc_algo to_ngtcp2_cc_algo(congestion_control_algorithm algo) {
+    switch (algo) {
+    case congestion_control_algorithm::reno:
+        return NGTCP2_CC_ALGO_RENO;
+    case congestion_control_algorithm::cubic:
+        return NGTCP2_CC_ALGO_CUBIC;
+    case congestion_control_algorithm::bbr:
+        return NGTCP2_CC_ALGO_BBR;
+    case congestion_control_algorithm::bbr2:
+#ifdef NGTCP2_CC_ALGO_BBR2
+        return NGTCP2_CC_ALGO_BBR2;
+#else
+        return NGTCP2_CC_ALGO_BBR;
+#endif
     }
+    return NGTCP2_CC_ALGO_CUBIC;
+}
 
-    if (!current_rx_packet.empty()) {
-        const auto packet_begin = reinterpret_cast<uintptr_t>(current_rx_packet.get());
-        const auto packet_end = packet_begin + current_rx_packet.size();
-        const auto data_begin = reinterpret_cast<uintptr_t>(data);
-        if (data_begin >= packet_begin && data_begin <= packet_end && datalen <= packet_end - data_begin) {
-            return current_rx_packet.share(data_begin - packet_begin, datalen);
-        }
+future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {
+    if (packet.empty()) {
+        co_return;
     }
-
-    ++stats.rx_fallback_copy_events;
-    stats.rx_fallback_copy_bytes += datalen;
-    return temporary_buffer<char>(reinterpret_cast<const char*>(data), datalen);
+    quic_server_log.trace("udp send datagram: dst={} bytes={}", dst, packet.size());
+    std::array<temporary_buffer<char>, 1> bufs{std::move(packet)};
+    co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
 }
 
 std::string cid_key(const uint8_t* data, size_t len) {
@@ -326,7 +318,7 @@ struct server_connection;
 void sync_current_path(server_connection& conn);
 
 struct server_connection : public enable_lw_shared_from_this<server_connection>, public internal::connection_transport, public internal::connection_actor {
-    quic_server_impl* server = nullptr;
+    std::weak_ptr<quic_server_impl> server;
     internal::session_runtime_ptr runtime;
     internal::connection_engine_ptr engine;
 
@@ -351,17 +343,14 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
     bool handshake_done = false;
     bool accepted_to_listener = false;
     size_t tx_payload_limit = default_udp_payload_size;
-    std::shared_ptr<internal::transport_debug_stats> stats = std::make_shared<internal::transport_debug_stats>();
-    bool transport_stats_logged = false;
-    std::vector<temporary_buffer<char>> tx_packet_pool;
-    std::deque<queued_datagram_packet> tx_datagram_queue;
-    std::optional<internal::blocked_send_state> blocked_send;
-    temporary_buffer<char> current_rx_packet;
+    temporary_buffer<char> tx_packet_scratch;
+    std::optional<transport_command> blocked_send_command;
+    bool blocked_send_retry_requested = false;
     std::unordered_set<std::string> mapped_dcids;
 
     ~server_connection() {
-        log_transport_stats("destroyed");
         fail_blocked_open_streams(quic_error::closed, "server connection destroyed");
+        discard_blocked_send();
         abort_event_queues("server connection destroyed");
         if (runtime) {
             runtime->set_command_notifier({});
@@ -382,6 +371,10 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&peer_ss), peer_ss_len);
     }
 
+    std::shared_ptr<quic_server_impl> lock_server() const {
+        return server.lock();
+    }
+
     bool transport_active() const noexcept override {
         return active();
     }
@@ -398,20 +391,22 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return tx_payload_limit;
     }
 
-    internal::transport_debug_stats& debug_stats() noexcept override {
-        return *stats;
+    bool has_blocked_send() const noexcept {
+        return blocked_send_command.has_value();
     }
 
-    bool has_blocked_send() const noexcept {
-        return blocked_send.has_value();
+    bool blocked_send_retry_pending() const noexcept {
+        return has_blocked_send() && blocked_send_retry_requested;
     }
 
     bool has_pending_actor_work() const noexcept {
         return stop_requested
+               || (runtime && runtime->transport_terminal())
                || !rx_queue.empty()
+               || blocked_send_retry_pending()
+               || (!has_blocked_send() && runtime && runtime->has_pending_commands())
                || engine->tick_pending()
-               || engine->has_blocked_open_stream_retry_work()
-               || (!has_blocked_send() && runtime && runtime->has_pending_commands());
+               || engine->has_blocked_open_stream_retry_work();
     }
 
     future<> wait_for_actor_wakeup() {
@@ -420,20 +415,6 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
 
     void wake_actor() {
         engine->wake_actor();
-    }
-
-    temporary_buffer<char> acquire_tx_packet_buffer() override {
-        const auto required = tx_payload_limit_bytes();
-        while (!tx_packet_pool.empty()) {
-            auto packet = std::move(tx_packet_pool.back());
-            tx_packet_pool.pop_back();
-            if (packet.size() >= required) {
-                ++stats->tx_packet_buffer_reuses;
-                return packet;
-            }
-        }
-        ++stats->tx_packet_buffer_allocations;
-        return temporary_buffer<char>(required);
     }
 
     int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override {
@@ -449,8 +430,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size,
-      bool more = false) override {
+      size_t outbuf_size) override {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -460,13 +440,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
             vec.base = reinterpret_cast<uint8_t*>(const_cast<char*>(data));
             vec.len = len;
         }
-        uint32_t flags = 0;
-        if (!len && fin) {
-            flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
-        }
-        if (more) {
-            flags |= NGTCP2_WRITE_STREAM_FLAG_MORE;
-        }
+        auto flags = (!len && fin) ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
         auto nwrite = ngtcp2_conn_writev_stream(
           conn,
           &path,
@@ -485,6 +459,12 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         };
     }
 
+    void complete_send_bytes(size_t len) override {
+        if (runtime) {
+            runtime->complete_send_bytes(len);
+        }
+    }
+
     internal::transport_open_stream_result try_open_stream(stream_type type) override {
         int64_t sid = invalid_stream_id;
         auto rv = type == stream_type::bidirectional
@@ -500,6 +480,18 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return ngtcp2_conn_shutdown_stream_write(conn, 0, sid, app_error_code);
     }
 
+    int consume_stream_data(stream_id sid, size_t len) override {
+        if (!conn || !len) {
+            return 0;
+        }
+        auto rv = ngtcp2_conn_extend_max_stream_offset(conn, sid, static_cast<uint64_t>(len));
+        if (rv < 0) {
+            return rv;
+        }
+        ngtcp2_conn_extend_max_offset(conn, static_cast<uint64_t>(len));
+        return 0;
+    }
+
     int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override {
         return ngtcp2_conn_shutdown_stream_read(conn, 0, sid, app_error_code);
     }
@@ -507,7 +499,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
     int read_transport_datagram(const socket_address& src, const char* data, size_t len) override {
         sockaddr_storage peer_addr_ss{};
         socklen_t peer_addr_ss_len = 0;
-        to_sockaddr_storage_v6(src, peer_addr_ss, peer_addr_ss_len);
+        to_sockaddr_storage(src, peer_addr_ss, peer_addr_ss_len);
 
         ngtcp2_path path{};
         init_ngtcp2_addr(&path.local, reinterpret_cast<sockaddr*>(&local_ss), local_ss_len);
@@ -534,13 +526,11 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return ngtcp2_conn_handle_expiry(conn, now_local);
     }
 
-    future<> send_datagram_packet(temporary_buffer<char> packet, size_t packet_size) override;
-
-    bool has_queued_datagram_packets() const noexcept override {
-        return !tx_datagram_queue.empty();
+    temporary_buffer<char>& tx_packet_buffer() override {
+        return tx_packet_scratch;
     }
 
-    future<> flush_datagram_packets() override;
+    future<> send_datagram_packet(temporary_buffer<char> packet) override;
 
     bool can_send_connection_close() const noexcept override;
 
@@ -585,45 +575,10 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         request_stop();
     }
 
-    void recycle_tx_packet_buffer(temporary_buffer<char> packet) noexcept {
-        if (!packet || packet.size() < tx_payload_limit_bytes() || tx_packet_pool.size() >= max_tx_packet_pool_size) {
-            return;
-        }
-        ++stats->tx_packet_buffer_recycles;
-        tx_packet_pool.emplace_back(std::move(packet));
-    }
-
     void cancel_transport_timer() {
         if (engine) {
             engine->cancel_timer();
         }
-    }
-
-    void log_transport_stats(const char* reason) {
-        if (transport_stats_logged || !stats) {
-            return;
-        }
-        transport_stats_logged = true;
-        quic_server_log.info(
-          "server transport stats: reason={} peer={} tx_payload_limit={} tx_packets={} tx_bytes={} tx_copy_bytes={} tx_copy_events={} tx_blocked_events={} tx_zero_write_events={} tx_packet_buffer_allocations={} tx_packet_buffer_reuses={} tx_packet_buffer_recycles={} rx_packets={} rx_bytes={} rx_linearized_packets={} rx_linearized_bytes={} rx_fallback_copy_events={} rx_fallback_copy_bytes={}",
-          reason,
-          peer,
-          stats->negotiated_tx_payload_limit,
-          stats->tx_packets,
-          stats->tx_bytes,
-          stats->tx_copy_bytes,
-          stats->tx_copy_events,
-          stats->tx_blocked_events,
-          stats->tx_zero_write_events,
-          stats->tx_packet_buffer_allocations,
-          stats->tx_packet_buffer_reuses,
-          stats->tx_packet_buffer_recycles,
-          stats->rx_packets,
-          stats->rx_bytes,
-          stats->rx_linearized_packets,
-          stats->rx_linearized_bytes,
-          stats->rx_fallback_copy_events,
-          stats->rx_fallback_copy_bytes);
     }
 
     void abort_event_queues(const char* why) {
@@ -666,6 +621,42 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         engine->request_blocked_open_stream_retry(type);
     }
 
+    void defer_blocked_send(transport_command cmd) {
+        blocked_send_command = std::move(cmd);
+        blocked_send_retry_requested = false;
+    }
+
+    std::optional<transport_command> take_blocked_send() {
+        if (!blocked_send_command) {
+            return std::nullopt;
+        }
+        auto cmd = std::move(*blocked_send_command);
+        blocked_send_command.reset();
+        blocked_send_retry_requested = false;
+        return cmd;
+    }
+
+    void request_blocked_send_retry() {
+        if (!blocked_send_command) {
+            return;
+        }
+        blocked_send_retry_requested = true;
+        wake_actor();
+    }
+
+    void clear_blocked_send_retry() noexcept {
+        blocked_send_retry_requested = false;
+    }
+
+    void discard_blocked_send() {
+        if (!blocked_send_command) {
+            return;
+        }
+        complete_send_bytes(blocked_send_command->msg.payload.size());
+        blocked_send_command.reset();
+        blocked_send_retry_requested = false;
+    }
+
     void clear_blocked_open_stream_retry(stream_type type) noexcept override {
         engine->clear_blocked_open_stream_retry(type);
     }
@@ -701,36 +692,43 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return stop_requested;
     }
     future<> actor_handle_stop_request() override;
+    bool actor_transport_terminal() const noexcept override {
+        return runtime && runtime->transport_terminal();
+    }
+    future<> actor_handle_transport_terminal() override {
+        if (!runtime) {
+            co_return;
+        }
+        if (runtime->transport_failed()) {
+            fail(runtime->transport_error(), runtime->transport_error_detail());
+        } else {
+            stop_transport();
+        }
+        co_return;
+    }
     bool actor_has_rx_event() const noexcept override {
         return !rx_queue.empty();
     }
     future<> actor_handle_next_rx_event() override;
-    bool actor_has_blocked_send() const noexcept override {
-        return has_blocked_send();
-    }
-    void actor_defer_blocked_send(internal::blocked_send_state state) override {
-        blocked_send = std::move(state);
-    }
-    future<> actor_handle_blocked_send() override {
-        if (!blocked_send) {
-            co_return;
-        }
-        auto state = std::move(*blocked_send);
-        blocked_send.reset();
-        co_await internal::send_stream_message(*this, *this, std::move(state));
-    }
     bool actor_has_transport_command() const noexcept override {
-        return !has_blocked_send() && runtime && runtime->has_pending_commands();
+        return blocked_send_retry_pending()
+               || (!has_blocked_send() && runtime && runtime->has_pending_commands());
     }
     future<> actor_handle_next_transport_command() override {
-        if (!runtime) {
-            co_return;
+        std::optional<transport_command> cmd;
+        if (blocked_send_retry_pending()) {
+            clear_blocked_send_retry();
+            cmd = take_blocked_send();
+        } else if (!has_blocked_send() && runtime) {
+            cmd = runtime->poll_command();
         }
-        auto cmd = runtime->poll_command();
         if (!cmd) {
             co_return;
         }
-        co_await internal::handle_transport_command(*this, *this, std::move(*cmd));
+        auto blocked = co_await internal::handle_transport_command(*this, std::move(*cmd));
+        if (blocked) {
+            defer_blocked_send(std::move(*blocked));
+        }
     }
     future<> actor_retry_blocked_open_streams() override {
         co_await internal::retry_blocked_open_streams(*this, stream_type::bidirectional);
@@ -782,17 +780,24 @@ void sync_current_path(server_connection& conn) {
       *remote);
 
     conn.peer = *remote;
-    to_sockaddr_storage_v6(*local, conn.local_ss, conn.local_ss_len);
-    to_sockaddr_storage_v6(conn.peer, conn.peer_ss, conn.peer_ss_len);
+    to_sockaddr_storage(*local, conn.local_ss, conn.local_ss_len);
+    to_sockaddr_storage(conn.peer, conn.peer_ss, conn.peer_ss_len);
 }
 
-class quic_server_impl {
+class quic_server_impl : public std::enable_shared_from_this<quic_server_impl> {
 public:
+    quic_server_impl() = default;
+    virtual ~quic_server_impl() {
+        request_stop_detached();
+        cleanup_resources();
+    }
+
     future<> start(quic_server_config cfg) {
         if (_started) {
             throw_quic_error(quic_error::invalid_state, "server already started");
         }
         ensure_gnutls_global();
+        validate_ip_socket_address(cfg.listen_address, "listen_address");
         quic_server_log.info(
           "server start: listen={} crt_file='{}' key_file='{}' alpn_count={}",
           cfg.listen_address,
@@ -819,12 +824,13 @@ public:
         _stopping = false;
         quic_server_log.info("server listening on {}", _listen_address);
 
-        (void)with_gate(_task_gate, [this] { return receive_loop(); })
-          .handle_exception([this](std::exception_ptr) {
-              if (!_stopping) {
+        auto self = shared_from_this();
+        (void)with_gate(_task_gate, [self] { return self->receive_loop(); })
+          .handle_exception([self](std::exception_ptr) {
+              if (!self->_stopping) {
                   quic_server_log.error("server receive loop failed");
-                  _stopping = true;
-                  _accept_cv.signal();
+                  self->_stopping = true;
+                  self->_accept_cv.broadcast();
               }
           })
           .or_terminate();
@@ -862,36 +868,13 @@ public:
           _conns.size(),
           _accepted.size(),
           _by_dcid.size());
-        _stopping = true;
-        _accept_cv.signal();
-
-        auto conns_copy = _conns;
-        for (auto& conn : conns_copy) {
-            conn->stop_transport();
-        }
-
-        if (_channel_ready && !_channel.is_closed()) {
-            _channel.shutdown_input();
-        }
+        request_stop();
 
         co_await _task_gate.close();
 
-        if (_channel_ready && !_channel.is_closed()) {
-            _channel.shutdown_output();
-            _channel.close();
-        }
-
-        _conns.clear();
-        _by_dcid.clear();
-        _accepted.clear();
-        if (_cred) {
-            gnutls_certificate_free_credentials(_cred);
-            _cred = nullptr;
-        }
-
+        cleanup_resources();
         _started = false;
         _stopping = false;
-        _channel_ready = false;
         quic_server_log.info("server stop complete");
     }
 
@@ -899,6 +882,40 @@ public:
         return _stopping;
     }
 
+    void request_stop() noexcept {
+        request_stop_impl(false);
+    }
+
+    void request_stop_detached() noexcept {
+        request_stop_impl(true);
+    }
+
+private:
+    void request_stop_impl(bool detached) noexcept {
+        if (!_started || _stopping) {
+            return;
+        }
+
+        if (detached) {
+            quic_server_log.warn("quic_server destroyed or orphaned without awaiting stop(); shutting down detached");
+        }
+        _stopping = true;
+        _accept_cv.broadcast();
+
+        auto conns_copy = _conns;
+        for (auto& conn : conns_copy) {
+            conn->stop_transport();
+        }
+
+        if (_channel_ready && !_channel.is_closed()) {
+            try {
+                _channel.shutdown_input();
+            } catch (...) {
+            }
+        }
+    }
+
+public:
     net::datagram_channel& channel() {
         return _channel;
     }
@@ -957,6 +974,28 @@ public:
     }
 
 private:
+    void cleanup_resources() noexcept {
+        if (_channel_ready && !_channel.is_closed()) {
+            try {
+                _channel.shutdown_output();
+            } catch (...) {
+            }
+            try {
+                _channel.close();
+            } catch (...) {
+            }
+        }
+
+        _conns.clear();
+        _by_dcid.clear();
+        _accepted.clear();
+        if (_cred) {
+            gnutls_certificate_free_credentials(_cred);
+            _cred = nullptr;
+        }
+        _channel_ready = false;
+    }
+
     friend struct server_connection;
 
     static ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref) {
@@ -1000,16 +1039,17 @@ private:
         if (!conn || !conn->runtime) {
             return 0;
         }
+        auto server = conn->lock_server();
         conn->handshake_done = true;
         sync_current_path(*conn);
         conn->runtime->mark_transport_ready(
           to_socket_address(ngtcp2_conn_get_path(conn->conn)->local).value_or(
-            conn->server ? conn->server->listen_address() : socket_address{}),
+            server ? server->listen_address() : socket_address{}),
           conn->peer,
           selected_alpn_or_empty(conn->tls));
-        if (!conn->accepted_to_listener && conn->server && conn->engine) {
+        if (!conn->accepted_to_listener && server && conn->engine) {
             conn->accepted_to_listener = true;
-            conn->server->enqueue_accepted_session(conn->engine);
+            server->enqueue_accepted_session(conn->engine);
         }
         quic_server_log.info("server handshake completed: peer={} alpn='{}'", conn->peer, conn->runtime->selected_alpn());
         conn->wake_actor();
@@ -1056,16 +1096,17 @@ private:
 
     static int dcid_status_cb(ngtcp2_conn*, ngtcp2_connection_id_status_type type, uint64_t, const ngtcp2_cid* cid, const uint8_t*, void* user_data) {
         auto* conn = static_cast<server_connection*>(user_data);
-        if (!conn || !conn->server || !cid) {
+        auto server = conn ? conn->lock_server() : nullptr;
+        if (!conn || !server || !cid) {
             return 0;
         }
         auto self = conn->shared_from_this();
         if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_ACTIVATE) {
             quic_server_log.debug("server dcid activate: peer={} len={}", conn->peer, cid->datalen);
-            conn->server->map_dcid(self, cid->data, cid->datalen);
+            server->map_dcid(self, cid->data, cid->datalen);
         } else if (type == NGTCP2_CONNECTION_ID_STATUS_TYPE_DEACTIVATE) {
             quic_server_log.debug("server dcid deactivate: peer={} len={}", conn->peer, cid->datalen);
-            conn->server->unmap_dcid(self, cid->data, cid->datalen);
+            server->unmap_dcid(self, cid->data, cid->datalen);
         }
         return 0;
     }
@@ -1080,10 +1121,11 @@ private:
         quic_server_log.trace("server recv_stream_data: peer={} sid={} bytes={}", conn->peer, sid, datalen);
         auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
         auto peer_initiated = !ngtcp2_conn_is_local_stream(ngconn, sid);
-        auto tb = copy_or_share_stream_payload(conn->current_rx_packet, data, datalen, *conn->stats);
+        temporary_buffer<char> tb(datalen);
+        if (datalen) {
+            std::memcpy(tb.get_write(), data, datalen);
+        }
         conn->engine->on_stream_data(sid, type, peer_initiated, std::move(tb), (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
-        ngtcp2_conn_extend_max_stream_offset(ngconn, sid, datalen);
-        ngtcp2_conn_extend_max_offset(ngconn, datalen);
         return 0;
     }
 
@@ -1109,23 +1151,13 @@ private:
         return 0;
     }
 
-    static int stream_close_cb(ngtcp2_conn* ngconn, uint32_t, int64_t sid, uint64_t, void* user_data, void*) {
+    static int stream_close_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t, void* user_data, void*) {
         auto* conn = static_cast<server_connection*>(user_data);
-        if (!conn || !conn->engine || !ngconn) {
+        if (!conn || !conn->engine) {
             return 0;
         }
 
         conn->engine->on_stream_closed(sid);
-
-        if (ngtcp2_conn_is_local_stream(ngconn, sid)) {
-            return 0;
-        }
-
-        if (ngtcp2_is_bidi_stream(sid)) {
-            ngtcp2_conn_extend_max_streams_bidi(ngconn, 1);
-        } else {
-            ngtcp2_conn_extend_max_streams_uni(ngconn, 1);
-        }
         return 0;
     }
 
@@ -1197,15 +1229,15 @@ private:
     conn_ptr init_connection(const socket_address& peer, const uint8_t* pkt, size_t pkt_len) {
         quic_server_log.info("server init_connection: peer={} first_packet_bytes={}", peer, pkt_len);
         auto conn = make_lw_shared<server_connection>();
-        conn->server = this;
+        conn->server = shared_from_this();
         conn->runtime = internal::make_session_runtime(_cfg.session_options);
-        conn->engine = internal::make_connection_engine(conn->runtime, _cfg.session_options, conn->stats);
+        conn->engine = internal::make_connection_engine(conn->runtime, _cfg.session_options);
         conn->runtime->set_command_notifier([raw = conn.get()] {
             raw->wake_actor();
         });
         conn->peer = peer;
-        to_sockaddr_storage_v6(_listen_address, conn->local_ss, conn->local_ss_len);
-        to_sockaddr_storage_v6(peer, conn->peer_ss, conn->peer_ss_len);
+        to_sockaddr_storage(_listen_address, conn->local_ss, conn->local_ss_len);
+        to_sockaddr_storage(peer, conn->peer_ss, conn->peer_ss_len);
         conn->tls = make_tls_session(*conn);
 
         ngtcp2_version_cid vc{};
@@ -1252,19 +1284,29 @@ private:
 
         ngtcp2_settings settings{};
         ngtcp2_settings_default(&settings);
-        settings.cc_algo = to_ngtcp2_cc_algo(_cfg.session_options.transport.congestion_control);
         settings.initial_ts = now_ns();
-        settings.max_window = _cfg.session_options.transport.max_window;
-        settings.max_stream_window = _cfg.session_options.transport.max_stream_window;
-        settings.ack_thresh = _cfg.session_options.transport.ack_thresh;
-        if (_cfg.session_options.transport.initial_rtt_ns > 0) {
-            settings.initial_rtt = _cfg.session_options.transport.initial_rtt_ns;
+        if (_cfg.session_options.transport.initial_rtt_ns
+            && *_cfg.session_options.transport.initial_rtt_ns > 0) {
+            settings.initial_rtt = *_cfg.session_options.transport.initial_rtt_ns;
         }
-        settings.max_tx_udp_payload_size = normalize_udp_payload_size(
-          _cfg.session_options.transport.max_tx_udp_payload_size,
-          default_max_tx_udp_payload_size);
+        if (_cfg.session_options.transport.max_tx_udp_payload_size) {
+            settings.max_tx_udp_payload_size = *_cfg.session_options.transport.max_tx_udp_payload_size;
+        }
+        if (_cfg.session_options.transport.max_window) {
+            settings.max_window = *_cfg.session_options.transport.max_window;
+        }
+        if (_cfg.session_options.transport.max_stream_window) {
+            settings.max_stream_window = *_cfg.session_options.transport.max_stream_window;
+        }
+        if (_cfg.session_options.transport.ack_thresh) {
+            settings.ack_thresh = *_cfg.session_options.transport.ack_thresh;
+        }
+        if (_cfg.session_options.transport.congestion_control) {
+            settings.cc_algo = to_ngtcp2_cc_algo(*_cfg.session_options.transport.congestion_control);
+        }
         settings.no_tx_udp_payload_size_shaping =
           _cfg.session_options.transport.disable_tx_udp_payload_size_shaping ? 1 : 0;
+        settings.no_pmtud = _cfg.session_options.transport.disable_pmtud ? 1 : 0;
 
         ngtcp2_transport_params params{};
         ngtcp2_transport_params_default(&params);
@@ -1280,9 +1322,9 @@ private:
         params.initial_max_streams_bidi = _cfg.session_options.transport.initial_max_streams_bidi;
         params.initial_max_streams_uni = _cfg.session_options.transport.initial_max_streams_uni;
         params.max_idle_timeout = _cfg.session_options.transport.max_idle_timeout_ns;
-        params.max_udp_payload_size = normalize_udp_payload_size(
-          _cfg.session_options.transport.max_udp_payload_size,
-          max_udp_payload_size);
+        if (_cfg.session_options.transport.max_udp_payload_size) {
+            params.max_udp_payload_size = *_cfg.session_options.transport.max_udp_payload_size;
+        }
         params.disable_active_migration = 1;
 
         ngtcp2_path path{};
@@ -1307,35 +1349,34 @@ private:
 
         auto payload = ngtcp2_conn_get_path_max_tx_udp_payload_size(conn->conn);
         if (payload == 0) {
-            payload = ngtcp2_conn_get_max_tx_udp_payload_size(conn->conn);
+            payload = default_udp_payload_size;
         }
-        payload = normalize_udp_payload_size(payload, default_udp_payload_size);
+        if (payload > max_udp_payload_size) {
+            payload = max_udp_payload_size;
+        }
         conn->tx_payload_limit = payload;
-        conn->stats->negotiated_tx_payload_limit = conn->tx_payload_limit;
 
         map_dcid(conn, odcid.data, odcid.datalen);
         map_dcid(conn, scid.data, scid.datalen);
         _conns.push_back(conn);
         quic_server_log.info(
-          "server connection initialized: peer={} tx_payload_limit={} max_tx_udp_payload_size={} max_udp_payload_size={} tx_payload_shaping_disabled={} active_conns={} odcid_len={} scid_len={}",
+          "server connection initialized: peer={} tx_payload_limit={} active_conns={} odcid_len={} scid_len={}",
           conn->peer,
           conn->tx_payload_limit,
-          settings.max_tx_udp_payload_size,
-          params.max_udp_payload_size,
-          bool(settings.no_tx_udp_payload_size_shaping),
           _conns.size(),
           odcid.datalen,
           scid.datalen);
 
-        (void)with_gate(_task_gate, [conn] { return conn_actor_loop(conn); })
-          .handle_exception([conn](std::exception_ptr) {
+        auto self = shared_from_this();
+        (void)with_gate(_task_gate, [self, conn] { return conn_actor_loop(conn); })
+          .handle_exception([self, conn](std::exception_ptr) {
               conn->closing = true;
               conn->abort_event_queues("server actor loop failed");
               if (conn->runtime && conn->runtime->is_open()) {
                   conn->runtime->mark_error(quic_error::io, "server actor loop failed");
               }
-              if (conn->server) {
-                  conn->server->unregister_connection(conn);
+              if (auto server = conn->lock_server()) {
+                  server->unregister_connection(conn);
               }
           })
           .or_terminate();
@@ -1344,20 +1385,15 @@ private:
 
     static future<> flush_pending_packets_actor(conn_ptr conn) {
         co_await internal::flush_pending_transport_packets(*conn);
-        if (conn->has_queued_datagram_packets()) {
-            co_await conn->flush_datagram_packets();
-        }
     }
 
     static future<> conn_actor_loop(conn_ptr conn) {
-        co_await internal::run_connection_actor(*conn, *conn);
+        co_await internal::run_connection_actor(*conn);
     }
 
     void handle_datagram(net::datagram d) {
         auto src = d.get_src();
-        auto bufs = d.get_buffers();
-        const bool was_linearized = bufs.size() > 1;
-        auto pkt = linearize_packet(bufs);
+        auto pkt = linearize_packet(d.get_buffers());
         const auto* data = reinterpret_cast<const uint8_t*>(pkt.get());
         const size_t len = pkt.size();
         quic_server_log.trace("server received datagram: src={} bytes={}", src, len);
@@ -1394,12 +1430,6 @@ private:
         }
 
         try {
-            if (was_linearized) {
-                ++conn->stats->rx_linearized_packets;
-                conn->stats->rx_linearized_bytes += len;
-            }
-            ++conn->stats->rx_packets;
-            conn->stats->rx_bytes += len;
             if (!conn->rx_queue.push(conn_rx_event{src, std::move(pkt)})) {
                 quic_server_log.warn("server rx queue full: peer={} queued={} max={}", conn->peer, conn->rx_queue.size(), conn->rx_queue.max_size());
                 conn->fail(quic_error::io, "server rx queue is full");
@@ -1453,68 +1483,26 @@ private:
 };
 
 bool server_connection::active() const noexcept {
-    return !closing && runtime && runtime->is_open() && server;
+    return !closing && runtime && !server.expired();
 }
 
-future<> server_connection::send_datagram_packet(temporary_buffer<char> packet, size_t packet_size) {
-    if (packet_size && !packet.empty()) {
-        tx_datagram_queue.emplace_back(queued_datagram_packet{
-          .storage = std::move(packet),
-          .size = packet_size,
-        });
-    } else {
-        recycle_tx_packet_buffer(std::move(packet));
-    }
-    return make_ready_future<>();
-}
-
-future<> server_connection::flush_datagram_packets() {
-    if (tx_datagram_queue.empty()) {
+future<> server_connection::send_datagram_packet(temporary_buffer<char> packet) {
+    auto server_state = lock_server();
+    if (!server_state) {
         co_return;
     }
-
-    static constexpr size_t max_batch = 64;
-
-    while (!tx_datagram_queue.empty()) {
-        temporary_buffer<char> views[max_batch];
-        temporary_buffer<char> storages[max_batch];
-        size_t count = 0;
-
-        while (!tx_datagram_queue.empty() && count < max_batch) {
-            auto packet = std::move(tx_datagram_queue.front());
-            tx_datagram_queue.pop_front();
-            views[count] = packet.storage.share(0, packet.size);
-            ++stats->tx_packets;
-            stats->tx_bytes += packet.size;
-            storages[count] = std::move(packet.storage);
-            ++count;
-        }
-
-        co_await server->channel().send_datagrams(peer, std::span<temporary_buffer<char>>(views, count));
-
-        for (size_t i = 0; i < count; ++i) {
-            recycle_tx_packet_buffer(std::move(storages[i]));
-        }
-    }
+    co_await send_datagram(server_state->channel(), peer, std::move(packet));
 }
 
 bool server_connection::can_send_connection_close() const noexcept {
-    return conn && server && !server->channel().is_closed();
+    auto server_state = lock_server();
+    return conn && server_state && !server_state->channel().is_closed();
 }
 
 future<> server_connection::actor_handle_next_rx_event() {
-    if (rx_queue.empty()) {
-        co_return;
-    }
     auto evt = rx_queue.pop();
-    current_rx_packet = evt.packet.share();
-    try {
-        co_await internal::recv_transport_datagram(*this, evt.src, std::move(evt.packet));
-    } catch (...) {
-        current_rx_packet = {};
-        throw;
-    }
-    current_rx_packet = {};
+    co_await internal::recv_transport_datagram(*this, evt.src, std::move(evt.packet));
+    request_blocked_send_retry();
 }
 
 future<> server_connection::actor_handle_stop_request() {
@@ -1522,9 +1510,9 @@ future<> server_connection::actor_handle_stop_request() {
     auto stop_error_local = stop_error;
     auto stop_error_detail_local = stop_error_detail;
     stop_requested = false;
+    discard_blocked_send();
 
     co_await internal::send_connection_close(*this);
-    log_transport_stats(stop_error_local ? "failed" : "stopped");
 
     closing = true;
     abort_event_queues(stop_error_local ? "server connection failed" : "server connection stopped");
@@ -1542,13 +1530,14 @@ future<> server_connection::actor_handle_stop_request() {
             engine->on_transport_closed(std::make_exception_ptr(quic_exception(quic_error::closed, "server connection stopped")));
         }
     }
-    if (server) {
-        server->unregister_connection(self);
+    if (auto server_state = lock_server()) {
+        server_state->unregister_connection(self);
     }
 }
 
 future<> server_connection::actor_handle_timer_tick() {
     co_await internal::handle_transport_timer(*this);
+    request_blocked_send_retry();
 }
 
 void server_connection::stop_transport() {
@@ -1558,6 +1547,7 @@ void server_connection::stop_transport() {
     }
     stop_requested = true;
     fail_blocked_open_streams(quic_error::closed, "server connection stopped");
+    discard_blocked_send();
     if (engine) {
         engine->on_transport_closed(std::make_exception_ptr(quic_exception(quic_error::closed, "server connection stopped")));
     }
@@ -1581,6 +1571,7 @@ void server_connection::fail(quic_error error, const sstring& detail) {
         stop_error_detail = detail;
     }
     fail_blocked_open_streams(error, detail);
+    discard_blocked_send();
     if (engine) {
         engine->on_transport_closed(std::make_exception_ptr(quic_exception(error, detail)));
     }
@@ -1599,10 +1590,14 @@ class quic_server::impl final : public quic_server_impl {
 };
 
 quic_server::quic_server()
-    : _impl(std::make_unique<impl>()) {
+    : _impl(std::make_shared<impl>()) {
 }
 
-quic_server::~quic_server() = default;
+quic_server::~quic_server() {
+    if (_impl) {
+        _impl->request_stop_detached();
+    }
+}
 quic_server::quic_server(quic_server&&) noexcept = default;
 quic_server& quic_server::operator=(quic_server&&) noexcept = default;
 

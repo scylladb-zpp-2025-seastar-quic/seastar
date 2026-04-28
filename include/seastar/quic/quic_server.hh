@@ -54,7 +54,7 @@ public:
 
 private:
     class impl;
-    std::unique_ptr<impl> _impl;
+    std::shared_ptr<impl> _impl;
 };
 
 } // namespace seastar::quic::experimental

@@ -25,7 +25,6 @@
 #include <cstring>
 #include <deque>
 #include <exception>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -39,7 +38,6 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/util/later.hh>
 #include <seastar/net/stack.hh>
 
 namespace seastar::quic::experimental {
@@ -53,18 +51,36 @@ uint64_t transport_now_ns() {
     return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-future<> flush_transport_batch(connection_transport& transport, bool rearm_timer = true) {
-    if (!transport.has_transport_connection()) {
-        co_return;
+temporary_buffer<char> coalesce_buffers(std::span<temporary_buffer<char>> bufs) {
+    if (bufs.empty()) {
+        return temporary_buffer<char>();
+    }
+    if (bufs.size() == 1) {
+        return std::move(bufs.front());
     }
 
-    co_await flush_pending_transport_packets(transport);
-    if (transport.has_queued_datagram_packets()) {
-        co_await transport.flush_datagram_packets();
+    size_t total = 0;
+    for (const auto& buf : bufs) {
+        total += buf.size();
     }
-    if (rearm_timer) {
-        transport.rearm_transport_timer();
+
+    temporary_buffer<char> merged(total);
+    auto* dst = merged.get_write();
+    size_t offset = 0;
+    for (auto& buf : bufs) {
+        std::memcpy(dst + offset, buf.get(), buf.size());
+        offset += buf.size();
     }
+    return merged;
+}
+
+temporary_buffer<char>& ensure_tx_packet_buffer(connection_transport& transport) {
+    auto required = transport.tx_payload_limit_bytes();
+    auto& scratch = transport.tx_packet_buffer();
+    if (scratch.size() < required) {
+        scratch = temporary_buffer<char>(required);
+    }
+    return scratch;
 }
 
 } // namespace
@@ -106,21 +122,19 @@ class stream_state final : public enable_shared_from_this<stream_state> {
     class source_impl;
     class sink_impl;
 
-    public:
-        stream_state(
-          session_runtime_ptr runtime,
-          std::shared_ptr<transport_debug_stats> debug_stats,
-          shared_ptr<receive_budget> receive_budget,
-          stream_id sid,
-          stream_type type,
-          bool peer_initiated)
-            : _runtime(std::move(runtime))
-            , _debug_stats(std::move(debug_stats))
-            , _receive_budget(std::move(receive_budget))
-            , _id(sid)
-            , _type(type)
-            , _can_read(type == stream_type::bidirectional || peer_initiated)
-            , _can_write(type == stream_type::bidirectional || !peer_initiated) {
+public:
+    stream_state(
+      session_runtime_ptr runtime,
+      shared_ptr<receive_budget> receive_budget,
+      stream_id sid,
+      stream_type type,
+      bool peer_initiated)
+        : _runtime(std::move(runtime))
+        , _receive_budget(std::move(receive_budget))
+        , _id(sid)
+        , _type(type)
+        , _can_read(type == stream_type::bidirectional || peer_initiated)
+        , _can_write(type == stream_type::bidirectional || !peer_initiated) {
         if (!_can_read) {
             notify_input_shutdown();
         }
@@ -182,6 +196,7 @@ class stream_state final : public enable_shared_from_this<stream_state> {
     void on_stop_sending_output(application_error_code app_error_code);
     void on_batch_flush_error() noexcept;
     void on_transport_closed();
+    void on_data_consumed(size_t size);
 
 private:
     future<> send_one(temporary_buffer<char> payload, bool fin);
@@ -245,17 +260,13 @@ private:
     }
 
     session_runtime_ptr _runtime;
-    std::shared_ptr<transport_debug_stats> _debug_stats;
     shared_ptr<receive_budget> _receive_budget;
     stream_id _id = invalid_stream_id;
     stream_type _type = stream_type::bidirectional;
     bool _can_read = true;
     bool _can_write = true;
 
-    // Receive backpressure is already enforced by _receive_budget in bytes.
-    // A small fixed fragment-count cap overflows single bidi streams when
-    // larger UDP payloads are enabled, even though the byte budget still has room.
-    queue<temporary_buffer<char>> _read_queue{std::numeric_limits<size_t>::max()};
+    queue<temporary_buffer<char>> _read_queue{1024};
     shared_promise<> _input_shutdown;
     bool _input_shutdown_notified = false;
     bool _output_closed = false;
@@ -287,7 +298,6 @@ public:
 
     session_runtime_ptr runtime;
     connection_options options;
-    std::shared_ptr<transport_debug_stats> debug_stats;
     queue<shared_ptr<stream_state>> accepted_streams;
     std::unordered_map<stream_id, shared_ptr<stream_state>> streams;
     shared_ptr<receive_budget> receive_window;
@@ -401,6 +411,13 @@ void stream_state::on_transport_closed() {
     abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::closed, "transport closed")));
 }
 
+void stream_state::on_data_consumed(size_t size) {
+    if (!size || !_runtime || _transport_closed || !_can_read || _input_shutdown_notified) {
+        return;
+    }
+    _runtime->consume_stream_data(_id, size);
+}
+
 class stream_state::source_impl final : public data_source_impl {
 public:
     explicit source_impl(shared_ptr<stream_state> state)
@@ -409,7 +426,9 @@ public:
 
     future<temporary_buffer<char>> get() override {
         auto buf = co_await _state->_read_queue.pop_eventually();
-        _state->release_read_bytes(buf.size());
+        auto consumed = buf.size();
+        _state->release_read_bytes(consumed);
+        _state->on_data_consumed(consumed);
         co_return std::move(buf);
     }
 
@@ -431,28 +450,7 @@ public:
         if (bufs.empty()) {
             return make_ready_future<>();
         }
-        size_t total = 0;
-        for (const auto& buf : bufs) {
-            total += buf.size();
-        }
-
-        if (bufs.size() > 1 && _state->_debug_stats) {
-            _state->_debug_stats->tx_copy_bytes += total;
-            ++_state->_debug_stats->tx_copy_events;
-        }
-
-        if (bufs.size() == 1) {
-            return _state->send_one(std::move(bufs.front()), false);
-        }
-
-        temporary_buffer<char> merged(total);
-        auto* dst = merged.get_write();
-        size_t offset = 0;
-        for (auto& buf : bufs) {
-            std::memcpy(dst + offset, buf.get(), buf.size());
-            offset += buf.size();
-        }
-        return _state->send_one(std::move(merged), false);
+        return _state->send_one(coalesce_buffers(bufs), false);
     }
 
     future<> close() override {
@@ -509,12 +507,8 @@ data_sink stream_state::sink() {
     return data_sink(std::make_unique<sink_impl>(shared_from_this()));
 }
 
-connection_engine::connection_engine(
-  session_runtime_ptr runtime,
-  connection_options options,
-  std::shared_ptr<transport_debug_stats> debug_stats)
+connection_engine::connection_engine(session_runtime_ptr runtime, connection_options options)
     : _impl(std::make_unique<impl>(std::move(runtime), std::move(options))) {
-    _impl->debug_stats = std::move(debug_stats);
 }
 
 connection_engine::~connection_engine() = default;
@@ -539,13 +533,7 @@ future<stream> connection_engine::open_stream(stream_open_options options) {
     auto sid = co_await _impl->runtime->open_stream(options.type);
     auto [it, inserted] = _impl->streams.emplace(sid, shared_ptr<stream_state>{});
     if (inserted || !it->second) {
-        it->second = seastar::make_shared<stream_state>(
-          _impl->runtime,
-          _impl->debug_stats,
-          _impl->receive_window,
-          sid,
-          options.type,
-          false);
+        it->second = make_shared<stream_state>(_impl->runtime, _impl->receive_window, sid, options.type, false);
     }
     auto st = it->second;
     co_return stream(std::move(st));
@@ -566,13 +554,7 @@ future<> connection_engine::close() {
 void connection_engine::on_stream_data(stream_id sid, stream_type type, bool peer_initiated, temporary_buffer<char> payload, bool fin) {
     auto [it, inserted] = _impl->streams.emplace(sid, shared_ptr<stream_state>{});
     if (inserted || !it->second) {
-        it->second = seastar::make_shared<stream_state>(
-          _impl->runtime,
-          _impl->debug_stats,
-          _impl->receive_window,
-          sid,
-          type,
-          peer_initiated);
+        it->second = make_shared<stream_state>(_impl->runtime, _impl->receive_window, sid, type, peer_initiated);
     }
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {
@@ -590,13 +572,7 @@ void connection_engine::on_stream_reset(
   application_error_code app_error_code) {
     auto [it, inserted] = _impl->streams.emplace(sid, shared_ptr<stream_state>{});
     if (inserted || !it->second) {
-        it->second = seastar::make_shared<stream_state>(
-          _impl->runtime,
-          _impl->debug_stats,
-          _impl->receive_window,
-          sid,
-          type,
-          peer_initiated);
+        it->second = make_shared<stream_state>(_impl->runtime, _impl->receive_window, sid, type, peer_initiated);
     }
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {
@@ -615,13 +591,7 @@ void connection_engine::on_stream_stop_sending(
   stream_shutdown_side shutdown_side) {
     auto [it, inserted] = _impl->streams.emplace(sid, shared_ptr<stream_state>{});
     if (inserted || !it->second) {
-        it->second = seastar::make_shared<stream_state>(
-          _impl->runtime,
-          _impl->debug_stats,
-          _impl->receive_window,
-          sid,
-          type,
-          peer_initiated);
+        it->second = make_shared<stream_state>(_impl->runtime, _impl->receive_window, sid, type, peer_initiated);
     }
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {
@@ -792,11 +762,8 @@ future<> flush_pending_transport_packets(connection_transport& transport) {
         co_return;
     }
 
-    temporary_buffer<char> outbuf;
+    auto& outbuf = ensure_tx_packet_buffer(transport);
     while (transport.transport_active()) {
-        if (!outbuf) {
-            outbuf = transport.acquire_tx_packet_buffer();
-        }
         auto nwrite = transport.write_pending_packet(
           reinterpret_cast<uint8_t*>(outbuf.get_write()),
           outbuf.size());
@@ -816,81 +783,111 @@ future<> flush_pending_transport_packets(connection_transport& transport) {
               ngtcp2_error_message(static_cast<int>(nwrite)));
             co_return;
         }
-        co_await transport.send_datagram_packet(std::move(outbuf), static_cast<size_t>(nwrite));
+        co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(nwrite)));
     }
 }
 
-future<> send_stream_message(connection_transport& transport, connection_actor& actor, blocked_send_state state) {
-    if (!transport.has_transport_connection() || state.msg.stream == invalid_stream_id) {
-        co_return;
+namespace {
+
+void complete_send_progress(connection_transport& transport, quic_message& msg, size_t consumed) {
+    if (!consumed) {
+        return;
+    }
+    if (consumed > msg.payload.size()) {
+        consumed = msg.payload.size();
+    }
+    transport.complete_send_bytes(consumed);
+    msg.payload.trim_front(consumed);
+}
+
+void discard_unsent_send_bytes(connection_transport& transport, quic_message& msg) {
+    if (msg.payload.empty()) {
+        return;
+    }
+    transport.complete_send_bytes(msg.payload.size());
+    msg.payload = temporary_buffer<char>();
+}
+
+} // namespace
+
+future<std::optional<quic_message>> send_stream_message(connection_transport& transport, quic_message msg) {
+    if (!transport.has_transport_connection() || !transport.transport_active() || msg.stream == invalid_stream_id) {
+        discard_unsent_send_bytes(transport, msg);
+        co_return std::nullopt;
     }
 
-    if (state.offset == 0 && state.msg.fin && !state.send_fin) {
-        state.send_fin = true;
-    }
+    bool send_fin = msg.fin;
+    auto& outbuf = ensure_tx_packet_buffer(transport);
 
-    temporary_buffer<char> outbuf;
     while (transport.transport_active()) {
-        if (!outbuf) {
-            outbuf = transport.acquire_tx_packet_buffer();
-        }
-        const bool remaining = state.offset < state.msg.payload.size();
-        if (!remaining && !state.send_fin) {
+        const bool remaining = !msg.payload.empty();
+        if (!remaining && !send_fin) {
             break;
         }
 
-        auto* ptr = remaining ? (state.msg.payload.get() + state.offset) : nullptr;
-        auto len = remaining ? (state.msg.payload.size() - state.offset) : 0;
+        auto* ptr = remaining ? msg.payload.get() : nullptr;
+        auto len = remaining ? msg.payload.size() : 0;
         auto result = transport.write_stream_packet(
-          state.msg.stream,
+          msg.stream,
           ptr,
           len,
-          state.send_fin,
+          send_fin,
           reinterpret_cast<uint8_t*>(outbuf.get_write()),
           outbuf.size());
 
         if (result.nwrite < 0) {
             if (ngtcp2_is_write_more(static_cast<int>(result.nwrite))) {
-                state.offset += result.consumed;
+                complete_send_progress(transport, msg, result.consumed);
                 co_await flush_pending_transport_packets(transport);
                 continue;
             }
             if (ngtcp2_is_draining(static_cast<int>(result.nwrite))) {
+                discard_unsent_send_bytes(transport, msg);
                 transport.stop_transport();
-                co_return;
+                co_return std::nullopt;
             }
             if (result.nwrite == NGTCP2_ERR_STREAM_SHUT_WR || result.nwrite == NGTCP2_ERR_STREAM_NOT_FOUND) {
-                transport.on_stream_write_closed(state.msg.stream);
-                co_return;
+                complete_send_progress(transport, msg, result.consumed);
+                discard_unsent_send_bytes(transport, msg);
+                transport.on_stream_write_closed(msg.stream);
+                co_await flush_pending_transport_packets(transport);
+                transport.rearm_transport_timer();
+                co_return std::nullopt;
             }
-            if (result.nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
-                ++transport.debug_stats().tx_blocked_events;
-                co_await flush_transport_batch(transport);
-                actor.actor_defer_blocked_send(std::move(state));
-                co_return;
-            }
+            discard_unsent_send_bytes(transport, msg);
             transport.fail_transport(
               classify_ngtcp2_error(static_cast<int>(result.nwrite)),
               ngtcp2_error_message(static_cast<int>(result.nwrite)));
-            co_return;
+            co_return std::nullopt;
         }
+        complete_send_progress(transport, msg, result.consumed);
         if (result.nwrite == 0) {
-            ++transport.debug_stats().tx_zero_write_events;
-            co_await flush_transport_batch(transport);
-            actor.actor_defer_blocked_send(std::move(state));
-            co_return;
+            co_await flush_pending_transport_packets(transport);
+            transport.rearm_transport_timer();
+            msg.fin = send_fin;
+            co_return std::make_optional(std::move(msg));
         }
 
-        state.offset += result.consumed;
-        if (!remaining && state.send_fin) {
-            state.send_fin = false;
+        if (!remaining && send_fin) {
+            send_fin = false;
         }
-        co_await transport.send_datagram_packet(std::move(outbuf), static_cast<size_t>(result.nwrite));
+        co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(result.nwrite)));
 
-        if (state.offset >= state.msg.payload.size() && !state.send_fin) {
+        if (msg.payload.empty() && !send_fin) {
             break;
         }
     }
+
+    if ((!transport.transport_active() || !transport.has_transport_connection())
+        && (!msg.payload.empty() || send_fin)) {
+        discard_unsent_send_bytes(transport, msg);
+        send_fin = false;
+    }
+
+    co_await flush_pending_transport_packets(transport);
+    transport.rearm_transport_timer();
+    msg.fin = false;
+    co_return std::nullopt;
 }
 
 future<bool> open_stream(connection_transport& transport, transport_command cmd) {
@@ -901,11 +898,15 @@ future<bool> open_stream(connection_transport& transport, transport_command cmd)
     auto result = transport.try_open_stream(cmd.type);
     if (result.rv == 0) {
         transport.complete_open_stream(cmd.open_result, result.sid);
+        co_await flush_pending_transport_packets(transport);
+        transport.rearm_transport_timer();
         co_return false;
     }
 
     if (result.rv == NGTCP2_ERR_STREAM_ID_BLOCKED) {
         transport.defer_blocked_open_stream(std::move(cmd));
+        co_await flush_pending_transport_packets(transport);
+        transport.rearm_transport_timer();
         co_return true;
     }
 
@@ -914,6 +915,21 @@ future<bool> open_stream(connection_transport& transport, transport_command cmd)
     transport.fail_open_stream(cmd.open_result, error, detail);
     transport.fail_transport(error, detail);
     co_return false;
+}
+
+future<> consume_stream_data(connection_transport& transport, stream_id sid, size_t len) {
+    if (!transport.has_transport_connection() || sid == invalid_stream_id || !len) {
+        co_return;
+    }
+
+    auto rv = transport.consume_stream_data(sid, len);
+    if (rv < 0) {
+        transport.fail_transport(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+        co_return;
+    }
+
+    co_await flush_pending_transport_packets(transport);
+    transport.rearm_transport_timer();
 }
 
 future<> reset_stream(connection_transport& transport, stream_id sid, application_error_code app_error_code) {
@@ -925,6 +941,8 @@ future<> reset_stream(connection_transport& transport, stream_id sid, applicatio
         transport.fail_transport(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
         co_return;
     }
+    co_await flush_pending_transport_packets(transport);
+    transport.rearm_transport_timer();
 }
 
 future<> stop_sending(connection_transport& transport, stream_id sid, application_error_code app_error_code) {
@@ -936,6 +954,8 @@ future<> stop_sending(connection_transport& transport, stream_id sid, applicatio
         transport.fail_transport(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
         co_return;
     }
+    co_await flush_pending_transport_packets(transport);
+    transport.rearm_transport_timer();
 }
 
 future<> retry_blocked_open_streams(connection_transport& transport, stream_type type) {
@@ -956,17 +976,21 @@ future<> retry_blocked_open_streams(connection_transport& transport, stream_type
     }
 }
 
-future<> handle_transport_command(connection_transport& transport, connection_actor& actor, transport_command cmd) {
+future<std::optional<transport_command>> handle_transport_command(connection_transport& transport, transport_command cmd) {
     switch (cmd.op) {
     case transport_command::kind::send: {
-        blocked_send_state state;
-        state.send_fin = cmd.msg.fin;
-        state.msg = std::move(cmd.msg);
-        co_await send_stream_message(transport, actor, std::move(state));
+        auto blocked = co_await send_stream_message(transport, std::move(cmd.msg));
+        if (blocked) {
+            cmd.msg = std::move(*blocked);
+            co_return std::make_optional(std::move(cmd));
+        }
         break;
     }
     case transport_command::kind::open_stream:
         (void)co_await open_stream(transport, std::move(cmd));
+        break;
+    case transport_command::kind::consume_stream_data:
+        co_await consume_stream_data(transport, cmd.msg.stream, cmd.consumed_bytes);
         break;
     case transport_command::kind::reset_stream:
         co_await reset_stream(transport, cmd.msg.stream, cmd.app_error_code);
@@ -978,6 +1002,7 @@ future<> handle_transport_command(connection_transport& transport, connection_ac
         transport.request_close();
         break;
     }
+    co_return std::nullopt;
 }
 
 future<> recv_transport_datagram(connection_transport& transport, const socket_address& src, temporary_buffer<char> pkt) {
@@ -996,6 +1021,8 @@ future<> recv_transport_datagram(connection_transport& transport, const socket_a
     }
 
     transport.sync_transport_path();
+    co_await flush_pending_transport_packets(transport);
+    transport.rearm_transport_timer();
 }
 
 future<> handle_transport_timer(connection_transport& transport) {
@@ -1015,6 +1042,9 @@ future<> handle_transport_timer(connection_transport& transport) {
             co_return;
         }
     }
+
+    co_await flush_pending_transport_packets(transport);
+    transport.rearm_transport_timer();
 }
 
 future<> send_connection_close(connection_transport& transport) {
@@ -1022,7 +1052,7 @@ future<> send_connection_close(connection_transport& transport) {
         co_return;
     }
 
-    auto outbuf = transport.acquire_tx_packet_buffer();
+    auto& outbuf = ensure_tx_packet_buffer(transport);
     auto nwrite = transport.write_connection_close_packet(
       reinterpret_cast<uint8_t*>(outbuf.get_write()),
       outbuf.size());
@@ -1030,11 +1060,10 @@ future<> send_connection_close(connection_transport& transport) {
         co_return;
     }
 
-    co_await transport.send_datagram_packet(std::move(outbuf), static_cast<size_t>(nwrite));
-    co_await transport.flush_datagram_packets();
+    co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(nwrite)));
 }
 
-future<> run_connection_actor(connection_transport& transport, connection_actor& actor) {
+future<> run_connection_actor(connection_actor& actor) {
     constexpr size_t actor_batch_limit = 64;
 
     while (actor.actor_active()) {
@@ -1050,6 +1079,11 @@ future<> run_connection_actor(connection_transport& transport, connection_actor&
             co_return;
         }
 
+        if (actor.actor_transport_terminal()) {
+            co_await actor.actor_handle_transport_terminal();
+            continue;
+        }
+
         size_t rx_processed = 0;
         while (actor.actor_active()
                && !actor.actor_stop_requested()
@@ -1059,19 +1093,9 @@ future<> run_connection_actor(connection_transport& transport, connection_actor&
             ++rx_processed;
         }
 
-        if (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_tick_pending()) {
-            actor.actor_clear_tick();
-            co_await actor.actor_handle_timer_tick();
-        }
-
-        if (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_has_blocked_send()) {
-            co_await actor.actor_handle_blocked_send();
-        }
-
         size_t commands_processed = 0;
         while (actor.actor_active()
                && !actor.actor_stop_requested()
-               && !actor.actor_has_blocked_send()
                && actor.actor_has_transport_command()
                && commands_processed < actor_batch_limit) {
             co_await actor.actor_handle_next_transport_command();
@@ -1082,8 +1106,9 @@ future<> run_connection_actor(connection_transport& transport, connection_actor&
             co_await actor.actor_retry_blocked_open_streams();
         }
 
-        if (actor.actor_active() && !actor.actor_stop_requested()) {
-            co_await flush_transport_batch(transport);
+        if (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_tick_pending()) {
+            actor.actor_clear_tick();
+            co_await actor.actor_handle_timer_tick();
         }
 
         if (actor.actor_active()
@@ -1095,14 +1120,8 @@ future<> run_connection_actor(connection_transport& transport, connection_actor&
     }
 }
 
-connection_engine_ptr make_connection_engine(
-  session_runtime_ptr runtime,
-  connection_options options,
-  std::shared_ptr<transport_debug_stats> debug_stats) {
-    return seastar::make_shared<connection_engine>(
-      std::move(runtime),
-      std::move(options),
-      std::move(debug_stats));
+connection_engine_ptr make_connection_engine(session_runtime_ptr runtime, connection_options options) {
+    return make_shared<connection_engine>(std::move(runtime), std::move(options));
 }
 
 } // namespace internal

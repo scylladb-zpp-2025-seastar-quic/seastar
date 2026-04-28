@@ -86,6 +86,32 @@ public:
         co_return co_await result->get_future();
     }
 
+    void complete_send_bytes(size_t len) override {
+        if (!len) {
+            return;
+        }
+        if (len >= _pending_send_bytes) {
+            _pending_send_bytes = 0;
+        } else {
+            _pending_send_bytes -= len;
+        }
+        _command_space_cv.broadcast();
+    }
+
+    void consume_stream_data(stream_id sid, size_t len) override {
+        if (!len || sid == invalid_stream_id || _error != quic_error::none || _closed || _closing) {
+            return;
+        }
+        _commands.emplace_back(transport_command{
+          .op = transport_command::kind::consume_stream_data,
+          .msg = internal::quic_message{
+            .stream = sid,
+          },
+          .consumed_bytes = len,
+        });
+        notify_command_ready();
+    }
+
     future<> reset_stream(stream_id sid, application_error_code app_error_code) override {
         throw_if_terminal("reset_stream");
         _commands.emplace_back(transport_command{
@@ -135,21 +161,11 @@ public:
         }
         auto cmd = std::move(_commands.front());
         _commands.pop_front();
-        if (_commands.empty()) {
-            _command_ready_notification_pending = false;
-        }
-        if (cmd.op == transport_command::kind::send) {
-            _pending_send_bytes -= cmd.msg.payload.size();
-            _command_space_cv.signal();
-        }
         return cmd;
     }
 
     void set_command_notifier(std::function<void()> notifier) override {
         _command_notifier = std::move(notifier);
-        if (_command_notifier && _command_ready_notification_pending) {
-            _command_notifier();
-        }
     }
 
     void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override {
@@ -176,6 +192,7 @@ public:
         }
         _closed = true;
         drain_pending_open_streams(std::make_exception_ptr(quic_exception(quic_error::closed, "transport closed")));
+        notify_command_ready();
         notify_terminal_waiters();
     }
 
@@ -187,7 +204,24 @@ public:
         _error_detail = std::move(detail);
         _closed = true;
         drain_pending_open_streams(std::make_exception_ptr(quic_exception(_error, _error_detail)));
+        notify_command_ready();
         notify_terminal_waiters();
+    }
+
+    bool transport_terminal() const noexcept override {
+        return _closed;
+    }
+
+    bool transport_failed() const noexcept override {
+        return _error != quic_error::none;
+    }
+
+    quic_error transport_error() const noexcept override {
+        return _error;
+    }
+
+    sstring transport_error_detail() const override {
+        return _error_detail;
     }
 
 private:
@@ -224,10 +258,6 @@ private:
     }
 
     void notify_command_ready() {
-        if (_command_ready_notification_pending) {
-            return;
-        }
-        _command_ready_notification_pending = true;
         if (_command_notifier) {
             _command_notifier();
         }
@@ -250,7 +280,6 @@ private:
     std::deque<transport_command> _commands;
     size_t _pending_send_bytes = 0;
     std::function<void()> _command_notifier;
-    bool _command_ready_notification_pending = false;
 
     condition_variable _command_space_cv;
 };

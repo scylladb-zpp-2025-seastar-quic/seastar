@@ -71,12 +71,7 @@ using us_t       = std::chrono::microseconds;
 static constexpr size_t throughput_buffer_size = 256 * 1024;
 static constexpr uint64_t throughput_stream_window = 8 * 1024 * 1024;
 static constexpr uint64_t throughput_connection_window = 64 * 1024 * 1024;
-static constexpr uint64_t throughput_max_stream_window = 16 * 1024 * 1024;
 static constexpr uint64_t throughput_stream_limit = 1024;
-static constexpr size_t throughput_ack_thresh = 8;
-static constexpr size_t throughput_udp_payload_size = 65527;
-static constexpr size_t throughput_tx_udp_payload_size = 4096;
-static constexpr uint64_t throughput_initial_rtt_ns = 0; // 0 = ngtcp2 default (333ms)
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -179,7 +174,7 @@ static future<> run_bidi_throughput_stream(
     result.messages_sent  += *msgs_tx;
 }
 
-// Throughput: unidirectional stream (client→server only).
+// Throughput: unidirectional stream (client->server only).
 // The server discards data; only TX throughput is measured.
 static future<> run_uni_throughput_stream(
         lw_shared_ptr<connection> conn,
@@ -388,7 +383,7 @@ static void print_latency(
     auto percentile_ms = [&](double p) -> double {
         size_t idx = static_cast<size_t>(p / 100.0 * static_cast<double>(count));
         if (idx >= count) { idx = count - 1; }
-        return static_cast<double>(samples[idx]) / 1000.0;  // µs → ms
+        return static_cast<double>(samples[idx]) / 1000.0;  // us -> ms
     };
 
     double mean_ms = static_cast<double>(
@@ -471,7 +466,7 @@ int main(int argc, char** argv) {
             const std::vector<char> msg(msg_size, 'Q');
             const auto flush_messages = resolve_throughput_flush_messages(flush_messages_cfg, msg_size);
 
-            // Base client config – each connection gets its own quic_client.
+            // Base client config - each connection gets its own quic_client.
             quic_client_config base_cfg;
             base_cfg.remote_address = parse_ipv6_address(address, port);
             base_cfg.server_name    = server_name;
@@ -488,12 +483,12 @@ int main(int argc, char** argv) {
             base_cfg.session_options.transport.initial_max_streams_bidi = throughput_stream_limit;
             base_cfg.session_options.transport.initial_max_streams_uni  = throughput_stream_limit;
             base_cfg.session_options.transport.max_window = throughput_connection_window;
-            base_cfg.session_options.transport.max_stream_window = throughput_max_stream_window;
-            base_cfg.session_options.transport.ack_thresh = throughput_ack_thresh;
-            base_cfg.session_options.transport.initial_rtt_ns = throughput_initial_rtt_ns;
+            base_cfg.session_options.transport.max_stream_window = 16 * 1024 * 1024;
+            base_cfg.session_options.transport.ack_thresh = 8;
+            base_cfg.session_options.transport.initial_rtt_ns = 0;
             base_cfg.session_options.transport.congestion_control = congestion_control_algorithm::bbr;
-            base_cfg.session_options.transport.max_udp_payload_size = throughput_udp_payload_size;
-            base_cfg.session_options.transport.max_tx_udp_payload_size = throughput_tx_udp_payload_size;
+            base_cfg.session_options.transport.max_udp_payload_size = 65527;
+            base_cfg.session_options.transport.max_tx_udp_payload_size = 4096;
             base_cfg.session_options.transport.disable_tx_udp_payload_size_shaping = true;
 
             const auto deadline = bm_clock::now() + std::chrono::seconds(dur_s);
@@ -519,21 +514,19 @@ int main(int argc, char** argv) {
                         run_connection_throughput(
                             base_cfg, n_streams, stype, msg, deadline, flush_messages, total));
                 }
-                auto conn_results = co_await when_all(conn_futs.begin(), conn_futs.end());
-                for (auto& f : conn_results) {
-                    try { f.get(); }
-                    catch (const std::exception& e) {
+
+                auto results = co_await when_all(conn_futs.begin(), conn_futs.end());
+                for (auto& f : results) {
+                    try {
+                        f.get();
+                    } catch (const std::exception& e) {
                         std::cerr << "[client] connection error: " << e.what() << "\n";
                     }
                 }
 
-                double elapsed = std::chrono::duration<double>(
+                const auto elapsed = std::chrono::duration<double>(
                     bm_clock::now() - bench_start).count();
                 print_throughput(total, elapsed, stype, n_conns, n_streams, msg_size);
-
-            // ------------------------------------------------------------------
-            // Latency benchmark
-            // ------------------------------------------------------------------
             } else {
                 latency_samples all_samples;
                 const auto bench_start = bm_clock::now();
@@ -542,22 +535,22 @@ int main(int argc, char** argv) {
                 conn_futs.reserve(n_conns);
                 for (int c = 0; c < n_conns; ++c) {
                     conn_futs.push_back(
-                        run_connection_latency(
-                            base_cfg, n_streams, msg, deadline, all_samples));
+                        run_connection_latency(base_cfg, n_streams, msg, deadline, all_samples));
                 }
-                auto conn_results = co_await when_all(conn_futs.begin(), conn_futs.end());
-                for (auto& f : conn_results) {
-                    try { f.get(); }
-                    catch (const std::exception& e) {
+
+                auto results = co_await when_all(conn_futs.begin(), conn_futs.end());
+                for (auto& f : results) {
+                    try {
+                        f.get();
+                    } catch (const std::exception& e) {
                         std::cerr << "[client] connection error: " << e.what() << "\n";
                     }
                 }
 
-                double elapsed = std::chrono::duration<double>(
+                const auto elapsed = std::chrono::duration<double>(
                     bm_clock::now() - bench_start).count();
                 print_latency(all_samples, elapsed, stype, n_conns, n_streams, msg_size);
             }
-
         } catch (...) {
             error = std::current_exception();
         }
@@ -572,6 +565,7 @@ int main(int argc, char** argv) {
             }
             co_return 1;
         }
+
         co_return 0;
     });
 }

@@ -79,9 +79,6 @@ seastar_add_demo (l3
 
 seastar_add_demo (rpc
   SOURCES rpc_demo.cc)
-  
-seastar_add_demo (rpc_quic_v1
-  SOURCES rpc_demo_quic_v1.cc)
 
 seastar_add_demo (scheduling_group
   SOURCES scheduling_group_demo.cc)
@@ -137,7 +134,6 @@ seastar_add_demo (quic_server
 
 seastar_add_demo (quic_client
   SOURCES quic_client_demo.cc)
-  
 
 seastar_add_demo (quic_bench_server
   SOURCES quic_bench_server.cc)

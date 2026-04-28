@@ -22,7 +22,7 @@
 // QUIC benchmark server.
 //
 // For bidirectional streams: echoes all received data back to the client.
-// For unidirectional streams (client→server): reads and discards all data.
+// For unidirectional streams (client->server): reads and discards all data.
 //
 // Prints throughput statistics every --stats-interval seconds.
 // Use alongside quic_bench_client to measure QUIC throughput and latency.
@@ -56,12 +56,7 @@ namespace bpo = boost::program_options;
 static constexpr size_t throughput_buffer_size = 256 * 1024;
 static constexpr uint64_t throughput_stream_window = 8 * 1024 * 1024;
 static constexpr uint64_t throughput_connection_window = 64 * 1024 * 1024;
-static constexpr uint64_t throughput_max_stream_window = 16 * 1024 * 1024;
 static constexpr uint64_t throughput_stream_limit = 1024;
-static constexpr size_t throughput_ack_thresh = 8;
-static constexpr size_t throughput_udp_payload_size = 65527;
-static constexpr size_t throughput_tx_udp_payload_size = 4096;
-static constexpr uint64_t throughput_initial_rtt_ns = 0; // 0 = ngtcp2 default (333ms)
 static size_t g_throughput_flush_bytes = throughput_buffer_size;
 
 static socket_address parse_ipv6_address(const std::string& ip, uint16_t port) {
@@ -118,7 +113,7 @@ static future<> handle_bidi_stream(seastar::quic::experimental::stream s) {
     ++g_stats.streams_completed;
 }
 
-// Drain all data on a unidirectional stream (client→server direction).
+// Drain all data on a unidirectional stream (client->server direction).
 static future<> handle_uni_stream(seastar::quic::experimental::stream s) {
     auto input = s.input();
     try {
@@ -270,12 +265,12 @@ int main(int argc, char** argv) {
             server_cfg.session_options.transport.initial_max_streams_bidi  = throughput_stream_limit;
             server_cfg.session_options.transport.initial_max_streams_uni   = throughput_stream_limit;
             server_cfg.session_options.transport.max_window = throughput_connection_window;
-            server_cfg.session_options.transport.max_stream_window = throughput_max_stream_window;
-            server_cfg.session_options.transport.ack_thresh = throughput_ack_thresh;
-            server_cfg.session_options.transport.initial_rtt_ns = throughput_initial_rtt_ns;
+            server_cfg.session_options.transport.max_stream_window = 16 * 1024 * 1024;
+            server_cfg.session_options.transport.ack_thresh = 8;
+            server_cfg.session_options.transport.initial_rtt_ns = 0;
             server_cfg.session_options.transport.congestion_control = congestion_control_algorithm::bbr;
-            server_cfg.session_options.transport.max_udp_payload_size = throughput_udp_payload_size;
-            server_cfg.session_options.transport.max_tx_udp_payload_size = throughput_tx_udp_payload_size;
+            server_cfg.session_options.transport.max_udp_payload_size = 65527;
+            server_cfg.session_options.transport.max_tx_udp_payload_size = 4096;
             server_cfg.session_options.transport.disable_tx_udp_payload_size_shaping = true;
 
             co_await server.start(std::move(server_cfg));
