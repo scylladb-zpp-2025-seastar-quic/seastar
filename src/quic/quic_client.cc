@@ -21,6 +21,9 @@
 
 #include <seastar/quic/quic_client.hh>
 
+#include "quic_common.hh"
+#include "quic_impl.hh"
+
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -66,113 +69,9 @@ struct tls_verification_failure {
     sstring detail;
 };
 
-class gnutls_global_guard {
-public:
-    gnutls_global_guard() {
-        gnutls_global_init();
-    }
-    ~gnutls_global_guard() {
-        gnutls_global_deinit();
-    }
-};
-
-void ensure_gnutls_global() {
-    static gnutls_global_guard guard;
-}
-
 ngtcp2_tstamp now_ns() {
     using namespace std::chrono;
     return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
-}
-
-int try_rand_bytes(uint8_t* dst, size_t len) noexcept {
-    return gnutls_rnd(GNUTLS_RND_RANDOM, dst, len);
-}
-
-[[noreturn]] void throw_random_failure(const char* context, int rv) {
-    throw quic_exception(
-      classify_gnutls_error(rv),
-      sstring(context) + ": " + gnutls_error_message(rv));
-}
-
-void rand_bytes_or_throw(uint8_t* dst, size_t len, const char* context) {
-    auto rv = try_rand_bytes(dst, len);
-    if (rv < 0) {
-        throw_random_failure(context, rv);
-    }
-}
-
-bool rand_bytes_or_log(uint8_t* dst, size_t len, const char* context) noexcept {
-    auto rv = try_rand_bytes(dst, len);
-    if (rv >= 0) {
-        return true;
-    }
-    quic_client_log.error("client random source failure: context={} detail='{}'", context, gnutls_error_message(rv));
-    return false;
-}
-
-void* mem_malloc(size_t size, void*) {
-    return std::malloc(size);
-}
-
-void mem_free(void* ptr, void*) {
-    std::free(ptr);
-}
-
-void* mem_calloc(size_t n, size_t s, void*) {
-    return std::calloc(n, s);
-}
-
-void* mem_realloc(void* ptr, size_t s, void*) {
-    return std::realloc(ptr, s);
-}
-
-const ngtcp2_mem* ngtcp2_mem_for_thread() {
-    thread_local const ngtcp2_mem mem = {
-      nullptr,
-      mem_malloc,
-      mem_free,
-      mem_calloc,
-      mem_realloc,
-    };
-    return &mem;
-}
-
-void init_ngtcp2_addr(ngtcp2_addr* addr, const sockaddr* sa, size_t len) {
-    addr->addr = const_cast<sockaddr*>(sa);
-    addr->addrlen = static_cast<socklen_t>(len);
-}
-
-void to_sockaddr_storage(const socket_address& sa, sockaddr_storage& out, socklen_t& outlen) {
-    std::memset(&out, 0, sizeof(out));
-    switch (sa.family()) {
-    case AF_INET: {
-        auto in = sa.as_posix_sockaddr_in();
-        std::memcpy(&out, &in, sizeof(in));
-        outlen = sizeof(in);
-        return;
-    }
-    case AF_INET6: {
-        auto in6 = sa.as_posix_sockaddr_in6();
-        std::memcpy(&out, &in6, sizeof(in6));
-        outlen = sizeof(in6);
-        return;
-    }
-    default:
-        throw_quic_error(quic_error::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
-    }
-}
-
-void validate_ip_socket_address(const socket_address& sa, std::string_view what) {
-    switch (sa.family()) {
-    case AF_INET:
-    case AF_INET6:
-        return;
-    default:
-        throw_quic_error(
-          quic_error::invalid_argument,
-          sstring(what) + " must be an IPv4 or IPv6 socket address");
-    }
 }
 
 socket_address wildcard_address_for_family(sa_family_t family) {
@@ -192,73 +91,18 @@ socket_address wildcard_address_for_family(sa_family_t family) {
     }
 }
 
-std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
-    if (!addr.addr || addr.addrlen == 0) {
+std::optional<congestion_control_algorithm> effective_congestion_control(const transport_config& cfg) {
+    if (!cfg.congestion_control) {
         return std::nullopt;
     }
-
-    auto* sa = reinterpret_cast<const sockaddr*>(addr.addr);
-    switch (sa->sa_family) {
-    case AF_INET: {
-        if (addr.addrlen < sizeof(sockaddr_in)) {
-            return std::nullopt;
-        }
-        sockaddr_in in{};
-        std::memcpy(&in, sa, sizeof(in));
-        return socket_address(in);
+    auto algo = *cfg.congestion_control;
+    // ngtcp2 BBR regresses sharply on the small-datagram benchmark profile.
+    if ((algo == congestion_control_algorithm::bbr || algo == congestion_control_algorithm::bbr2)
+        && cfg.max_tx_udp_payload_size
+        && *cfg.max_tx_udp_payload_size <= 4096) {
+        return congestion_control_algorithm::cubic;
     }
-    case AF_INET6: {
-        if (addr.addrlen < sizeof(sockaddr_in6)) {
-            return std::nullopt;
-        }
-        sockaddr_in6 in6{};
-        std::memcpy(&in6, sa, sizeof(in6));
-        return socket_address(in6);
-    }
-    default:
-        return std::nullopt;
-    }
-}
-
-temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) {
-    if (bufs.empty()) {
-        return temporary_buffer<char>();
-    }
-    if (bufs.size() == 1) {
-        return std::move(bufs.front());
-    }
-
-    size_t total = 0;
-    for (const auto& b : bufs) {
-        total += b.size();
-    }
-
-    temporary_buffer<char> result(total);
-    char* dst = result.get_write();
-    size_t offset = 0;
-    for (const auto& b : bufs) {
-        std::memcpy(dst + offset, b.get(), b.size());
-        offset += b.size();
-    }
-    return result;
-}
-
-ngtcp2_cc_algo to_ngtcp2_cc_algo(congestion_control_algorithm algo) {
-    switch (algo) {
-    case congestion_control_algorithm::reno:
-        return NGTCP2_CC_ALGO_RENO;
-    case congestion_control_algorithm::cubic:
-        return NGTCP2_CC_ALGO_CUBIC;
-    case congestion_control_algorithm::bbr:
-        return NGTCP2_CC_ALGO_BBR;
-    case congestion_control_algorithm::bbr2:
-#ifdef NGTCP2_CC_ALGO_BBR2
-        return NGTCP2_CC_ALGO_BBR2;
-#else
-        return NGTCP2_CC_ALGO_BBR;
-#endif
-    }
-    return NGTCP2_CC_ALGO_CUBIC;
+    return algo;
 }
 
 future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {
@@ -278,7 +122,78 @@ struct rx_event {
 struct client_state;
 void sync_current_path(client_state& st);
 
-struct client_state : public enable_lw_shared_from_this<client_state>, public internal::connection_transport, public internal::connection_actor {
+struct client_state : public enable_lw_shared_from_this<client_state> {
+    struct transport_adapter final : internal::connection_transport {
+        client_state& owner;
+
+        explicit transport_adapter(client_state& owner) noexcept
+            : owner(owner) {
+        }
+
+        bool transport_active() const noexcept override { return owner.transport_active(); }
+        bool has_transport_connection() const noexcept override { return owner.has_transport_connection(); }
+        bool can_retry_blocked_open_streams() const noexcept override { return owner.can_retry_blocked_open_streams(); }
+        size_t tx_payload_limit_bytes() const noexcept override { return owner.tx_payload_limit_bytes(); }
+        int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override { return owner.write_pending_packet(outbuf, outbuf_size); }
+        internal::transport_stream_write_result write_stream_packet(
+          stream_id sid,
+          const char* data,
+          size_t len,
+          bool fin,
+          uint8_t* outbuf,
+          size_t outbuf_size) override { return owner.write_stream_packet(sid, data, len, fin, outbuf, outbuf_size); }
+        internal::transport_open_stream_result try_open_stream(stream_type type) override { return owner.try_open_stream(type); }
+        void complete_send_bytes(size_t len) override { owner.complete_send_bytes(len); }
+        int consume_stream_data(stream_id sid, size_t len) override { return owner.consume_stream_data(sid, len); }
+        int shutdown_stream_write(stream_id sid, application_error_code app_error_code) override { return owner.shutdown_stream_write(sid, app_error_code); }
+        int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override { return owner.shutdown_stream_read(sid, app_error_code); }
+        int read_transport_datagram(const socket_address& src, const char* data, size_t len) override { return owner.read_transport_datagram(src, data, len); }
+        void sync_transport_path() override { owner.sync_transport_path(); }
+        uint64_t transport_expiry_ns() const noexcept override { return owner.transport_expiry_ns(); }
+        int handle_transport_expiry(uint64_t now_ns) override { return owner.handle_transport_expiry(now_ns); }
+        temporary_buffer<char>& tx_packet_buffer() override { return owner.tx_packet_buffer(); }
+        future<> send_datagram_packet(temporary_buffer<char> packet) override { return owner.send_datagram_packet(std::move(packet)); }
+        bool can_send_connection_close() const noexcept override { return owner.can_send_connection_close(); }
+        int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) override { return owner.write_connection_close_packet(outbuf, outbuf_size); }
+        void on_stream_write_closed(stream_id sid) override { owner.on_stream_write_closed(sid); }
+        void rearm_transport_timer() override { owner.rearm_transport_timer(); }
+        void request_close() override { owner.request_close(); }
+        void stop_transport() override { owner.stop_transport(); }
+        void fail_transport(quic_error err, sstring detail) override { owner.fail_transport(err, std::move(detail)); }
+        void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override { owner.complete_open_stream(std::move(result), sid); }
+        void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error err, sstring detail) override {
+            owner.fail_open_stream(std::move(result), err, std::move(detail));
+        }
+        void defer_blocked_open_stream(internal::transport_command cmd) override { owner.defer_blocked_open_stream(std::move(cmd)); }
+        std::optional<internal::transport_command> pop_blocked_open_stream(stream_type type) override { return owner.pop_blocked_open_stream(type); }
+        bool blocked_open_stream_retry_pending(stream_type type) const noexcept override { return owner.blocked_open_stream_retry_pending(type); }
+        void clear_blocked_open_stream_retry(stream_type type) noexcept override { owner.clear_blocked_open_stream_retry(type); }
+    };
+
+    struct actor_adapter final : internal::connection_actor {
+        client_state& owner;
+
+        explicit actor_adapter(client_state& owner) noexcept
+            : owner(owner) {
+        }
+
+        bool actor_active() const noexcept override { return owner.actor_active(); }
+        bool actor_has_pending_work() const noexcept override { return owner.actor_has_pending_work(); }
+        future<> actor_wait_for_wakeup() override { return owner.actor_wait_for_wakeup(); }
+        bool actor_stop_requested() const noexcept override { return owner.actor_stop_requested(); }
+        future<> actor_handle_stop_request() override { return owner.actor_handle_stop_request(); }
+        bool actor_transport_terminal() const noexcept override { return owner.actor_transport_terminal(); }
+        future<> actor_handle_transport_terminal() override { return owner.actor_handle_transport_terminal(); }
+        bool actor_has_rx_event() const noexcept override { return owner.actor_has_rx_event(); }
+        future<> actor_handle_next_rx_event() override { return owner.actor_handle_next_rx_event(); }
+        bool actor_has_transport_command() const noexcept override { return owner.actor_has_transport_command(); }
+        future<> actor_handle_next_transport_command() override { return owner.actor_handle_next_transport_command(); }
+        future<> actor_retry_blocked_open_streams() override { return owner.actor_retry_blocked_open_streams(); }
+        bool actor_tick_pending() const noexcept override { return owner.actor_tick_pending(); }
+        void actor_clear_tick() noexcept override { owner.actor_clear_tick(); }
+        future<> actor_handle_timer_tick() override { return owner.actor_handle_timer_tick(); }
+    };
+
     quic_client_config cfg{};
     internal::session_runtime_ptr runtime;
 
@@ -311,6 +226,13 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
     temporary_buffer<char> tx_packet_scratch;
     std::optional<internal::transport_command> blocked_send_command;
     bool blocked_send_retry_requested = false;
+    transport_adapter transport;
+    actor_adapter actor;
+
+    client_state()
+        : transport(*this)
+        , actor(*this) {
+    }
 
     ~client_state() {
         fail_blocked_open_streams(quic_error::closed, "client state destroyed");
@@ -343,19 +265,19 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         return !stopping && runtime;
     }
 
-    bool transport_active() const noexcept override {
+    bool transport_active() const noexcept {
         return active();
     }
 
-    bool has_transport_connection() const noexcept override {
+    bool has_transport_connection() const noexcept {
         return conn != nullptr;
     }
 
-    bool can_retry_blocked_open_streams() const noexcept override {
+    bool can_retry_blocked_open_streams() const noexcept {
         return active() && handshake_done;
     }
 
-    size_t tx_payload_limit_bytes() const noexcept override {
+    size_t tx_payload_limit_bytes() const noexcept {
         return tx_payload_limit;
     }
 
@@ -385,7 +307,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         engine->wake_actor();
     }
 
-    int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override {
+    int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -398,7 +320,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size) override {
+      size_t outbuf_size) {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -427,13 +349,13 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         };
     }
 
-    void complete_send_bytes(size_t len) override {
+    void complete_send_bytes(size_t len) {
         if (runtime) {
             runtime->complete_send_bytes(len);
         }
     }
 
-    internal::transport_open_stream_result try_open_stream(stream_type type) override {
+    internal::transport_open_stream_result try_open_stream(stream_type type) {
         int64_t sid = invalid_stream_id;
         auto rv = type == stream_type::bidirectional
                     ? ngtcp2_conn_open_bidi_stream(conn, &sid, nullptr)
@@ -444,11 +366,11 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         };
     }
 
-    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) override {
+    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) {
         return ngtcp2_conn_shutdown_stream_write(conn, 0, sid, app_error_code);
     }
 
-    int consume_stream_data(stream_id sid, size_t len) override {
+    int consume_stream_data(stream_id sid, size_t len) {
         if (!conn || !len) {
             return 0;
         }
@@ -460,11 +382,11 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         return 0;
     }
 
-    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override {
+    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) {
         return ngtcp2_conn_shutdown_stream_read(conn, 0, sid, app_error_code);
     }
 
-    int read_transport_datagram(const socket_address& src, const char* data, size_t len) override {
+    int read_transport_datagram(const socket_address& src, const char* data, size_t len) {
         sockaddr_storage remote_ss{};
         socklen_t remote_ss_len = 0;
         to_sockaddr_storage(src, remote_ss, remote_ss_len);
@@ -482,31 +404,31 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
           now_ns());
     }
 
-    void sync_transport_path() override {
+    void sync_transport_path() {
         sync_current_path(*this);
     }
 
-    uint64_t transport_expiry_ns() const noexcept override {
+    uint64_t transport_expiry_ns() const noexcept {
         return ngtcp2_conn_get_expiry(conn);
     }
 
-    int handle_transport_expiry(uint64_t now_local) override {
+    int handle_transport_expiry(uint64_t now_local) {
         return ngtcp2_conn_handle_expiry(conn, now_local);
     }
 
-    temporary_buffer<char>& tx_packet_buffer() override {
+    temporary_buffer<char>& tx_packet_buffer() {
         return tx_packet_scratch;
     }
 
-    future<> send_datagram_packet(temporary_buffer<char> packet) override {
+    future<> send_datagram_packet(temporary_buffer<char> packet) {
         return send_datagram(channel, remote_address, std::move(packet));
     }
 
-    bool can_send_connection_close() const noexcept override {
+    bool can_send_connection_close() const noexcept {
         return conn && channel_ready && !channel.is_closed();
     }
 
-    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) override {
+    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -523,7 +445,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
           now_ns());
     }
 
-    void on_stream_write_closed(stream_id sid) override {
+    void on_stream_write_closed(stream_id sid) {
         if (!engine || !conn) {
             return;
         }
@@ -532,7 +454,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         engine->on_stream_stop_sending(sid, type, peer_initiated, 0, internal::stream_shutdown_side::write);
     }
 
-    void rearm_transport_timer() override {
+    void rearm_transport_timer() {
         if (!engine) {
             return;
         }
@@ -543,7 +465,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), now_ns(), stopping);
     }
 
-    void request_close() override {
+    void request_close() {
         request_stop();
     }
 
@@ -578,7 +500,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         handshake_promise->set_exception(ex);
     }
 
-    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override {
+    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) {
         if (runtime) {
             runtime->complete_open_stream(std::move(result), sid);
         }
@@ -587,21 +509,21 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
     void fail_open_stream(
       std::shared_ptr<promise<stream_id>> result,
       quic_error error,
-      sstring detail) override {
+      sstring detail) {
         if (runtime) {
             runtime->fail_open_stream(std::move(result), error, std::move(detail));
         }
     }
 
-    bool blocked_open_stream_retry_pending(stream_type type) const noexcept override {
+    bool blocked_open_stream_retry_pending(stream_type type) const noexcept {
         return engine->blocked_open_stream_retry_pending(type);
     }
 
-    void defer_blocked_open_stream(internal::transport_command cmd) override {
+    void defer_blocked_open_stream(internal::transport_command cmd) {
         engine->defer_blocked_open_stream(std::move(cmd));
     }
 
-    std::optional<internal::transport_command> pop_blocked_open_stream(stream_type type) override {
+    std::optional<internal::transport_command> pop_blocked_open_stream(stream_type type) {
         return engine->pop_blocked_open_stream(type);
     }
 
@@ -645,7 +567,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         blocked_send_retry_requested = false;
     }
 
-    void clear_blocked_open_stream_retry(stream_type type) noexcept override {
+    void clear_blocked_open_stream_retry(stream_type type) noexcept {
         engine->clear_blocked_open_stream_retry(type);
     }
 
@@ -666,7 +588,7 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         wake_actor();
     }
 
-    void stop_transport() override {
+    void stop_transport() {
         quic_client_log.info(
           "client transport stop: local={} remote={} handshake_done={} channel_ready={}",
           local_address,
@@ -721,36 +643,36 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         }
     }
 
-    void fail_transport(quic_error err, sstring detail) override {
+    void fail_transport(quic_error err, sstring detail) {
         fail(err, detail);
     }
 
-    bool actor_active() const noexcept override {
+    bool actor_active() const noexcept {
         return active();
     }
 
-    bool actor_has_pending_work() const noexcept override {
+    bool actor_has_pending_work() const noexcept {
         return has_pending_actor_work();
     }
 
-    future<> actor_wait_for_wakeup() override {
+    future<> actor_wait_for_wakeup() {
         return wait_for_actor_wakeup();
     }
 
-    bool actor_stop_requested() const noexcept override {
+    bool actor_stop_requested() const noexcept {
         return stop_requested;
     }
 
-    future<> actor_handle_stop_request() override {
-        co_await internal::send_connection_close(*this);
+    future<> actor_handle_stop_request() {
+        co_await internal::send_connection_close(transport);
         stop_transport();
     }
 
-    bool actor_transport_terminal() const noexcept override {
+    bool actor_transport_terminal() const noexcept {
         return runtime && runtime->transport_terminal();
     }
 
-    future<> actor_handle_transport_terminal() override {
+    future<> actor_handle_transport_terminal() {
         if (!runtime) {
             co_return;
         }
@@ -762,22 +684,22 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         co_return;
     }
 
-    bool actor_has_rx_event() const noexcept override {
+    bool actor_has_rx_event() const noexcept {
         return !rx_queue.empty();
     }
 
-    future<> actor_handle_next_rx_event() override {
+    future<> actor_handle_next_rx_event() {
         auto evt = rx_queue.pop();
-        co_await internal::recv_transport_datagram(*this, evt.src, std::move(evt.packet));
+        co_await internal::recv_transport_datagram(transport, evt.src, std::move(evt.packet));
         request_blocked_send_retry();
     }
 
-    bool actor_has_transport_command() const noexcept override {
+    bool actor_has_transport_command() const noexcept {
         return blocked_send_retry_pending()
                || (!has_blocked_send() && runtime && runtime->has_pending_commands());
     }
 
-    future<> actor_handle_next_transport_command() override {
+    future<> actor_handle_next_transport_command() {
         std::optional<internal::transport_command> cmd;
         if (blocked_send_retry_pending()) {
             clear_blocked_send_retry();
@@ -788,30 +710,30 @@ struct client_state : public enable_lw_shared_from_this<client_state>, public in
         if (!cmd) {
             co_return;
         }
-        auto blocked = co_await internal::handle_transport_command(*this, std::move(*cmd));
+        auto blocked = co_await internal::handle_transport_command(transport, std::move(*cmd));
         if (blocked) {
             defer_blocked_send(std::move(*blocked));
         }
     }
 
-    future<> actor_retry_blocked_open_streams() override {
+    future<> actor_retry_blocked_open_streams() {
         if (!handshake_done) {
             co_return;
         }
-        co_await internal::retry_blocked_open_streams(*this, stream_type::bidirectional);
-        co_await internal::retry_blocked_open_streams(*this, stream_type::unidirectional);
+        co_await internal::retry_blocked_open_streams(transport, stream_type::bidirectional);
+        co_await internal::retry_blocked_open_streams(transport, stream_type::unidirectional);
     }
 
-    bool actor_tick_pending() const noexcept override {
+    bool actor_tick_pending() const noexcept {
         return engine->tick_pending();
     }
 
-    void actor_clear_tick() noexcept override {
+    void actor_clear_tick() noexcept {
         engine->clear_tick();
     }
 
-    future<> actor_handle_timer_tick() override {
-        co_await internal::handle_transport_timer(*this);
+    future<> actor_handle_timer_tick() {
+        co_await internal::handle_transport_timer(transport);
         request_blocked_send_retry();
     }
 };
@@ -853,24 +775,24 @@ ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref) {
 }
 
 void rand_cb(uint8_t* dest, size_t destlen, const ngtcp2_rand_ctx*) {
-    if (!rand_bytes_or_log(dest, destlen, "ngtcp2 rand callback")) {
+    if (!rand_bytes_or_log(quic_client_log, "client", dest, destlen, "ngtcp2 rand callback")) {
         std::terminate();
     }
 }
 
 int get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* token, size_t cidlen, void*) {
     cid->datalen = cidlen;
-    if (!rand_bytes_or_log(cid->data, cidlen, "connection id generation")) {
+    if (!rand_bytes_or_log(quic_client_log, "client", cid->data, cidlen, "connection id generation")) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
-    if (!rand_bytes_or_log(token, NGTCP2_STATELESS_RESET_TOKENLEN, "stateless reset token generation")) {
+    if (!rand_bytes_or_log(quic_client_log, "client", token, NGTCP2_STATELESS_RESET_TOKENLEN, "stateless reset token generation")) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     return 0;
 }
 
 int get_path_challenge_data_cb(ngtcp2_conn*, uint8_t* data, void*) {
-    if (!rand_bytes_or_log(data, 8, "path challenge generation")) {
+    if (!rand_bytes_or_log(quic_client_log, "client", data, 8, "path challenge generation")) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     return 0;
@@ -1172,8 +1094,8 @@ void init_client_connection(client_state& st) {
     if (st.cfg.session_options.transport.ack_thresh) {
         settings.ack_thresh = *st.cfg.session_options.transport.ack_thresh;
     }
-    if (st.cfg.session_options.transport.congestion_control) {
-        settings.cc_algo = to_ngtcp2_cc_algo(*st.cfg.session_options.transport.congestion_control);
+    if (auto algo = effective_congestion_control(st.cfg.session_options.transport)) {
+        settings.cc_algo = to_ngtcp2_cc_algo(*algo);
     }
     settings.no_tx_udp_payload_size_shaping =
       st.cfg.session_options.transport.disable_tx_udp_payload_size_shaping ? 1 : 0;
@@ -1236,7 +1158,7 @@ void init_client_connection(client_state& st) {
 }
 
 future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
-    co_await internal::flush_pending_transport_packets(*st);
+    co_await internal::flush_pending_transport_packets(st->transport);
 }
 
     future<> recv_loop(lw_shared_ptr<client_state> st) {
@@ -1271,7 +1193,7 @@ future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
 }
 
 future<> actor_loop(lw_shared_ptr<client_state> st) {
-    co_await internal::run_connection_actor(*st);
+    co_await internal::run_connection_actor(st->actor);
 }
 
 void start_background_tasks(const lw_shared_ptr<client_state>& st) {

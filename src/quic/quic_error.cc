@@ -19,13 +19,54 @@
  * Copyright (C) 2026 ScyllaDB Ltd.
  */
 
-#include <seastar/quic/quic_error.hh>
+#include "quic_error_impl.hh"
 
 #include <ngtcp2/ngtcp2.h>
 
 #include <gnutls/gnutls.h>
 
 namespace seastar::quic::experimental {
+
+const char* to_string(quic_error error) noexcept {
+    switch (error) {
+    case quic_error::none:
+        return "none";
+    case quic_error::invalid_argument:
+        return "invalid_argument";
+    case quic_error::invalid_state:
+        return "invalid_state";
+    case quic_error::io:
+        return "io";
+    case quic_error::timeout:
+        return "timeout";
+    case quic_error::protocol:
+        return "protocol";
+    case quic_error::closed:
+        return "closed";
+    case quic_error::unsupported:
+        return "unsupported";
+    case quic_error::internal:
+        return "internal";
+    case quic_error::backend:
+        return "backend";
+    }
+    return "unknown";
+}
+
+quic_exception::quic_exception(quic_error error, std::string detail)
+    : std::runtime_error(detail.empty()
+              ? std::string(to_string(error))
+              : std::string(to_string(error)) + ": " + detail)
+    , _error(error) {
+}
+
+quic_error quic_exception::code() const noexcept {
+    return _error;
+}
+
+[[noreturn]] void throw_quic_error(quic_error error, std::string_view detail) {
+    throw quic_exception(error, std::string(detail));
+}
 
 quic_error classify_ngtcp2_error(int code) noexcept {
     if (code == 0) {

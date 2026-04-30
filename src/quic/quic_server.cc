@@ -21,6 +21,9 @@
 
 #include <seastar/quic/quic_server.hh>
 
+#include "quic_common.hh"
+#include "quic_impl.hh"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -66,182 +69,22 @@ static logger quic_server_log("quic_server");
 using transport_command = internal::transport_command;
 using quic_message = internal::quic_message;
 
-class gnutls_global_guard {
-public:
-    gnutls_global_guard() {
-        gnutls_global_init();
-    }
-    ~gnutls_global_guard() {
-        gnutls_global_deinit();
-    }
-};
-
-void ensure_gnutls_global() {
-    static gnutls_global_guard guard;
-}
-
 ngtcp2_tstamp now_ns() {
     using namespace std::chrono;
     return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
 }
-
-int try_rand_bytes(uint8_t* dst, size_t len) noexcept {
-    return gnutls_rnd(GNUTLS_RND_RANDOM, dst, len);
-}
-
-[[noreturn]] void throw_random_failure(const char* context, int rv) {
-    throw quic_exception(
-      classify_gnutls_error(rv),
-      sstring(context) + ": " + gnutls_error_message(rv));
-}
-
-void rand_bytes_or_throw(uint8_t* dst, size_t len, const char* context) {
-    auto rv = try_rand_bytes(dst, len);
-    if (rv < 0) {
-        throw_random_failure(context, rv);
-    }
-}
-
-bool rand_bytes_or_log(uint8_t* dst, size_t len, const char* context) noexcept {
-    auto rv = try_rand_bytes(dst, len);
-    if (rv >= 0) {
-        return true;
-    }
-    quic_server_log.error("server random source failure: context={} detail='{}'", context, gnutls_error_message(rv));
-    return false;
-}
-
-void* mem_malloc(size_t size, void*) {
-    return std::malloc(size);
-}
-
-void mem_free(void* ptr, void*) {
-    std::free(ptr);
-}
-
-void* mem_calloc(size_t n, size_t s, void*) {
-    return std::calloc(n, s);
-}
-
-void* mem_realloc(void* ptr, size_t s, void*) {
-    return std::realloc(ptr, s);
-}
-
-const ngtcp2_mem* ngtcp2_mem_for_thread() {
-    thread_local const ngtcp2_mem mem = {
-      nullptr,
-      mem_malloc,
-      mem_free,
-      mem_calloc,
-      mem_realloc,
-    };
-    return &mem;
-}
-
-void init_ngtcp2_addr(ngtcp2_addr* addr, const sockaddr* sa, size_t len) {
-    addr->addr = const_cast<sockaddr*>(sa);
-    addr->addrlen = static_cast<socklen_t>(len);
-}
-
-void to_sockaddr_storage(const socket_address& sa, sockaddr_storage& out, socklen_t& outlen) {
-    std::memset(&out, 0, sizeof(out));
-    switch (sa.family()) {
-    case AF_INET: {
-        auto in = sa.as_posix_sockaddr_in();
-        std::memcpy(&out, &in, sizeof(in));
-        outlen = sizeof(in);
-        return;
-    }
-    case AF_INET6: {
-        auto in6 = sa.as_posix_sockaddr_in6();
-        std::memcpy(&out, &in6, sizeof(in6));
-        outlen = sizeof(in6);
-        return;
-    }
-    default:
-        throw_quic_error(quic_error::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
-    }
-}
-
-void validate_ip_socket_address(const socket_address& sa, std::string_view what) {
-    switch (sa.family()) {
-    case AF_INET:
-    case AF_INET6:
-        return;
-    default:
-        throw_quic_error(
-          quic_error::invalid_argument,
-          sstring(what) + " must be an IPv4 or IPv6 socket address");
-    }
-}
-
-std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
-    if (!addr.addr || addr.addrlen == 0) {
+std::optional<congestion_control_algorithm> effective_congestion_control(const transport_config& cfg) {
+    if (!cfg.congestion_control) {
         return std::nullopt;
     }
-
-    auto* sa = reinterpret_cast<const sockaddr*>(addr.addr);
-    switch (sa->sa_family) {
-    case AF_INET: {
-        if (addr.addrlen < sizeof(sockaddr_in)) {
-            return std::nullopt;
-        }
-        sockaddr_in in{};
-        std::memcpy(&in, sa, sizeof(in));
-        return socket_address(in);
+    auto algo = *cfg.congestion_control;
+    // ngtcp2 BBR regresses sharply on the small-datagram benchmark profile.
+    if ((algo == congestion_control_algorithm::bbr || algo == congestion_control_algorithm::bbr2)
+        && cfg.max_tx_udp_payload_size
+        && *cfg.max_tx_udp_payload_size <= 4096) {
+        return congestion_control_algorithm::cubic;
     }
-    case AF_INET6: {
-        if (addr.addrlen < sizeof(sockaddr_in6)) {
-            return std::nullopt;
-        }
-        sockaddr_in6 in6{};
-        std::memcpy(&in6, sa, sizeof(in6));
-        return socket_address(in6);
-    }
-    default:
-        return std::nullopt;
-    }
-}
-
-temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) {
-    if (bufs.empty()) {
-        return temporary_buffer<char>();
-    }
-    if (bufs.size() == 1) {
-        return std::move(bufs.front());
-    }
-
-    size_t total = 0;
-    for (const auto& b : bufs) {
-        total += b.size();
-    }
-
-    temporary_buffer<char> result(total);
-    char* dst = result.get_write();
-    size_t offset = 0;
-    for (const auto& b : bufs) {
-        std::memcpy(dst + offset, b.get(), b.size());
-        offset += b.size();
-    }
-    return result;
-}
-
-ngtcp2_cc_algo to_ngtcp2_cc_algo(congestion_control_algorithm algo) {
-    switch (algo) {
-    case congestion_control_algorithm::reno:
-        return NGTCP2_CC_ALGO_RENO;
-    case congestion_control_algorithm::cubic:
-        return NGTCP2_CC_ALGO_CUBIC;
-    case congestion_control_algorithm::bbr:
-        return NGTCP2_CC_ALGO_BBR;
-    case congestion_control_algorithm::bbr2:
-#ifdef NGTCP2_CC_ALGO_BBR2
-        return NGTCP2_CC_ALGO_BBR2;
-#else
-        return NGTCP2_CC_ALGO_BBR;
-#endif
-    }
-    return NGTCP2_CC_ALGO_CUBIC;
+    return algo;
 }
 
 future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {
@@ -307,8 +150,6 @@ dcid_parse_result parse_dcid(const uint8_t* pkt, size_t len, size_t short_dcid_l
     return result;
 }
 
-class quic_server_impl;
-
 struct conn_rx_event {
     socket_address src;
     temporary_buffer<char> packet;
@@ -317,7 +158,80 @@ struct conn_rx_event {
 struct server_connection;
 void sync_current_path(server_connection& conn);
 
-struct server_connection : public enable_lw_shared_from_this<server_connection>, public internal::connection_transport, public internal::connection_actor {
+class quic_server_impl;
+
+struct server_connection : public enable_lw_shared_from_this<server_connection> {
+    struct transport_adapter final : internal::connection_transport {
+        server_connection& owner;
+
+        explicit transport_adapter(server_connection& owner) noexcept
+            : owner(owner) {
+        }
+
+        bool transport_active() const noexcept override { return owner.transport_active(); }
+        bool has_transport_connection() const noexcept override { return owner.has_transport_connection(); }
+        bool can_retry_blocked_open_streams() const noexcept override { return owner.can_retry_blocked_open_streams(); }
+        size_t tx_payload_limit_bytes() const noexcept override { return owner.tx_payload_limit_bytes(); }
+        int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override { return owner.write_pending_packet(outbuf, outbuf_size); }
+        internal::transport_stream_write_result write_stream_packet(
+          stream_id sid,
+          const char* data,
+          size_t len,
+          bool fin,
+          uint8_t* outbuf,
+          size_t outbuf_size) override { return owner.write_stream_packet(sid, data, len, fin, outbuf, outbuf_size); }
+        internal::transport_open_stream_result try_open_stream(stream_type type) override { return owner.try_open_stream(type); }
+        void complete_send_bytes(size_t len) override { owner.complete_send_bytes(len); }
+        int consume_stream_data(stream_id sid, size_t len) override { return owner.consume_stream_data(sid, len); }
+        int shutdown_stream_write(stream_id sid, application_error_code app_error_code) override { return owner.shutdown_stream_write(sid, app_error_code); }
+        int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override { return owner.shutdown_stream_read(sid, app_error_code); }
+        int read_transport_datagram(const socket_address& src, const char* data, size_t len) override { return owner.read_transport_datagram(src, data, len); }
+        void sync_transport_path() override { owner.sync_transport_path(); }
+        uint64_t transport_expiry_ns() const noexcept override { return owner.transport_expiry_ns(); }
+        int handle_transport_expiry(uint64_t now_ns) override { return owner.handle_transport_expiry(now_ns); }
+        temporary_buffer<char>& tx_packet_buffer() override { return owner.tx_packet_buffer(); }
+        future<> send_datagram_packet(temporary_buffer<char> packet) override { return owner.send_datagram_packet(std::move(packet)); }
+        bool can_send_connection_close() const noexcept override { return owner.can_send_connection_close(); }
+        int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) override { return owner.write_connection_close_packet(outbuf, outbuf_size); }
+        void on_stream_write_closed(stream_id sid) override { owner.on_stream_write_closed(sid); }
+        void rearm_transport_timer() override { owner.rearm_transport_timer(); }
+        void request_close() override { owner.request_close(); }
+        void stop_transport() override { owner.stop_transport(); }
+        void fail_transport(quic_error error, sstring detail) override { owner.fail_transport(error, std::move(detail)); }
+        void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override { owner.complete_open_stream(std::move(result), sid); }
+        void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error error, sstring detail) override {
+            owner.fail_open_stream(std::move(result), error, std::move(detail));
+        }
+        void defer_blocked_open_stream(transport_command cmd) override { owner.defer_blocked_open_stream(std::move(cmd)); }
+        std::optional<transport_command> pop_blocked_open_stream(stream_type type) override { return owner.pop_blocked_open_stream(type); }
+        bool blocked_open_stream_retry_pending(stream_type type) const noexcept override { return owner.blocked_open_stream_retry_pending(type); }
+        void clear_blocked_open_stream_retry(stream_type type) noexcept override { owner.clear_blocked_open_stream_retry(type); }
+    };
+
+    struct actor_adapter final : internal::connection_actor {
+        server_connection& owner;
+
+        explicit actor_adapter(server_connection& owner) noexcept
+            : owner(owner) {
+        }
+
+        bool actor_active() const noexcept override { return owner.actor_active(); }
+        bool actor_has_pending_work() const noexcept override { return owner.actor_has_pending_work(); }
+        future<> actor_wait_for_wakeup() override { return owner.actor_wait_for_wakeup(); }
+        bool actor_stop_requested() const noexcept override { return owner.actor_stop_requested(); }
+        future<> actor_handle_stop_request() override { return owner.actor_handle_stop_request(); }
+        bool actor_transport_terminal() const noexcept override { return owner.actor_transport_terminal(); }
+        future<> actor_handle_transport_terminal() override { return owner.actor_handle_transport_terminal(); }
+        bool actor_has_rx_event() const noexcept override { return owner.actor_has_rx_event(); }
+        future<> actor_handle_next_rx_event() override { return owner.actor_handle_next_rx_event(); }
+        bool actor_has_transport_command() const noexcept override { return owner.actor_has_transport_command(); }
+        future<> actor_handle_next_transport_command() override { return owner.actor_handle_next_transport_command(); }
+        future<> actor_retry_blocked_open_streams() override { return owner.actor_retry_blocked_open_streams(); }
+        bool actor_tick_pending() const noexcept override { return owner.actor_tick_pending(); }
+        void actor_clear_tick() noexcept override { owner.actor_clear_tick(); }
+        future<> actor_handle_timer_tick() override { return owner.actor_handle_timer_tick(); }
+    };
+
     std::weak_ptr<quic_server_impl> server;
     internal::session_runtime_ptr runtime;
     internal::connection_engine_ptr engine;
@@ -347,6 +261,13 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
     std::optional<transport_command> blocked_send_command;
     bool blocked_send_retry_requested = false;
     std::unordered_set<std::string> mapped_dcids;
+    transport_adapter transport;
+    actor_adapter actor;
+
+    server_connection()
+        : transport(*this)
+        , actor(*this) {
+    }
 
     ~server_connection() {
         fail_blocked_open_streams(quic_error::closed, "server connection destroyed");
@@ -375,19 +296,19 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return server.lock();
     }
 
-    bool transport_active() const noexcept override {
+    bool transport_active() const noexcept {
         return active();
     }
 
-    bool has_transport_connection() const noexcept override {
+    bool has_transport_connection() const noexcept {
         return conn != nullptr;
     }
 
-    bool can_retry_blocked_open_streams() const noexcept override {
+    bool can_retry_blocked_open_streams() const noexcept {
         return active() && !stop_requested;
     }
 
-    size_t tx_payload_limit_bytes() const noexcept override {
+    size_t tx_payload_limit_bytes() const noexcept {
         return tx_payload_limit;
     }
 
@@ -417,7 +338,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         engine->wake_actor();
     }
 
-    int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override {
+    int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -430,7 +351,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size) override {
+      size_t outbuf_size) {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -459,13 +380,13 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         };
     }
 
-    void complete_send_bytes(size_t len) override {
+    void complete_send_bytes(size_t len) {
         if (runtime) {
             runtime->complete_send_bytes(len);
         }
     }
 
-    internal::transport_open_stream_result try_open_stream(stream_type type) override {
+    internal::transport_open_stream_result try_open_stream(stream_type type) {
         int64_t sid = invalid_stream_id;
         auto rv = type == stream_type::bidirectional
                     ? ngtcp2_conn_open_bidi_stream(conn, &sid, nullptr)
@@ -476,11 +397,11 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         };
     }
 
-    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) override {
+    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) {
         return ngtcp2_conn_shutdown_stream_write(conn, 0, sid, app_error_code);
     }
 
-    int consume_stream_data(stream_id sid, size_t len) override {
+    int consume_stream_data(stream_id sid, size_t len) {
         if (!conn || !len) {
             return 0;
         }
@@ -492,11 +413,11 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         return 0;
     }
 
-    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override {
+    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) {
         return ngtcp2_conn_shutdown_stream_read(conn, 0, sid, app_error_code);
     }
 
-    int read_transport_datagram(const socket_address& src, const char* data, size_t len) override {
+    int read_transport_datagram(const socket_address& src, const char* data, size_t len) {
         sockaddr_storage peer_addr_ss{};
         socklen_t peer_addr_ss_len = 0;
         to_sockaddr_storage(src, peer_addr_ss, peer_addr_ss_len);
@@ -514,27 +435,27 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
           now_ns());
     }
 
-    void sync_transport_path() override {
+    void sync_transport_path() {
         sync_current_path(*this);
     }
 
-    uint64_t transport_expiry_ns() const noexcept override {
+    uint64_t transport_expiry_ns() const noexcept {
         return ngtcp2_conn_get_expiry(conn);
     }
 
-    int handle_transport_expiry(uint64_t now_local) override {
+    int handle_transport_expiry(uint64_t now_local) {
         return ngtcp2_conn_handle_expiry(conn, now_local);
     }
 
-    temporary_buffer<char>& tx_packet_buffer() override {
+    temporary_buffer<char>& tx_packet_buffer() {
         return tx_packet_scratch;
     }
 
-    future<> send_datagram_packet(temporary_buffer<char> packet) override;
+    future<> send_datagram_packet(temporary_buffer<char> packet);
 
-    bool can_send_connection_close() const noexcept override;
+    bool can_send_connection_close() const noexcept;
 
-    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) override {
+    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -551,7 +472,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
           now_ns());
     }
 
-    void on_stream_write_closed(stream_id sid) override {
+    void on_stream_write_closed(stream_id sid) {
         if (!engine || !conn) {
             return;
         }
@@ -560,7 +481,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         engine->on_stream_stop_sending(sid, type, peer_initiated, 0, internal::stream_shutdown_side::write);
     }
 
-    void rearm_transport_timer() override {
+    void rearm_transport_timer() {
         if (!engine) {
             return;
         }
@@ -571,7 +492,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), now_ns(), closing);
     }
 
-    void request_close() override {
+    void request_close() {
         request_stop();
     }
 
@@ -590,7 +511,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         rx_queue.abort(ex);
     }
 
-    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override {
+    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) {
         if (runtime) {
             runtime->complete_open_stream(std::move(result), sid);
         }
@@ -599,21 +520,21 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
     void fail_open_stream(
       std::shared_ptr<promise<stream_id>> result,
       quic_error error,
-      sstring detail) override {
+      sstring detail) {
         if (runtime) {
             runtime->fail_open_stream(std::move(result), error, std::move(detail));
         }
     }
 
-    bool blocked_open_stream_retry_pending(stream_type type) const noexcept override {
+    bool blocked_open_stream_retry_pending(stream_type type) const noexcept {
         return engine->blocked_open_stream_retry_pending(type);
     }
 
-    void defer_blocked_open_stream(transport_command cmd) override {
+    void defer_blocked_open_stream(transport_command cmd) {
         engine->defer_blocked_open_stream(std::move(cmd));
     }
 
-    std::optional<transport_command> pop_blocked_open_stream(stream_type type) override {
+    std::optional<transport_command> pop_blocked_open_stream(stream_type type) {
         return engine->pop_blocked_open_stream(type);
     }
 
@@ -657,7 +578,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         blocked_send_retry_requested = false;
     }
 
-    void clear_blocked_open_stream_retry(stream_type type) noexcept override {
+    void clear_blocked_open_stream_retry(stream_type type) noexcept {
         engine->clear_blocked_open_stream_retry(type);
     }
 
@@ -679,23 +600,23 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
     }
 
     bool active() const noexcept;
-    bool actor_active() const noexcept override {
+    bool actor_active() const noexcept {
         return active();
     }
-    bool actor_has_pending_work() const noexcept override {
+    bool actor_has_pending_work() const noexcept {
         return has_pending_actor_work();
     }
-    future<> actor_wait_for_wakeup() override {
+    future<> actor_wait_for_wakeup() {
         return wait_for_actor_wakeup();
     }
-    bool actor_stop_requested() const noexcept override {
+    bool actor_stop_requested() const noexcept {
         return stop_requested;
     }
-    future<> actor_handle_stop_request() override;
-    bool actor_transport_terminal() const noexcept override {
+    future<> actor_handle_stop_request();
+    bool actor_transport_terminal() const noexcept {
         return runtime && runtime->transport_terminal();
     }
-    future<> actor_handle_transport_terminal() override {
+    future<> actor_handle_transport_terminal() {
         if (!runtime) {
             co_return;
         }
@@ -706,15 +627,15 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         }
         co_return;
     }
-    bool actor_has_rx_event() const noexcept override {
+    bool actor_has_rx_event() const noexcept {
         return !rx_queue.empty();
     }
-    future<> actor_handle_next_rx_event() override;
-    bool actor_has_transport_command() const noexcept override {
+    future<> actor_handle_next_rx_event();
+    bool actor_has_transport_command() const noexcept {
         return blocked_send_retry_pending()
                || (!has_blocked_send() && runtime && runtime->has_pending_commands());
     }
-    future<> actor_handle_next_transport_command() override {
+    future<> actor_handle_next_transport_command() {
         std::optional<transport_command> cmd;
         if (blocked_send_retry_pending()) {
             clear_blocked_send_retry();
@@ -725,25 +646,25 @@ struct server_connection : public enable_lw_shared_from_this<server_connection>,
         if (!cmd) {
             co_return;
         }
-        auto blocked = co_await internal::handle_transport_command(*this, std::move(*cmd));
+        auto blocked = co_await internal::handle_transport_command(transport, std::move(*cmd));
         if (blocked) {
             defer_blocked_send(std::move(*blocked));
         }
     }
-    future<> actor_retry_blocked_open_streams() override {
-        co_await internal::retry_blocked_open_streams(*this, stream_type::bidirectional);
-        co_await internal::retry_blocked_open_streams(*this, stream_type::unidirectional);
+    future<> actor_retry_blocked_open_streams() {
+        co_await internal::retry_blocked_open_streams(transport, stream_type::bidirectional);
+        co_await internal::retry_blocked_open_streams(transport, stream_type::unidirectional);
     }
-    bool actor_tick_pending() const noexcept override {
+    bool actor_tick_pending() const noexcept {
         return engine->tick_pending();
     }
-    void actor_clear_tick() noexcept override {
+    void actor_clear_tick() noexcept {
         engine->clear_tick();
     }
-    future<> actor_handle_timer_tick() override;
-    void stop_transport() override;
+    future<> actor_handle_timer_tick();
+    void stop_transport();
     void fail(quic_error error, const sstring& detail);
-    void fail_transport(quic_error error, sstring detail) override;
+    void fail_transport(quic_error error, sstring detail);
 };
 
 using conn_ptr = lw_shared_ptr<server_connection>;
@@ -1003,24 +924,24 @@ private:
     }
 
     static void rand_cb(uint8_t* dest, size_t len, const ngtcp2_rand_ctx*) {
-        if (!rand_bytes_or_log(dest, len, "ngtcp2 rand callback")) {
+        if (!rand_bytes_or_log(quic_server_log, "server", dest, len, "ngtcp2 rand callback")) {
             std::terminate();
         }
     }
 
     static int get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* token, size_t cidlen, void*) {
         cid->datalen = cidlen;
-        if (!rand_bytes_or_log(cid->data, cidlen, "connection id generation")) {
+        if (!rand_bytes_or_log(quic_server_log, "server", cid->data, cidlen, "connection id generation")) {
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
-        if (!rand_bytes_or_log(token, NGTCP2_STATELESS_RESET_TOKENLEN, "stateless reset token generation")) {
+        if (!rand_bytes_or_log(quic_server_log, "server", token, NGTCP2_STATELESS_RESET_TOKENLEN, "stateless reset token generation")) {
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
         return 0;
     }
 
     static int get_path_challenge_data_cb(ngtcp2_conn*, uint8_t* data, void*) {
-        if (!rand_bytes_or_log(data, 8, "path challenge generation")) {
+        if (!rand_bytes_or_log(quic_server_log, "server", data, 8, "path challenge generation")) {
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
         return 0;
@@ -1301,8 +1222,8 @@ private:
         if (_cfg.session_options.transport.ack_thresh) {
             settings.ack_thresh = *_cfg.session_options.transport.ack_thresh;
         }
-        if (_cfg.session_options.transport.congestion_control) {
-            settings.cc_algo = to_ngtcp2_cc_algo(*_cfg.session_options.transport.congestion_control);
+        if (auto algo = effective_congestion_control(_cfg.session_options.transport)) {
+            settings.cc_algo = to_ngtcp2_cc_algo(*algo);
         }
         settings.no_tx_udp_payload_size_shaping =
           _cfg.session_options.transport.disable_tx_udp_payload_size_shaping ? 1 : 0;
@@ -1384,11 +1305,11 @@ private:
     }
 
     static future<> flush_pending_packets_actor(conn_ptr conn) {
-        co_await internal::flush_pending_transport_packets(*conn);
+        co_await internal::flush_pending_transport_packets(conn->transport);
     }
 
     static future<> conn_actor_loop(conn_ptr conn) {
-        co_await internal::run_connection_actor(*conn);
+        co_await internal::run_connection_actor(conn->actor);
     }
 
     void handle_datagram(net::datagram d) {
@@ -1501,7 +1422,7 @@ bool server_connection::can_send_connection_close() const noexcept {
 
 future<> server_connection::actor_handle_next_rx_event() {
     auto evt = rx_queue.pop();
-    co_await internal::recv_transport_datagram(*this, evt.src, std::move(evt.packet));
+    co_await internal::recv_transport_datagram(transport, evt.src, std::move(evt.packet));
     request_blocked_send_retry();
 }
 
@@ -1512,7 +1433,7 @@ future<> server_connection::actor_handle_stop_request() {
     stop_requested = false;
     discard_blocked_send();
 
-    co_await internal::send_connection_close(*this);
+    co_await internal::send_connection_close(transport);
 
     closing = true;
     abort_event_queues(stop_error_local ? "server connection failed" : "server connection stopped");
@@ -1536,7 +1457,7 @@ future<> server_connection::actor_handle_stop_request() {
 }
 
 future<> server_connection::actor_handle_timer_tick() {
-    co_await internal::handle_transport_timer(*this);
+    co_await internal::handle_transport_timer(transport);
     request_blocked_send_retry();
 }
 

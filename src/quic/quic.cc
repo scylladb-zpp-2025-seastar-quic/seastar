@@ -19,7 +19,7 @@
  * Copyright (C) 2026 ScyllaDB Ltd.
  */
 
-#include <seastar/quic/quic.hh>
+#include "quic_impl.hh"
 
 #include <deque>
 #include <exception>
@@ -87,15 +87,7 @@ public:
     }
 
     void complete_send_bytes(size_t len) override {
-        if (!len) {
-            return;
-        }
-        if (len >= _pending_send_bytes) {
-            _pending_send_bytes = 0;
-        } else {
-            _pending_send_bytes -= len;
-        }
-        _command_space_cv.broadcast();
+        (void)len;
     }
 
     void consume_stream_data(stream_id sid, size_t len) override {
@@ -161,6 +153,15 @@ public:
         }
         auto cmd = std::move(_commands.front());
         _commands.pop_front();
+        if (cmd.op == transport_command::kind::send) {
+            auto msg_size = cmd.msg.payload.size();
+            if (msg_size >= _pending_send_bytes) {
+                _pending_send_bytes = 0;
+            } else {
+                _pending_send_bytes -= msg_size;
+            }
+            _command_space_cv.broadcast();
+        }
         return cmd;
     }
 

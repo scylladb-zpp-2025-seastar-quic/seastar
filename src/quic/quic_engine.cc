@@ -19,7 +19,7 @@
  * Copyright (C) 2026 ScyllaDB Ltd.
  */
 
-#include <seastar/quic/quic.hh>
+#include "quic_impl.hh"
 
 #include <chrono>
 #include <cstring>
@@ -846,6 +846,13 @@ future<std::optional<quic_message>> send_stream_message(connection_transport& tr
                 transport.stop_transport();
                 co_return std::nullopt;
             }
+            if (result.nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+                complete_send_progress(transport, msg, result.consumed);
+                co_await flush_pending_transport_packets(transport);
+                transport.rearm_transport_timer();
+                msg.fin = send_fin;
+                co_return std::make_optional(std::move(msg));
+            }
             if (result.nwrite == NGTCP2_ERR_STREAM_SHUT_WR || result.nwrite == NGTCP2_ERR_STREAM_NOT_FOUND) {
                 complete_send_progress(transport, msg, result.consumed);
                 discard_unsent_send_bytes(transport, msg);
@@ -863,15 +870,18 @@ future<std::optional<quic_message>> send_stream_message(connection_transport& tr
         complete_send_progress(transport, msg, result.consumed);
         if (result.nwrite == 0) {
             co_await flush_pending_transport_packets(transport);
+            if (result.consumed) {
+                continue;
+            }
             transport.rearm_transport_timer();
             msg.fin = send_fin;
             co_return std::make_optional(std::move(msg));
         }
 
-        if (!remaining && send_fin) {
+        co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(result.nwrite)));
+        if (send_fin && msg.payload.empty()) {
             send_fin = false;
         }
-        co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(result.nwrite)));
 
         if (msg.payload.empty() && !send_fin) {
             break;

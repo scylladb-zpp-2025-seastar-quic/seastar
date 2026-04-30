@@ -21,37 +21,18 @@
 
 #pragma once
 
-#include <stdexcept>
-#include <string>
-#include <string_view>
+#include <seastar/quic/quic_error.hh>
 
 namespace seastar::quic::experimental {
 
-enum class quic_error {
-    none = 0,
-    invalid_argument,
-    invalid_state,
-    io,
-    timeout,
-    protocol,
-    closed,
-    unsupported,
-    internal,
-    backend,
-};
+quic_error classify_ngtcp2_error(int code) noexcept;
+quic_error classify_gnutls_error(int code) noexcept;
 
-const char* to_string(quic_error error) noexcept;
+bool ngtcp2_is_write_more(int code) noexcept;
+bool ngtcp2_is_draining(int code) noexcept;
+bool ngtcp2_is_idle_close(int code) noexcept;
 
-class quic_exception final : public std::runtime_error {
-public:
-    explicit quic_exception(quic_error error, std::string detail = {});
-
-    quic_error code() const noexcept;
-
-private:
-    quic_error _error;
-};
-
-[[noreturn]] void throw_quic_error(quic_error error, std::string_view detail = {});
+std::string ngtcp2_error_message(int code);
+std::string gnutls_error_message(int code);
 
 } // namespace seastar::quic::experimental

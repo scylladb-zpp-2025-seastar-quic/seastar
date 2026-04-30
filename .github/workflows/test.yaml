@@ -43,6 +43,9 @@ jobs:
         with:
           submodules: "${{ contains(inputs.enables, 'dpdk') }}"
 
+      - name: Checkout ngtcp2 submodule
+        run: git submodule update --init --recursive ngtcp2
+
       - run: |
           sudo apt-get update
 
