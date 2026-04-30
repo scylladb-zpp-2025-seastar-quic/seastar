@@ -25,14 +25,18 @@
 #include <cmath>
 #include <iostream>
 #include <ranges>
+#include <vector>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/rpc/rpc.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/quic/quic_server.hh>
 #include <seastar/rpc/lz4_compressor.hh>
-#include <seastar/rpc/rpc_quic_adapters.hh>
+#include <seastar/rpc/rpc_quic_transport.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/loop.hh>
+
+#include "../apps/lib/stop_signal.hh"
 
 using namespace seastar;
 
@@ -137,7 +141,7 @@ int main(int ac, char** av) {
     static logger log("quic_rpc_demo");
     myrpc.set_logger(&log);
 
-    return app.run_deprecated(ac, av, [&] {
+    return app.run(ac, av, [&] () -> future<> {
         auto&& config = app.configuration();
         uint16_t port = config["port"].as<uint16_t>();
         bool compress = config["compress"].as<bool>();
@@ -183,41 +187,53 @@ int main(int ac, char** av) {
             client_cfg.session_options.transport.initial_max_stream_data_bidi_local = 4 * 1024 * 1024;
             client_cfg.session_options.transport.initial_max_stream_data_bidi_remote = 4 * 1024 * 1024;
             client_cfg.session_options.transport.initial_max_data = 64 * 1024 * 1024;
-            auto sock = rpc::experimental::make_quic_client_socket(std::move(client_cfg));
+            client = co_await myrpc.make_quic_client(co, std::move(client_cfg));
 
-            client = std::make_unique<rpc::protocol<serializer>::client>(myrpc, co, std::move(sock), addr);
+            std::vector<future<>> pending;
+            pending.reserve(1400);
+            auto background = [&pending] (auto fut) {
+                pending.push_back(std::move(fut).then_wrapped([] (auto f) {
+                    try {
+                        f.get();
+                    } catch (const rpc::closed_error&) {
+                    } catch (...) {
+                    }
+                }));
+            };
 
-            auto f = test8(*client, 1500ms).then_wrapped([](future<> f) {
+            pending.push_back(test8(*client, 1500ms).then_wrapped([](future<> f) {
                 try {
                     f.get();
                     printf("test8 should not get here!\n");
                 } catch (rpc::timeout_error&) {
                     printf("test8 timeout!\n");
+                } catch (rpc::closed_error&) {
+                    fmt::print("test8 connection is closed\n");
                 }
-            });
+            }));
             for (auto i = 0; i < 100; i++) {
                 fmt::print("iteration={:d}\n", i);
-                (void)test1(*client, 5).then([] (){ fmt::print("test1 ended\n");});
-                (void)test2(*client, 1, 2).then([] (int r) { fmt::print("test2 got {:d}\n", r); });
-                (void)test3(*client, x).then([](double x) { fmt::print("sin={:f}\n", x); });
-                (void)test4(*client).then_wrapped([](future<> f) {
+                background(test1(*client, 5).then([] (){ fmt::print("test1 ended\n");}));
+                background(test2(*client, 1, 2).then([] (int r) { fmt::print("test2 got {:d}\n", r); }));
+                background(test3(*client, x).then([](double x) { fmt::print("sin={:f}\n", x); }));
+                background(test4(*client).then_wrapped([](future<> f) {
                     try {
                         f.get();
                         fmt::print("test4 your should not see this!\n");
                     } catch (std::runtime_error& x){
                         fmt::print("test4 {}\n", x.what());
                     }
-                });
-                (void)test5(*client).then([] { fmt::print("test5 no wait ended\n"); });
-                (void)test6(*client, 1).then([] { fmt::print("test6 ended\n"); });
-                (void)test7(*client, 5, 6).then([] (long r) { fmt::print("test7 got {:d}\n", r); });
-                (void)test9(*client, 1, 2).then([] (long r) { fmt::print("test9 got {:d}\n", r); });
-                (void)test9_1(*client, 1, 2, 3).then([] (long r) { fmt::print("test9.1 got {:d}\n", r); });
-                (void)test9_2(*client, 1, 2, 3, 4).then([] (long r) { fmt::print("test9.2 got {:d}\n", r); });
-                (void)test10(*client).then([] (long r) { fmt::print("test10 got {:d}\n", r); });
-                (void)test10_1(*client).then([] (rpc::tuple<long, int> r) { fmt::print("test10_1 got {:d} and {:d}\n", std::get<0>(r), std::get<1>(r)); });
-                (void)test11(*client).then([] (rpc::tuple<long, rpc::optional<int> > r) { fmt::print("test11 got {:d} and {:d}\n", std::get<0>(r), bool(std::get<1>(r))); });
-                (void)test_nohandler(*client).then_wrapped([](future<> f) {
+                }));
+                background(test5(*client).then([] { fmt::print("test5 no wait ended\n"); }));
+                background(test6(*client, 1).then([] { fmt::print("test6 ended\n"); }));
+                background(test7(*client, 5, 6).then([] (long r) { fmt::print("test7 got {:d}\n", r); }));
+                background(test9(*client, 1, 2).then([] (long r) { fmt::print("test9 got {:d}\n", r); }));
+                background(test9_1(*client, 1, 2, 3).then([] (long r) { fmt::print("test9.1 got {:d}\n", r); }));
+                background(test9_2(*client, 1, 2, 3, 4).then([] (long r) { fmt::print("test9.2 got {:d}\n", r); }));
+                background(test10(*client).then([] (long r) { fmt::print("test10 got {:d}\n", r); }));
+                background(test10_1(*client).then([] (rpc::tuple<long, int> r) { fmt::print("test10_1 got {:d} and {:d}\n", std::get<0>(r), std::get<1>(r)); }));
+                background(test11(*client).then([] (rpc::tuple<long, rpc::optional<int> > r) { fmt::print("test11 got {:d} and {:d}\n", std::get<0>(r), bool(std::get<1>(r))); }));
+                background(test_nohandler(*client).then_wrapped([](future<> f) {
                     try {
                         f.get();
                         fmt::print("test_nohandler your should not see this!\n");
@@ -226,10 +242,10 @@ int main(int ac, char** av) {
                     } catch (...) {
                         fmt::print("incorrect exception!\n");
                     }
-                });
-                (void)test_nohandler_nowait(*client);
-                auto c = make_lw_shared<rpc::cancellable>();
-                (void)test13(*client, *c).then_wrapped([](future<> f) {
+                }));
+                background(test_nohandler_nowait(*client));
+                auto c1 = make_lw_shared<rpc::cancellable>();
+                background(test13(*client, *c1).then_wrapped([](future<> f) {
                     try {
                         f.get();
                         fmt::print("test13 shold not get here\n");
@@ -238,9 +254,10 @@ int main(int ac, char** av) {
                     } catch(...) {
                         fmt::print("test13 wrong exception\n");
                     }
-                });
-                c->cancel();
-                (void)test13(*client, *c).then_wrapped([](future<> f) {
+                }));
+                c1->cancel();
+                auto c2 = make_lw_shared<rpc::cancellable>();
+                background(test13(*client, *c2).then_wrapped([](future<> f) {
                     try {
                         f.get();
                         fmt::print("test13 shold not get here\n");
@@ -249,8 +266,8 @@ int main(int ac, char** av) {
                     } catch(...) {
                         fmt::print("test13 wrong exception\n");
                     }
-                });
-                (void)sleep(500us).then([c] { c->cancel(); });
+                }));
+                (void)sleep(500us).then([c2] { c2->cancel(); });
                 // (void)test_message_to_big(*client, uninitialized_string(10'000'001)).then_wrapped([](future<> f) {
                 //     try {
                 //         f.get();
@@ -263,7 +280,7 @@ int main(int ac, char** av) {
                 // });
             }
             // delay a little for a time-sensitive test
-            (void)sleep(400ms).then([test12] () mutable {
+            background(sleep(400ms).then([test12] () mutable {
                 // server is configured for 10MB max, throw 25MB worth of requests at it.
                 auto now = rpc::rpc_clock_type::now();
                 return parallel_for_each(std::views::iota(0, 25), [test12, now] (int idx) mutable {
@@ -277,14 +294,9 @@ int main(int ac, char** av) {
                     auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(later - now);
                     fmt::print("test12 completed after {:d} ms (should be ~300)\n", delta.count());
                 });
-            });
-            (void)f.finally([] {
-                return sleep(10s).then([] {
-                    return client->stop().then([] {
-                        return engine().exit(0);
-                    });
-                });
-            });
+            }));
+            co_await when_all(pending.begin(), pending.end()).discard_result();
+            co_await client->stop();
         } else {
             std::cout << "server on port " << port << std::endl;
             myrpc.register_handler(7, [](long a, long b) mutable {
@@ -342,9 +354,22 @@ int main(int ac, char** av) {
             if (compress) {
                 so.compressor_factory = &mc;
             }
-            auto ss = rpc::experimental::make_quic_server_socket(std::move(server_cfg));
-            server = std::make_unique<rpc::protocol<serializer>::server>(myrpc, so, std::move(ss), limits);
+            quic::experimental::quic_server quic_server;
+            co_await quic_server.start(std::move(server_cfg));
+
+            server = std::make_unique<rpc::protocol<serializer>::server>(
+                    myrpc,
+                    so,
+                    make_ipv6_address(address, 0),
+                    limits);
+            server->accept_quic(quic_server);
+
+            seastar_apps_lib::stop_signal stop_signal;
+            co_await stop_signal.wait();
+            co_await quic_server.stop();
+            co_await server->stop();
         }
+        co_return;
     });
 
 }

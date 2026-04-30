@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <seastar/core/coroutine.hh>
+#include <seastar/quic/quic_client.hh>
 #include <seastar/quic/quic.hh>
 #include <seastar/rpc/rpc.hh>
 
@@ -24,6 +26,10 @@ namespace seastar::rpc::experimental {
 class quic_client_transport final : public connection::transport {
 public:
     quic_client_transport(
+            seastar::quic::experimental::quic_client client,
+            seastar::quic::experimental::connection conn,
+            seastar::quic::experimental::stream control_stream);
+    quic_client_transport(
             seastar::quic::experimental::connection conn,
             seastar::quic::experimental::stream control_stream);
 
@@ -31,10 +37,12 @@ public:
     output_stream<char>& output() override;
     void shutdown_input() override;
     void shutdown_output() override;
+    future<> stop() override;
     future<internal::incoming_request> receive_request(connection& owner) override;
-    future<> send_request(connection& owner, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) override;
+    future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) override;
 
 private:
+    std::optional<seastar::quic::experimental::quic_client> _client;
     seastar::quic::experimental::connection _conn;
     seastar::quic::experimental::stream _control_stream;
     input_stream<char> _control_input;
@@ -53,7 +61,7 @@ public:
     void shutdown_input() override;
     void shutdown_output() override;
     future<internal::incoming_request> receive_request(connection& owner) override;
-    future<> send_request(connection& owner, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) override;
+    future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) override;
 
 private:
     seastar::quic::experimental::connection _conn;
@@ -63,3 +71,35 @@ private:
 };
 
 } // namespace seastar::rpc::experimental
+
+namespace seastar::rpc {
+
+template <typename Serializer, typename MsgType>
+future<std::unique_ptr<typename protocol<Serializer, MsgType>::client>>
+protocol<Serializer, MsgType>::make_quic_client(quic::experimental::quic_client_config config) {
+    return make_quic_client(client_options{}, std::move(config));
+}
+
+template <typename Serializer, typename MsgType>
+future<std::unique_ptr<typename protocol<Serializer, MsgType>::client>>
+protocol<Serializer, MsgType>::make_quic_client(client_options options, quic::experimental::quic_client_config config) {
+    quic::experimental::quic_client quic_client;
+    auto session = co_await quic_client.connect(std::move(config));
+    auto peer_addr = session.peer_address();
+    auto local_addr = session.local_address();
+    auto control_stream = co_await session.open_stream();
+    auto transport = std::make_unique<experimental::quic_client_transport>(
+            std::move(quic_client),
+            std::move(session),
+            std::move(control_stream));
+
+    co_return std::make_unique<typename protocol<Serializer, MsgType>::client>(
+            *this,
+            std::move(options),
+            std::move(transport),
+            peer_addr,
+            local_addr,
+            false);
+}
+
+} // namespace seastar::rpc

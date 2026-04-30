@@ -46,6 +46,8 @@ namespace internal {
 
 namespace {
 
+constexpr size_t stream_read_queue_capacity = 65536;
+
 uint64_t transport_now_ns() {
     using namespace std::chrono;
     return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
@@ -266,7 +268,9 @@ private:
     bool _can_read = true;
     bool _can_write = true;
 
-    queue<temporary_buffer<char>> _read_queue{1024};
+    // Memory backpressure is enforced by receive_budget; keep the item queue
+    // large enough for bursts of small STREAM frames.
+    queue<temporary_buffer<char>> _read_queue{stream_read_queue_capacity};
     shared_promise<> _input_shutdown;
     bool _input_shutdown_notified = false;
     bool _output_closed = false;
@@ -853,6 +857,13 @@ future<std::optional<quic_message>> send_stream_message(connection_transport& tr
                 co_await flush_pending_transport_packets(transport);
                 transport.rearm_transport_timer();
                 co_return std::nullopt;
+            }
+            if (result.nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+                complete_send_progress(transport, msg, result.consumed);
+                co_await flush_pending_transport_packets(transport);
+                transport.rearm_transport_timer();
+                msg.fin = send_fin;
+                co_return std::make_optional(std::move(msg));
             }
             discard_unsent_send_bytes(transport, msg);
             transport.fail_transport(

@@ -51,6 +51,7 @@ namespace bi = boost::intrusive;
 namespace seastar::quic::experimental {
 class connection;
 class quic_server;
+struct quic_client_config;
 class stream;
 }
 
@@ -246,16 +247,19 @@ class source_impl;
 
 struct reply_handle {
     using sender = noncopyable_function<future<> (snd_buf&&, std::optional<rpc_clock_type::time_point>)>;
+    using closer = noncopyable_function<future<> ()>;
 
     sender send;
+    closer close;
 
     reply_handle() = default;
-    explicit reply_handle(sender s) noexcept
-        : send(std::move(s)) {
+    explicit reply_handle(sender s, closer c = {}) noexcept
+        : send(std::move(s))
+        , close(std::move(c)) {
     }
 
     explicit operator bool() const noexcept {
-        return static_cast<bool>(send);
+        return static_cast<bool>(send) || static_cast<bool>(close);
     }
 };
 
@@ -289,8 +293,13 @@ public:
         virtual output_stream<char>& output() = 0;
         virtual void shutdown_input() = 0;
         virtual void shutdown_output() = 0;
+        virtual future<> stop() {
+            shutdown_input();
+            shutdown_output();
+            return make_ready_future<>();
+        }
         virtual future<internal::incoming_request> receive_request(connection& owner) = 0;
-        virtual future<> send_request(connection& owner, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) = 0;
+        virtual future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) = 0;
     };
 
 protected:
@@ -396,7 +405,7 @@ protected:
     void set_transport(std::unique_ptr<transport> t);
     internal::reply_handle make_reply_handle();
     future<internal::incoming_request> transport_receive_request();
-    future<> transport_send_request(snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr);
+    future<> transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr);
     virtual future<internal::incoming_request> receive_request_frame(input_stream<char>& in);
 
     friend class experimental::quic_server_transport;
@@ -1039,6 +1048,9 @@ public:
     ///     signature: `future<Ret>(protocol::client&, Args...)`.
     template<typename Func>
     auto make_client(MsgType t);
+
+    future<std::unique_ptr<client>> make_quic_client(::seastar::quic::experimental::quic_client_config config);
+    future<std::unique_ptr<client>> make_quic_client(client_options options, ::seastar::quic::experimental::quic_client_config config);
 
     /// Register a handler to be called when this verb is invoked.
     ///

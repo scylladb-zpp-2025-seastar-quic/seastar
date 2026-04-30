@@ -640,11 +640,14 @@ inline future<> reply(wait_type, future<RetTypes>&& ret, int64_t msg_id, shared_
 // specialization for no_wait_type which does not send a reply
 template<typename Serializer>
 inline future<> reply(no_wait_type, future<no_wait_type>&& r, int64_t msgid, shared_ptr<server::connection> client,
-        internal::reply_handle, std::optional<rpc_clock_type::time_point>, std::optional<rpc_clock_type::duration>) {
+        internal::reply_handle reply_handle, std::optional<rpc_clock_type::time_point>, std::optional<rpc_clock_type::duration>) {
     try {
         r.get();
     } catch (std::exception& ex) {
         client->get_logger()(client->info(), msgid, to_sstring("exception \"") + ex.what() + "\" in no_wait handler ignored");
+    }
+    if (reply_handle.close) {
+        return reply_handle.close();
     }
     return make_ready_future<>();
 }
@@ -1009,4 +1012,3 @@ struct hash<seastar::rpc::streaming_domain_type> {
     }
 };
 }
-

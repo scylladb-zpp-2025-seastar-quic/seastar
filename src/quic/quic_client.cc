@@ -1305,8 +1305,11 @@ public:
         } catch (const quic_exception& e) {
             quic_client_log.error("client connect failed: code={} detail='{}'", to_string(e.code()), e.what());
             init_error = std::current_exception();
+        } catch (const std::exception& e) {
+            quic_client_log.error("client connect failed: unexpected exception: {}", e.what());
+            init_error = std::current_exception();
         } catch (...) {
-            quic_client_log.error("client connect failed: unexpected exception");
+            quic_client_log.error("client connect failed: unexpected non-std exception");
             init_error = std::current_exception();
         }
 
