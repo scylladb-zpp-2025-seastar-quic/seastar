@@ -197,9 +197,9 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         void rearm_transport_timer() override { owner.rearm_transport_timer(); }
         void request_close() override { owner.request_close(); }
         void stop_transport() override { owner.stop_transport(); }
-        void fail_transport(quic_error error, sstring detail) override { owner.fail_transport(error, std::move(detail)); }
+        void fail_transport(quic_error_code error, sstring detail) override { owner.fail_transport(error, std::move(detail)); }
         void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override { owner.complete_open_stream(std::move(result), sid); }
-        void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error error, sstring detail) override {
+        void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) override {
             owner.fail_open_stream(std::move(result), error, std::move(detail));
         }
         void defer_blocked_open_stream(transport_command cmd) override { owner.defer_blocked_open_stream(std::move(cmd)); }
@@ -250,7 +250,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     bool queues_aborted = false;
     bool unregistered = false;
     bool stop_requested = false;
-    std::optional<quic_error> stop_error;
+    std::optional<quic_error_code> stop_error;
     sstring stop_error_detail;
 
     bool closing = false;
@@ -270,7 +270,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     }
 
     ~server_connection() {
-        fail_blocked_open_streams(quic_error::closed, "server connection destroyed");
+        fail_blocked_open_streams(quic_error_code::closed, "server connection destroyed");
         discard_blocked_send();
         abort_event_queues("server connection destroyed");
         if (runtime) {
@@ -519,7 +519,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
 
     void fail_open_stream(
       std::shared_ptr<promise<stream_id>> result,
-      quic_error error,
+      quic_error_code error,
       sstring detail) {
         if (runtime) {
             runtime->fail_open_stream(std::move(result), error, std::move(detail));
@@ -582,7 +582,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         engine->clear_blocked_open_stream_retry(type);
     }
 
-    void fail_blocked_open_streams(quic_error error, std::string_view detail) {
+    void fail_blocked_open_streams(quic_error_code error, std::string_view detail) {
         if (!engine) {
             return;
         }
@@ -594,7 +594,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
             return;
         }
         stop_requested = true;
-        fail_blocked_open_streams(quic_error::closed, "server connection stopping");
+        fail_blocked_open_streams(quic_error_code::closed, "server connection stopping");
         cancel_transport_timer();
         wake_actor();
     }
@@ -663,8 +663,8 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     }
     future<> actor_handle_timer_tick();
     void stop_transport();
-    void fail(quic_error error, const sstring& detail);
-    void fail_transport(quic_error error, sstring detail);
+    void fail(quic_error_code error, const sstring& detail);
+    void fail_transport(quic_error_code error, sstring detail);
 };
 
 using conn_ptr = lw_shared_ptr<server_connection>;
@@ -715,7 +715,7 @@ public:
 
     future<> start(quic_server_config cfg) {
         if (_started) {
-            throw_quic_error(quic_error::invalid_state, "server already started");
+            throw_quic_error(quic_error_code::invalid_state, "server already started");
         }
         ensure_gnutls_global();
         validate_ip_socket_address(cfg.listen_address, "listen_address");
@@ -760,13 +760,13 @@ public:
 
     future<internal::connection_engine_ptr> accept() {
         if (!_started) {
-            throw_quic_error(quic_error::invalid_state, "server is not started");
+            throw_quic_error(quic_error_code::invalid_state, "server is not started");
         }
         quic_server_log.debug("server accept wait: pending_accepted={} active_conns={}", _accepted.size(), _conns.size());
 
         while (_accepted.empty()) {
             if (_stopping) {
-                throw_quic_error(quic_error::closed, "server stopped");
+                throw_quic_error(quic_error_code::closed, "server stopped");
             }
             co_await _accept_cv.wait();
         }
@@ -1164,7 +1164,7 @@ private:
         ngtcp2_version_cid vc{};
         int rv = ngtcp2_pkt_decode_version_cid(&vc, pkt, pkt_len, NGTCP2_MAX_CIDLEN);
         if (rv < 0) {
-            throw_quic_error(quic_error::protocol, "failed to decode Initial CID");
+            throw_quic_error(quic_error_code::protocol, "failed to decode Initial CID");
         }
 
         ngtcp2_cid dcid{};
@@ -1294,7 +1294,7 @@ private:
               conn->closing = true;
               conn->abort_event_queues("server actor loop failed");
               if (conn->runtime && conn->runtime->is_open()) {
-                  conn->runtime->mark_error(quic_error::io, "server actor loop failed");
+                  conn->runtime->mark_error(quic_error_code::io, "server actor loop failed");
               }
               if (auto server = conn->lock_server()) {
                   server->unregister_connection(conn);
@@ -1353,7 +1353,7 @@ private:
         try {
             if (!conn->rx_queue.push(conn_rx_event{src, std::move(pkt)})) {
                 quic_server_log.warn("server rx queue full: peer={} queued={} max={}", conn->peer, conn->rx_queue.size(), conn->rx_queue.max_size());
-                conn->fail(quic_error::io, "server rx queue is full");
+                conn->fail(quic_error_code::io, "server rx queue is full");
                 return;
             }
             conn->wake_actor();
@@ -1361,7 +1361,7 @@ private:
             if (!conn->active()) {
                 return;
             }
-            conn->fail(quic_error::io, "server rx queue push failed");
+            conn->fail(quic_error_code::io, "server rx queue push failed");
         }
     }
 
@@ -1380,7 +1380,7 @@ private:
 
                 auto conns_copy = _conns;
                 for (auto& conn : conns_copy) {
-                    conn->fail(quic_error::io, "server receive_loop channel receive failed");
+                    conn->fail(quic_error_code::io, "server receive_loop channel receive failed");
                 }
                 co_return;
             }
@@ -1446,9 +1446,9 @@ future<> server_connection::actor_handle_stop_request() {
     }
     if (engine) {
         if (stop_error_local) {
-            engine->on_transport_closed(std::make_exception_ptr(quic_exception(*stop_error_local, stop_error_detail_local)));
+            engine->on_transport_closed(std::make_exception_ptr(quic_error(*stop_error_local, stop_error_detail_local)));
         } else {
-            engine->on_transport_closed(std::make_exception_ptr(quic_exception(quic_error::closed, "server connection stopped")));
+            engine->on_transport_closed(std::make_exception_ptr(quic_error(quic_error_code::closed, "server connection stopped")));
         }
     }
     if (auto server_state = lock_server()) {
@@ -1467,16 +1467,16 @@ void server_connection::stop_transport() {
         return;
     }
     stop_requested = true;
-    fail_blocked_open_streams(quic_error::closed, "server connection stopped");
+    fail_blocked_open_streams(quic_error_code::closed, "server connection stopped");
     discard_blocked_send();
     if (engine) {
-        engine->on_transport_closed(std::make_exception_ptr(quic_exception(quic_error::closed, "server connection stopped")));
+        engine->on_transport_closed(std::make_exception_ptr(quic_error(quic_error_code::closed, "server connection stopped")));
     }
     cancel_transport_timer();
     wake_actor();
 }
 
-void server_connection::fail(quic_error error, const sstring& detail) {
+void server_connection::fail(quic_error_code error, const sstring& detail) {
     quic_server_log.error(
       "server connection failure: peer={} error={} detail='{}' closing={} mapped_dcids={}",
       peer,
@@ -1494,14 +1494,14 @@ void server_connection::fail(quic_error error, const sstring& detail) {
     fail_blocked_open_streams(error, detail);
     discard_blocked_send();
     if (engine) {
-        engine->on_transport_closed(std::make_exception_ptr(quic_exception(error, detail)));
+        engine->on_transport_closed(std::make_exception_ptr(quic_error(error, detail)));
     }
     cancel_transport_timer();
     stop_requested = true;
     wake_actor();
 }
 
-void server_connection::fail_transport(quic_error error, sstring detail) {
+void server_connection::fail_transport(quic_error_code error, sstring detail) {
     fail(error, detail);
 }
 

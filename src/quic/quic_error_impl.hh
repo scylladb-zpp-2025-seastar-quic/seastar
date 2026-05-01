@@ -25,8 +25,10 @@
 
 namespace seastar::quic::experimental {
 
-quic_error classify_ngtcp2_error(int code) noexcept;
-quic_error classify_gnutls_error(int code) noexcept;
+[[noreturn]] void throw_quic_error(quic_error_code error, std::string_view detail = {});
+
+quic_error_code classify_ngtcp2_error(int code) noexcept;
+quic_error_code classify_gnutls_error(int code) noexcept;
 
 bool ngtcp2_is_write_more(int code) noexcept;
 bool ngtcp2_is_draining(int code) noexcept;

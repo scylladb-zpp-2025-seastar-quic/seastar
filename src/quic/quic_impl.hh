@@ -85,13 +85,13 @@ public:
     virtual std::optional<transport_command> poll_command() = 0;
     virtual void set_command_notifier(std::function<void()> notifier) = 0;
     virtual void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) = 0;
-    virtual void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error error, sstring detail) = 0;
+    virtual void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) = 0;
     virtual void mark_transport_ready(socket_address local, socket_address peer, sstring selected_alpn) = 0;
     virtual void mark_transport_closed() = 0;
-    virtual void mark_error(quic_error error, sstring detail) = 0;
+    virtual void mark_error(quic_error_code error, sstring detail) = 0;
     virtual bool transport_terminal() const noexcept = 0;
     virtual bool transport_failed() const noexcept = 0;
-    virtual quic_error transport_error() const noexcept = 0;
+    virtual quic_error_code transport_error() const noexcept = 0;
     virtual sstring transport_error_detail() const = 0;
 };
 
@@ -140,12 +140,12 @@ public:
     virtual void rearm_transport_timer() = 0;
     virtual void request_close() = 0;
     virtual void stop_transport() = 0;
-    virtual void fail_transport(quic_error error, sstring detail) = 0;
+    virtual void fail_transport(quic_error_code error, sstring detail) = 0;
 
     virtual void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) = 0;
     virtual void fail_open_stream(
       std::shared_ptr<promise<stream_id>> result,
-      quic_error error,
+      quic_error_code error,
       sstring detail) = 0;
     virtual void defer_blocked_open_stream(transport_command cmd) = 0;
     virtual std::optional<transport_command> pop_blocked_open_stream(stream_type type) = 0;
@@ -218,7 +218,7 @@ public:
     bool blocked_open_stream_retry_pending(stream_type type) const noexcept;
     void clear_blocked_open_stream_retry(stream_type type) noexcept;
     bool has_blocked_open_stream_retry_work() const noexcept;
-    void fail_blocked_open_streams(quic_error error, std::string_view detail);
+    void fail_blocked_open_streams(quic_error_code error, std::string_view detail);
 
 private:
     class impl;

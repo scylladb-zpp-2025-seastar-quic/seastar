@@ -65,7 +65,7 @@ static logger quic_client_log("quic_client");
 using quic_message = internal::quic_message;
 
 struct tls_verification_failure {
-    quic_error error = quic_error::none;
+    quic_error_code error = quic_error_code::none;
     sstring detail;
 };
 
@@ -87,7 +87,7 @@ socket_address wildcard_address_for_family(sa_family_t family) {
         return socket_address(sa);
     }
     default:
-        throw_quic_error(quic_error::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
+        throw_quic_error(quic_error_code::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
     }
 }
 
@@ -159,9 +159,9 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         void rearm_transport_timer() override { owner.rearm_transport_timer(); }
         void request_close() override { owner.request_close(); }
         void stop_transport() override { owner.stop_transport(); }
-        void fail_transport(quic_error err, sstring detail) override { owner.fail_transport(err, std::move(detail)); }
+        void fail_transport(quic_error_code err, sstring detail) override { owner.fail_transport(err, std::move(detail)); }
         void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override { owner.complete_open_stream(std::move(result), sid); }
-        void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error err, sstring detail) override {
+        void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code err, sstring detail) override {
             owner.fail_open_stream(std::move(result), err, std::move(detail));
         }
         void defer_blocked_open_stream(internal::transport_command cmd) override { owner.defer_blocked_open_stream(std::move(cmd)); }
@@ -235,7 +235,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 
     ~client_state() {
-        fail_blocked_open_streams(quic_error::closed, "client state destroyed");
+        fail_blocked_open_streams(quic_error_code::closed, "client state destroyed");
         discard_blocked_send();
         abort_event_queues("client state destroyed");
         if (runtime) {
@@ -508,7 +508,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
 
     void fail_open_stream(
       std::shared_ptr<promise<stream_id>> result,
-      quic_error error,
+      quic_error_code error,
       sstring detail) {
         if (runtime) {
             runtime->fail_open_stream(std::move(result), error, std::move(detail));
@@ -571,7 +571,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         engine->clear_blocked_open_stream_retry(type);
     }
 
-    void fail_blocked_open_streams(quic_error error, std::string_view detail) {
+    void fail_blocked_open_streams(quic_error_code error, std::string_view detail) {
         if (!engine) {
             return;
         }
@@ -583,7 +583,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
             return;
         }
         stop_requested = true;
-        fail_blocked_open_streams(quic_error::closed, "connection closing");
+        fail_blocked_open_streams(quic_error_code::closed, "connection closing");
         cancel_transport_timer();
         wake_actor();
     }
@@ -596,18 +596,18 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
           handshake_done,
           channel_ready);
         stopping = true;
-        fail_blocked_open_streams(quic_error::closed, "transport stopped");
+        fail_blocked_open_streams(quic_error_code::closed, "transport stopped");
         discard_blocked_send();
         abort_event_queues("client transport stopped");
         cancel_transport_timer();
-        auto ex = std::make_exception_ptr(quic_exception(quic_error::closed, "transport stopped"));
+        auto ex = std::make_exception_ptr(quic_error(quic_error_code::closed, "transport stopped"));
         if (runtime) {
             runtime->mark_transport_closed();
         }
         if (engine) {
             engine->on_transport_closed(ex);
         }
-        fail_handshake(std::make_exception_ptr(quic_exception(quic_error::closed, "transport stopped before handshake")));
+        fail_handshake(std::make_exception_ptr(quic_error(quic_error_code::closed, "transport stopped before handshake")));
         wake_actor();
         if (channel_ready && !channel.is_closed()) {
             channel.shutdown_input();
@@ -615,7 +615,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         }
     }
 
-    void fail(quic_error err, const sstring& detail) {
+    void fail(quic_error_code err, const sstring& detail) {
         quic_client_log.error(
           "client transport failure: error={} detail='{}' local={} remote={} handshake_done={}",
           to_string(err),
@@ -628,7 +628,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         discard_blocked_send();
         abort_event_queues("client transport failed");
         cancel_transport_timer();
-        auto ex = std::make_exception_ptr(quic_exception(err, detail));
+        auto ex = std::make_exception_ptr(quic_error(err, detail));
         if (runtime) {
             runtime->mark_error(err, detail);
         }
@@ -643,7 +643,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         }
     }
 
-    void fail_transport(quic_error err, sstring detail) {
+    void fail_transport(quic_error_code err, sstring detail) {
         fail(err, detail);
     }
 
@@ -833,7 +833,7 @@ static std::optional<tls_verification_failure> verify_tls_peer_certificate(clien
     }
     if (status != 0) {
         return tls_verification_failure{
-          .error = quic_error::protocol,
+          .error = quic_error_code::protocol,
           .detail = sstring("peer certificate verification failed: ")
                     + certificate_status_to_string(st.tls, status),
         };
@@ -976,38 +976,38 @@ void init_tls(client_state& st) {
       st.cfg.alpns.size());
     int rv = gnutls_certificate_allocate_credentials(&st.cred);
     if (rv < 0) {
-        throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+        throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
     }
 
     rv = gnutls_certificate_set_x509_system_trust(st.cred);
     if (rv < 0) {
-        throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+        throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
     }
     if (st.cfg.ca_file) {
         rv = gnutls_certificate_set_x509_trust_file(st.cred, st.cfg.ca_file->c_str(), GNUTLS_X509_FMT_PEM);
         if (rv < 0) {
-            throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+            throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
         }
         if (rv == 0) {
-            throw quic_exception(
-              quic_error::invalid_argument,
+            throw quic_error(
+              quic_error_code::invalid_argument,
               sstring("no trust anchors loaded from ") + *st.cfg.ca_file);
         }
     }
 
     rv = gnutls_init(&st.tls, GNUTLS_CLIENT | GNUTLS_ENABLE_EARLY_DATA);
     if (rv < 0) {
-        throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+        throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
     }
 
     rv = gnutls_credentials_set(st.tls, GNUTLS_CRD_CERTIFICATE, st.cred);
     if (rv < 0) {
-        throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+        throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
     }
 
     rv = gnutls_priority_set_direct(st.tls, "NORMAL:-VERS-ALL:+VERS-TLS1.3", nullptr);
     if (rv < 0) {
-        throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+        throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
     }
 
     std::vector<gnutls_datum_t> alpns;
@@ -1021,7 +1021,7 @@ void init_tls(client_state& st) {
     if (!alpns.empty()) {
         rv = gnutls_alpn_set_protocols(st.tls, alpns.data(), alpns.size(), 0);
         if (rv < 0) {
-            throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+            throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
         }
     }
 
@@ -1029,13 +1029,13 @@ void init_tls(client_state& st) {
         rv = gnutls_server_name_set(
           st.tls, GNUTLS_NAME_DNS, st.cfg.server_name.c_str(), st.cfg.server_name.size());
         if (rv < 0) {
-            throw quic_exception(classify_gnutls_error(rv), gnutls_error_message(rv));
+            throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
         }
     }
 
     rv = ngtcp2_crypto_gnutls_configure_client_session(st.tls);
     if (rv != 0) {
-        throw quic_exception(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+        throw quic_error(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
     }
 
     st.conn_ref.get_conn = get_conn;
@@ -1136,7 +1136,7 @@ void init_client_connection(client_state& st) {
       ngtcp2_mem_for_thread(),
       &st);
     if (rv != 0) {
-        throw quic_exception(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
+        throw quic_error(classify_ngtcp2_error(rv), ngtcp2_error_message(rv));
     }
 
     ngtcp2_conn_set_tls_native_handle(st.conn, st.tls);
@@ -1171,7 +1171,7 @@ future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
                 co_return;
             }
             quic_client_log.error("client recv_loop datagram receive failed");
-            st->fail(quic_error::io, "datagram receive failed");
+            st->fail(quic_error_code::io, "datagram receive failed");
             co_return;
         }
 
@@ -1186,7 +1186,7 @@ future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
             if (st->stopping || !st->runtime || !st->runtime->is_open()) {
                 co_return;
             }
-            st->fail(quic_error::io, "rx queue push failed");
+            st->fail(quic_error_code::io, "rx queue push failed");
             co_return;
         }
     }
@@ -1201,14 +1201,14 @@ void start_background_tasks(const lw_shared_ptr<client_state>& st) {
     (void)with_gate(st->task_gate, [st] { return actor_loop(st); })
       .handle_exception([st](std::exception_ptr) {
           if (st->active()) {
-              st->fail(quic_error::io, "actor loop failed");
+              st->fail(quic_error_code::io, "actor loop failed");
           }
       })
       .or_terminate();
     (void)with_gate(st->task_gate, [st] { return recv_loop(st); })
       .handle_exception([st](std::exception_ptr) {
           if (st->active()) {
-              st->fail(quic_error::io, "receive loop failed");
+              st->fail(quic_error_code::io, "receive loop failed");
           }
       })
       .or_terminate();
@@ -1218,7 +1218,7 @@ class quic_client_impl {
 public:
     future<internal::connection_engine_ptr> connect(quic_client_config config) {
         if (_state) {
-            throw_quic_error(quic_error::invalid_state, "client is already connected");
+            throw_quic_error(quic_error_code::invalid_state, "client is already connected");
         }
         ensure_gnutls_global();
         quic_client_log.info(
@@ -1245,7 +1245,7 @@ public:
             validate_ip_socket_address(local, "local_address");
             if (local.family() != st->remote_address.family()) {
                 throw_quic_error(
-                  quic_error::invalid_argument,
+                  quic_error_code::invalid_argument,
                   "local_address and remote_address must use the same address family");
             }
             st->channel = engine().net().make_bound_datagram_channel(local);
@@ -1270,7 +1270,7 @@ public:
               st->remote_address,
               st->tx_payload_limit,
               st->runtime->selected_alpn());
-        } catch (const quic_exception& e) {
+        } catch (const quic_error& e) {
             quic_client_log.error("client connect failed: code={} detail='{}'", to_string(e.code()), e.what());
             init_error = std::current_exception();
         } catch (...) {

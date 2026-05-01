@@ -42,7 +42,7 @@ public:
     }
 
     bool is_open() const noexcept override {
-        return !_closed && !_closing && _error == quic_error::none;
+        return !_closed && !_closing && _error == quic_error_code::none;
     }
 
     socket_address local_address() const override {
@@ -91,7 +91,7 @@ public:
     }
 
     void consume_stream_data(stream_id sid, size_t len) override {
-        if (!len || sid == invalid_stream_id || _error != quic_error::none || _closed || _closing) {
+        if (!len || sid == invalid_stream_id || _error != quic_error_code::none || _closed || _closing) {
             return;
         }
         _commands.emplace_back(transport_command{
@@ -175,9 +175,9 @@ public:
         }
     }
 
-    void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error error, sstring detail) override {
+    void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) override {
         if (result) {
-            result->set_exception(std::make_exception_ptr(quic_exception(error, detail)));
+            result->set_exception(std::make_exception_ptr(quic_error(error, detail)));
         }
     }
 
@@ -192,19 +192,19 @@ public:
             return;
         }
         _closed = true;
-        drain_pending_open_streams(std::make_exception_ptr(quic_exception(quic_error::closed, "transport closed")));
+        drain_pending_open_streams(std::make_exception_ptr(quic_error(quic_error_code::closed, "transport closed")));
         notify_command_ready();
         notify_terminal_waiters();
     }
 
-    void mark_error(quic_error error, sstring detail) override {
-        if (_error != quic_error::none) {
+    void mark_error(quic_error_code error, sstring detail) override {
+        if (_error != quic_error_code::none) {
             return;
         }
         _error = error;
         _error_detail = std::move(detail);
         _closed = true;
-        drain_pending_open_streams(std::make_exception_ptr(quic_exception(_error, _error_detail)));
+        drain_pending_open_streams(std::make_exception_ptr(quic_error(_error, _error_detail)));
         notify_command_ready();
         notify_terminal_waiters();
     }
@@ -214,10 +214,10 @@ public:
     }
 
     bool transport_failed() const noexcept override {
-        return _error != quic_error::none;
+        return _error != quic_error_code::none;
     }
 
-    quic_error transport_error() const noexcept override {
+    quic_error_code transport_error() const noexcept override {
         return _error;
     }
 
@@ -238,14 +238,14 @@ private:
     }
 
     void throw_if_terminal(const char* op) const {
-        if (_error != quic_error::none) {
-            throw quic_exception(_error, sstring(op) + ": " + _error_detail);
+        if (_error != quic_error_code::none) {
+            throw quic_error(_error, sstring(op) + ": " + _error_detail);
         }
         if (_closed) {
-            throw quic_exception(quic_error::closed, sstring(op) + ": transport closed");
+            throw quic_error(quic_error_code::closed, sstring(op) + ": transport closed");
         }
         if (_closing) {
-            throw quic_exception(quic_error::closed, sstring(op) + ": connection closing");
+            throw quic_error(quic_error_code::closed, sstring(op) + ": connection closing");
         }
     }
 
@@ -271,7 +271,7 @@ private:
     connection_options _options;
     bool _closing = false;
     bool _closed = false;
-    quic_error _error = quic_error::none;
+    quic_error_code _error = quic_error_code::none;
     sstring _error_detail;
 
     socket_address _local_address{};

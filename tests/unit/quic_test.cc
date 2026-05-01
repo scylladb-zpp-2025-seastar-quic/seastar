@@ -187,7 +187,7 @@ public:
         active = false;
     }
 
-    void fail_transport(quic_error error, sstring detail) override {
+    void fail_transport(quic_error_code error, sstring detail) override {
         last_error = error;
         last_error_detail = std::move(detail);
     }
@@ -200,12 +200,12 @@ public:
         }
     }
 
-    void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error error, sstring detail) override {
+    void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) override {
         ++fail_open_stream_calls;
         open_stream_error = error;
         open_stream_error_detail = detail;
         if (result) {
-            result->set_exception(std::make_exception_ptr(quic_exception(error, std::string(detail))));
+            result->set_exception(std::make_exception_ptr(quic_error(error, std::string(detail))));
         }
     }
 
@@ -225,9 +225,9 @@ public:
     void clear_blocked_open_stream_retry(stream_type) noexcept override {
     }
 
-    std::optional<quic_error> last_error;
+    std::optional<quic_error_code> last_error;
     sstring last_error_detail;
-    std::optional<quic_error> open_stream_error;
+    std::optional<quic_error_code> open_stream_error;
     sstring open_stream_error_detail;
 };
 
@@ -489,18 +489,18 @@ SEASTAR_TEST_CASE(test_quic_open_stream_command_failure_propagates_error) {
         BOOST_REQUIRE_EQUAL(transport.open_stream_calls, 1);
         BOOST_REQUIRE_EQUAL(transport.fail_open_stream_calls, 1);
         BOOST_REQUIRE(transport.open_stream_error.has_value());
-        BOOST_REQUIRE(*transport.open_stream_error == quic_error::protocol);
+        BOOST_REQUIRE(*transport.open_stream_error == quic_error_code::protocol);
         BOOST_REQUIRE(!transport.open_stream_error_detail.empty());
         BOOST_REQUIRE(transport.last_error.has_value());
-        BOOST_REQUIRE(*transport.last_error == quic_error::protocol);
+        BOOST_REQUIRE(*transport.last_error == quic_error_code::protocol);
         BOOST_REQUIRE_EQUAL(transport.write_pending_calls, 0);
         BOOST_REQUIRE_EQUAL(transport.rearm_calls, 0);
 
         try {
             (void)result_future.get();
             BOOST_FAIL("expected open_stream to fail");
-        } catch (const quic_exception& e) {
-            BOOST_REQUIRE(e.code() == quic_error::protocol);
+        } catch (const quic_error& e) {
+            BOOST_REQUIRE(e.code() == quic_error_code::protocol);
         }
     });
 }

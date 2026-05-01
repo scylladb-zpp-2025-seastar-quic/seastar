@@ -49,7 +49,7 @@ int try_rand_bytes(uint8_t* dst, size_t len) noexcept {
 }
 
 [[noreturn]] void throw_random_failure(const char* context, int rv) {
-    throw quic_exception(
+    throw quic_error(
       classify_gnutls_error(rv),
       sstring(context) + ": " + gnutls_error_message(rv));
 }
@@ -124,7 +124,7 @@ void to_sockaddr_storage(const socket_address& sa, sockaddr_storage& out, sockle
         return;
     }
     default:
-        throw_quic_error(quic_error::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
+        throw_quic_error(quic_error_code::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
     }
 }
 
@@ -135,7 +135,7 @@ void validate_ip_socket_address(const socket_address& sa, std::string_view what)
         return;
     default:
         throw_quic_error(
-          quic_error::invalid_argument,
+          quic_error_code::invalid_argument,
           sstring(what) + " must be an IPv4 or IPv6 socket address");
     }
 }

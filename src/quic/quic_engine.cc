@@ -204,9 +204,9 @@ private:
     bool push_read_fragment(temporary_buffer<char> payload) {
         const auto payload_size = payload.size();
         if (payload_size && _receive_budget && !_receive_budget->try_acquire(payload_size)) {
-            abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::io, "receive queue limit exceeded")));
+            abort_read_queue(std::make_exception_ptr(quic_error(quic_error_code::io, "receive queue limit exceeded")));
             if (_runtime) {
-                _runtime->mark_error(quic_error::io, "receive queue limit exceeded");
+                _runtime->mark_error(quic_error_code::io, "receive queue limit exceeded");
             }
             return false;
         }
@@ -217,9 +217,9 @@ private:
         if (payload_size && _receive_budget) {
             _receive_budget->release(payload_size);
         }
-        abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::io, "stream read queue is full")));
+        abort_read_queue(std::make_exception_ptr(quic_error(quic_error_code::io, "stream read queue is full")));
         if (_runtime) {
-            _runtime->mark_error(quic_error::io, "stream read queue is full");
+            _runtime->mark_error(quic_error_code::io, "stream read queue is full");
         }
         return false;
     }
@@ -314,13 +314,13 @@ public:
 
 future<> stream_state::send_one(temporary_buffer<char> payload, bool fin) {
     if (!_can_write) {
-        return make_exception_future<>(quic_exception(quic_error::invalid_state, "stream output is unavailable"));
+        return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream output is unavailable"));
     }
     if (!_runtime) {
-        return make_exception_future<>(quic_exception(quic_error::closed, "stream runtime is gone"));
+        return make_exception_future<>(quic_error(quic_error_code::closed, "stream runtime is gone"));
     }
     if (_transport_closed || (_output_closed && !fin)) {
-        return make_exception_future<>(quic_exception(quic_error::closed, "stream output is closed"));
+        return make_exception_future<>(quic_error(quic_error_code::closed, "stream output is closed"));
     }
     return _runtime->send(internal::quic_message{
       .stream = _id,
@@ -331,7 +331,7 @@ future<> stream_state::send_one(temporary_buffer<char> payload, bool fin) {
 
 future<> stream_state::close_output() {
     if (!_can_write) {
-        throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+        throw_quic_error(quic_error_code::invalid_state, "stream output is unavailable");
     }
     if (_output_closed) {
         co_return;
@@ -342,7 +342,7 @@ future<> stream_state::close_output() {
 
 future<> stream_state::reset(application_error_code app_error_code) {
     if (!_can_write) {
-        throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+        throw_quic_error(quic_error_code::invalid_state, "stream output is unavailable");
     }
     if (_output_closed) {
         co_return;
@@ -356,7 +356,7 @@ future<> stream_state::reset(application_error_code app_error_code) {
 
 future<> stream_state::stop_sending(application_error_code app_error_code) {
     if (!_can_read) {
-        throw_quic_error(quic_error::invalid_state, "stream input is unavailable");
+        throw_quic_error(quic_error_code::invalid_state, "stream input is unavailable");
     }
     if (_input_shutdown_notified) {
         co_return;
@@ -364,7 +364,7 @@ future<> stream_state::stop_sending(application_error_code app_error_code) {
     if (!_runtime) {
         co_return;
     }
-    abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::closed, "stop_sending")));
+    abort_read_queue(std::make_exception_ptr(quic_error(quic_error_code::closed, "stop_sending")));
     co_await _runtime->stop_sending(_id, app_error_code);
 }
 
@@ -382,14 +382,14 @@ void stream_state::on_data(temporary_buffer<char> payload, bool fin) {
 }
 
 void stream_state::on_reset(application_error_code) {
-    abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::closed, "peer reset stream")));
+    abort_read_queue(std::make_exception_ptr(quic_error(quic_error_code::closed, "peer reset stream")));
 }
 
 void stream_state::on_stop_sending_input(application_error_code) {
     if (!_can_read || _input_shutdown_notified) {
         return;
     }
-    abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::closed, "stop_sending")));
+    abort_read_queue(std::make_exception_ptr(quic_error(quic_error_code::closed, "stop_sending")));
 }
 
 void stream_state::on_stop_sending_output(application_error_code) {
@@ -408,7 +408,7 @@ void stream_state::on_transport_closed() {
         return;
     }
     _transport_closed = true;
-    abort_read_queue(std::make_exception_ptr(quic_exception(quic_error::closed, "transport closed")));
+    abort_read_queue(std::make_exception_ptr(quic_error(quic_error_code::closed, "transport closed")));
 }
 
 void stream_state::on_data_consumed(size_t size) {
@@ -475,34 +475,34 @@ private:
 
 input_stream<char> stream_state::input(connected_socket_input_stream_config cfg) {
     if (!_can_read) {
-        throw_quic_error(quic_error::invalid_state, "stream input is unavailable");
+        throw_quic_error(quic_error_code::invalid_state, "stream input is unavailable");
     }
     return input_stream<char>(source(cfg));
 }
 
 output_stream<char> stream_state::output(size_t buffer_size) {
     if (!_can_write) {
-        throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+        throw_quic_error(quic_error_code::invalid_state, "stream output is unavailable");
     }
     if (_output_closed) {
-        throw_quic_error(quic_error::closed, "stream output is closed");
+        throw_quic_error(quic_error_code::closed, "stream output is closed");
     }
     return output_stream<char>(sink(), buffer_size);
 }
 
 data_source stream_state::source(connected_socket_input_stream_config) {
     if (!_can_read) {
-        throw_quic_error(quic_error::invalid_state, "stream input is unavailable");
+        throw_quic_error(quic_error_code::invalid_state, "stream input is unavailable");
     }
     return data_source(std::make_unique<source_impl>(shared_from_this()));
 }
 
 data_sink stream_state::sink() {
     if (!_can_write) {
-        throw_quic_error(quic_error::invalid_state, "stream output is unavailable");
+        throw_quic_error(quic_error_code::invalid_state, "stream output is unavailable");
     }
     if (_output_closed) {
-        throw_quic_error(quic_error::closed, "stream output is closed");
+        throw_quic_error(quic_error_code::closed, "stream output is closed");
     }
     return data_sink(std::make_unique<sink_impl>(shared_from_this()));
 }
@@ -559,7 +559,7 @@ void connection_engine::on_stream_data(stream_id sid, stream_type type, bool pee
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {
         if (!_impl->accepted_streams.push(shared_ptr<stream_state>(st)) && _impl->runtime) {
-            _impl->runtime->mark_error(quic_error::io, "accepted stream queue is full");
+            _impl->runtime->mark_error(quic_error_code::io, "accepted stream queue is full");
         }
     }
     st->on_data(std::move(payload), fin);
@@ -577,7 +577,7 @@ void connection_engine::on_stream_reset(
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {
         if (!_impl->accepted_streams.push(shared_ptr<stream_state>(st)) && _impl->runtime) {
-            _impl->runtime->mark_error(quic_error::io, "accepted stream queue is full");
+            _impl->runtime->mark_error(quic_error_code::io, "accepted stream queue is full");
         }
     }
     st->on_reset(app_error_code);
@@ -596,7 +596,7 @@ void connection_engine::on_stream_stop_sending(
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {
         if (!_impl->accepted_streams.push(shared_ptr<stream_state>(st)) && _impl->runtime) {
-            _impl->runtime->mark_error(quic_error::io, "accepted stream queue is full");
+            _impl->runtime->mark_error(quic_error_code::io, "accepted stream queue is full");
         }
     }
     if (shutdown_side == stream_shutdown_side::write) {
@@ -617,7 +617,7 @@ void connection_engine::on_transport_closed(std::exception_ptr ex) {
     _impl->transport_closed = true;
     _impl->_timer.cancel();
     if (!ex) {
-        ex = std::make_exception_ptr(quic_exception(quic_error::closed, "transport closed"));
+        ex = std::make_exception_ptr(quic_error(quic_error_code::closed, "transport closed"));
     }
     _impl->accepted_streams.abort(ex);
     for (auto& [_, st] : _impl->streams) {
@@ -735,7 +735,7 @@ bool connection_engine::has_blocked_open_stream_retry_work() const noexcept {
            || (_impl->blocked_uni_open_stream_retry_pending && !_impl->blocked_uni_open_streams.empty());
 }
 
-void connection_engine::fail_blocked_open_streams(quic_error error, std::string_view detail) {
+void connection_engine::fail_blocked_open_streams(quic_error_code error, std::string_view detail) {
     if (!_impl->runtime) {
         _impl->blocked_bidi_open_streams.clear();
         _impl->blocked_uni_open_streams.clear();
@@ -1241,42 +1241,42 @@ stream_type stream::type() const noexcept {
 
 input_stream<char> stream::input(connected_socket_input_stream_config cfg) {
     if (!_state) {
-        throw_quic_error(quic_error::invalid_state, "stream state is null");
+        throw_quic_error(quic_error_code::invalid_state, "stream state is null");
     }
     return _state->input(cfg);
 }
 
 output_stream<char> stream::output(size_t buffer_size) {
     if (!_state) {
-        throw_quic_error(quic_error::invalid_state, "stream state is null");
+        throw_quic_error(quic_error_code::invalid_state, "stream state is null");
     }
     return _state->output(buffer_size);
 }
 
 future<> stream::close_output() {
     if (!_state) {
-        return make_exception_future<>(quic_exception(quic_error::invalid_state, "stream state is null"));
+        return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream state is null"));
     }
     return _state->close_output();
 }
 
 future<> stream::reset(application_error_code app_error_code) {
     if (!_state) {
-        return make_exception_future<>(quic_exception(quic_error::invalid_state, "stream state is null"));
+        return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream state is null"));
     }
     return _state->reset(app_error_code);
 }
 
 future<> stream::stop_sending(application_error_code app_error_code) {
     if (!_state) {
-        return make_exception_future<>(quic_exception(quic_error::invalid_state, "stream state is null"));
+        return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream state is null"));
     }
     return _state->stop_sending(app_error_code);
 }
 
 future<> stream::wait_input_shutdown() {
     if (!_state) {
-        return make_exception_future<>(quic_exception(quic_error::invalid_state, "stream state is null"));
+        return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream state is null"));
     }
     return _state->wait_input_shutdown();
 }
@@ -1308,14 +1308,14 @@ sstring connection::selected_alpn() const {
 
 future<stream> connection::open_stream(stream_open_options options) {
     if (!_state) {
-        return make_exception_future<stream>(quic_exception(quic_error::invalid_state, "connection state is null"));
+        return make_exception_future<stream>(quic_error(quic_error_code::invalid_state, "connection state is null"));
     }
     return _state->open_stream(options);
 }
 
 future<stream> connection::accept_stream() {
     if (!_state) {
-        return make_exception_future<stream>(quic_exception(quic_error::invalid_state, "connection state is null"));
+        return make_exception_future<stream>(quic_error(quic_error_code::invalid_state, "connection state is null"));
     }
     return _state->accept_stream();
 }
@@ -1329,10 +1329,10 @@ future<> connection::close() {
 
 connected_socket to_connected_socket(stream&& s) {
     if (!s._state) {
-        throw_quic_error(quic_error::invalid_state, "stream state is null");
+        throw_quic_error(quic_error_code::invalid_state, "stream state is null");
     }
     if (!s._state->can_read() || !s._state->can_write()) {
-        throw_quic_error(quic_error::invalid_state, "connected_socket requires a bidirectional stream");
+        throw_quic_error(quic_error_code::invalid_state, "connected_socket requires a bidirectional stream");
     }
     return connected_socket(std::make_unique<quic_connected_socket_impl>(std::move(s._state)));
 }

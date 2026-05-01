@@ -27,7 +27,7 @@
 
 namespace seastar::quic::experimental {
 
-enum class quic_error {
+enum class quic_error_code {
     none = 0,
     invalid_argument,
     invalid_state,
@@ -40,18 +40,16 @@ enum class quic_error {
     backend,
 };
 
-const char* to_string(quic_error error) noexcept;
+const char* to_string(quic_error_code error) noexcept;
 
-class quic_exception final : public std::runtime_error {
+class quic_error final : public std::runtime_error {
 public:
-    explicit quic_exception(quic_error error, std::string detail = {});
+    explicit quic_error(quic_error_code error, std::string detail = {});
 
-    quic_error code() const noexcept;
+    quic_error_code code() const noexcept;
 
 private:
-    quic_error _error;
+    quic_error_code _error;
 };
-
-[[noreturn]] void throw_quic_error(quic_error error, std::string_view detail = {});
 
 } // namespace seastar::quic::experimental

@@ -27,82 +27,82 @@
 
 namespace seastar::quic::experimental {
 
-const char* to_string(quic_error error) noexcept {
+const char* to_string(quic_error_code error) noexcept {
     switch (error) {
-    case quic_error::none:
+    case quic_error_code::none:
         return "none";
-    case quic_error::invalid_argument:
+    case quic_error_code::invalid_argument:
         return "invalid_argument";
-    case quic_error::invalid_state:
+    case quic_error_code::invalid_state:
         return "invalid_state";
-    case quic_error::io:
+    case quic_error_code::io:
         return "io";
-    case quic_error::timeout:
+    case quic_error_code::timeout:
         return "timeout";
-    case quic_error::protocol:
+    case quic_error_code::protocol:
         return "protocol";
-    case quic_error::closed:
+    case quic_error_code::closed:
         return "closed";
-    case quic_error::unsupported:
+    case quic_error_code::unsupported:
         return "unsupported";
-    case quic_error::internal:
+    case quic_error_code::internal:
         return "internal";
-    case quic_error::backend:
+    case quic_error_code::backend:
         return "backend";
     }
     return "unknown";
 }
 
-quic_exception::quic_exception(quic_error error, std::string detail)
+quic_error::quic_error(quic_error_code error, std::string detail)
     : std::runtime_error(detail.empty()
               ? std::string(to_string(error))
               : std::string(to_string(error)) + ": " + detail)
     , _error(error) {
 }
 
-quic_error quic_exception::code() const noexcept {
+quic_error_code quic_error::code() const noexcept {
     return _error;
 }
 
-[[noreturn]] void throw_quic_error(quic_error error, std::string_view detail) {
-    throw quic_exception(error, std::string(detail));
+[[noreturn]] void throw_quic_error(quic_error_code error, std::string_view detail) {
+    throw quic_error(error, std::string(detail));
 }
 
-quic_error classify_ngtcp2_error(int code) noexcept {
+quic_error_code classify_ngtcp2_error(int code) noexcept {
     if (code == 0) {
-        return quic_error::none;
+        return quic_error_code::none;
     }
     if (code == NGTCP2_ERR_DRAINING) {
-        return quic_error::closed;
+        return quic_error_code::closed;
     }
     if (code == NGTCP2_ERR_IDLE_CLOSE) {
-        return quic_error::timeout;
+        return quic_error_code::timeout;
     }
     if (code == NGTCP2_ERR_WRITE_MORE) {
-        return quic_error::none;
+        return quic_error_code::none;
     }
     if (code == NGTCP2_ERR_INVALID_ARGUMENT) {
-        return quic_error::invalid_argument;
+        return quic_error_code::invalid_argument;
     }
     if (code == NGTCP2_ERR_PROTO) {
-        return quic_error::protocol;
+        return quic_error_code::protocol;
     }
-    return quic_error::backend;
+    return quic_error_code::backend;
 }
 
-quic_error classify_gnutls_error(int code) noexcept {
+quic_error_code classify_gnutls_error(int code) noexcept {
     if (code >= 0) {
-        return quic_error::none;
+        return quic_error_code::none;
     }
     if (code == GNUTLS_E_AGAIN || code == GNUTLS_E_INTERRUPTED) {
-        return quic_error::io;
+        return quic_error_code::io;
     }
 #ifdef GNUTLS_E_TIMEDOUT
     if (code == GNUTLS_E_TIMEDOUT) {
-        return quic_error::timeout;
+        return quic_error_code::timeout;
     }
 #endif
-    return quic_error::backend;
+    return quic_error_code::backend;
 }
 
 bool ngtcp2_is_write_more(int code) noexcept {
