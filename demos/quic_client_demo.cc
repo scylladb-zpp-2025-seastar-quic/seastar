@@ -106,7 +106,7 @@ static future<> receive_loop(lw_shared_ptr<input_stream<char>> input, lw_shared_
                     std::cout << "\n";
                 }
                 std::cout.flush();
-            } catch (const quic_exception& e) {
+            } catch (const quic_error& e) {
                 if (e.code() == quic_error::closed) {
                     shutdown->signal();
                     co_return;

@@ -21,9 +21,16 @@
 
 #pragma once
 
+#include <string>
+#include <string_view>
+
 #include <seastar/quic/quic_error.hh>
 
 namespace seastar::quic::experimental {
+
+using quic_error_code = quic_error::value;
+
+const char* to_string(quic_error_code error) noexcept;
 
 [[noreturn]] void throw_quic_error(quic_error_code error, std::string_view detail = {});
 

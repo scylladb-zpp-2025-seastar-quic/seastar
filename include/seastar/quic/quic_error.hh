@@ -21,35 +21,33 @@
 
 #pragma once
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 
 namespace seastar::quic::experimental {
 
-enum class quic_error_code {
-    none = 0,
-    invalid_argument,
-    invalid_state,
-    io,
-    timeout,
-    protocol,
-    closed,
-    unsupported,
-    internal,
-    backend,
-};
-
-const char* to_string(quic_error_code error) noexcept;
-
 class quic_error final : public std::runtime_error {
 public:
-    explicit quic_error(quic_error_code error, std::string detail = {});
+    enum value : uint8_t {
+        none = 0,
+        invalid_argument,
+        invalid_state,
+        io,
+        timeout,
+        protocol,
+        closed,
+        unsupported,
+        internal,
+        backend,
+    };
 
-    quic_error_code code() const noexcept;
+    explicit quic_error(value error, std::string detail = {});
+
+    value code() const noexcept;
 
 private:
-    quic_error_code _error;
+    value _error;
 };
 
 } // namespace seastar::quic::experimental

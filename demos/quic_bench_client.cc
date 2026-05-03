@@ -165,7 +165,7 @@ static future<> run_bidi_throughput_stream(
 
     try {
         co_await when_all_succeed(sender(), receiver()).discard_result();
-    } catch (const quic_exception& e) {
+    } catch (const quic_error& e) {
         if (e.code() != quic_error::closed) { throw; }
     }
 
@@ -201,7 +201,7 @@ static future<> run_uni_throughput_stream(
             co_await out.flush();
         }
         co_await out.close();
-    } catch (const quic_exception& e) {
+    } catch (const quic_error& e) {
         if (e.code() != quic_error::closed) { throw; }
     }
 }
@@ -245,7 +245,7 @@ static future<> run_latency_stream(
         }
         co_await out.close();
         co_await inp.close();
-    } catch (const quic_exception& e) {
+    } catch (const quic_error& e) {
         if (e.code() != quic_error::closed) { throw; }
     }
 }

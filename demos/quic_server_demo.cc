@@ -88,7 +88,7 @@ static future<> handle_stream(seastar::quic::experimental::stream quic_stream, b
         }
         co_await output.close();
         co_await input.close();
-    } catch (const quic_exception& e) {
+    } catch (const quic_error& e) {
         if (e.code() != quic_error::closed) {
             std::cerr << "[server conn#" << conn_id << " stream#" << stream_no << "] stream error: " << e.what() << "\n";
         }
@@ -118,7 +118,7 @@ static future<> handle_session(connection session, bool verbose, uint64_t conn_i
                 }
             }).or_terminate();
         }
-    } catch (const quic_exception& e) {
+    } catch (const quic_error& e) {
         if (e.code() != quic_error::closed) {
             std::cerr << "[server conn#" << conn_id << "] connection error: " << e.what() << "\n";
         }
@@ -142,7 +142,7 @@ static future<> accept_loop(quic_server& server, gate& sessions, bool verbose) {
         connection session;
         try {
             session = co_await server.accept();
-        } catch (const quic_exception& e) {
+        } catch (const quic_error& e) {
             if (e.code() == quic_error::closed) {
                 co_return;
             }

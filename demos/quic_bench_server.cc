@@ -103,7 +103,7 @@ static future<> handle_bidi_stream(seastar::quic::experimental::stream s) {
         if (buffered_echo_bytes > 0) {
             co_await output.flush();
         }
-    } catch (const quic_exception& e) {
+    } catch (const quic_error& e) {
         if (e.code() != quic_error::closed) {
             std::cerr << "[server] bidi stream error: " << e.what() << "\n";
         }
@@ -124,7 +124,7 @@ static future<> handle_uni_stream(seastar::quic::experimental::stream s) {
             }
             g_stats.bytes_received += buf.size();
         }
-    } catch (const quic_exception& e) {
+    } catch (const quic_error& e) {
         if (e.code() != quic_error::closed) {
             std::cerr << "[server] uni stream error: " << e.what() << "\n";
         }
@@ -157,7 +157,7 @@ static future<> handle_bench_session(connection session) {
                 }
             }).or_terminate();
         }
-    } catch (const quic_exception& e) {
+    } catch (const quic_error& e) {
         if (e.code() != quic_error::closed) {
             std::cerr << "[server] connection error: " << e.what() << "\n";
         }
@@ -173,7 +173,7 @@ static future<> accept_loop(quic_server& server, gate& sessions) {
         connection session;
         try {
             session = co_await server.accept();
-        } catch (const quic_exception& e) {
+        } catch (const quic_error& e) {
             if (e.code() == quic_error::closed) {
                 co_return;
             }
