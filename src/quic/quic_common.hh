@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -44,6 +45,11 @@ void init_ngtcp2_addr(ngtcp2_addr* addr, const sockaddr* sa, size_t len);
 void to_sockaddr_storage(const socket_address& sa, sockaddr_storage& out, socklen_t& outlen);
 void validate_ip_socket_address(const socket_address& sa, std::string_view what);
 std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr);
+
+ngtcp2_tstamp quic_now_ns() noexcept;
+socket_address wildcard_address_for_family(sa_family_t family);
+std::optional<congestion_control_algorithm> effective_congestion_control(const transport_config& cfg);
+future<> send_datagram(logger& log, net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet);
 
 temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs);
 ngtcp2_cc_algo to_ngtcp2_cc_algo(congestion_control_algorithm algo);

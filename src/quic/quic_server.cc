@@ -25,8 +25,6 @@
 #include "quic_impl.hh"
 
 #include <algorithm>
-#include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -69,36 +67,11 @@ static logger quic_server_log("quic_server");
 using transport_command = internal::transport_command;
 using quic_message = internal::quic_message;
 
-ngtcp2_tstamp now_ns() {
-    using namespace std::chrono;
-    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
-}
-std::optional<congestion_control_algorithm> effective_congestion_control(const transport_config& cfg) {
-    if (!cfg.congestion_control) {
-        return std::nullopt;
-    }
-    auto algo = *cfg.congestion_control;
-    // ngtcp2 BBR regresses sharply on the small-datagram benchmark profile.
-    if ((algo == congestion_control_algorithm::bbr || algo == congestion_control_algorithm::bbr2)
-        && cfg.max_tx_udp_payload_size
-        && *cfg.max_tx_udp_payload_size <= 4096) {
-        return congestion_control_algorithm::cubic;
-    }
-    return algo;
-}
-
-future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {
-    if (packet.empty()) {
-        co_return;
-    }
-    quic_server_log.trace("udp send datagram: dst={} bytes={}", dst, packet.size());
-    std::array<temporary_buffer<char>, 1> bufs{std::move(packet)};
-    co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
-}
-
 std::string cid_key(const uint8_t* data, size_t len) {
     return std::string(reinterpret_cast<const char*>(data), len);
 }
+
+class quic_server_impl;
 
 enum class quic_long_type : uint8_t {
     initial = 0,
@@ -157,8 +130,6 @@ struct conn_rx_event {
 
 struct server_connection;
 void sync_current_path(server_connection& conn);
-
-class quic_server_impl;
 
 struct server_connection : public enable_lw_shared_from_this<server_connection> {
     struct transport_adapter final : internal::connection_transport {
@@ -342,7 +313,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
-        return ngtcp2_conn_write_pkt(conn, &path, &pkt_info, outbuf, outbuf_size, now_ns());
+        return ngtcp2_conn_write_pkt(conn, &path, &pkt_info, outbuf, outbuf_size, quic_now_ns());
     }
 
     internal::transport_stream_write_result write_stream_packet(
@@ -373,7 +344,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
           sid,
           (data && len) ? &vec : nullptr,
           (data && len) ? 1 : 0,
-          now_ns());
+          quic_now_ns());
         return internal::transport_stream_write_result{
           .nwrite = nwrite,
           .consumed = consumed > 0 ? static_cast<size_t>(consumed) : 0,
@@ -432,7 +403,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
           &pkt_info,
           reinterpret_cast<const uint8_t*>(data),
           len,
-          now_ns());
+          quic_now_ns());
     }
 
     void sync_transport_path() {
@@ -469,7 +440,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
           outbuf,
           outbuf_size,
           &ccerr,
-          now_ns());
+          quic_now_ns());
     }
 
     void on_stream_write_closed(stream_id sid) {
@@ -489,7 +460,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
             engine->cancel_timer();
             return;
         }
-        engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), now_ns(), closing);
+        engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), quic_now_ns(), closing);
     }
 
     void request_close() {
@@ -1205,7 +1176,7 @@ private:
 
         ngtcp2_settings settings{};
         ngtcp2_settings_default(&settings);
-        settings.initial_ts = now_ns();
+        settings.initial_ts = quic_now_ns();
         if (_cfg.session_options.transport.initial_rtt_ns
             && *_cfg.session_options.transport.initial_rtt_ns > 0) {
             settings.initial_rtt = *_cfg.session_options.transport.initial_rtt_ns;
@@ -1412,7 +1383,7 @@ future<> server_connection::send_datagram_packet(temporary_buffer<char> packet) 
     if (!server_state) {
         co_return;
     }
-    co_await send_datagram(server_state->channel(), peer, std::move(packet));
+    co_await send_datagram(quic_server_log, server_state->channel(), peer, std::move(packet));
 }
 
 bool server_connection::can_send_connection_close() const noexcept {

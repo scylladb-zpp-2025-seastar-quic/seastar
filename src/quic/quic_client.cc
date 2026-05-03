@@ -24,8 +24,6 @@
 #include "quic_common.hh"
 #include "quic_impl.hh"
 
-#include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -68,51 +66,6 @@ struct tls_verification_failure {
     quic_error_code error = quic_error_code::none;
     sstring detail;
 };
-
-ngtcp2_tstamp now_ns() {
-    using namespace std::chrono;
-    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
-}
-
-socket_address wildcard_address_for_family(sa_family_t family) {
-    switch (family) {
-    case AF_INET: {
-        sockaddr_in sa{};
-        sa.sin_family = AF_INET;
-        return socket_address(sa);
-    }
-    case AF_INET6: {
-        sockaddr_in6 sa{};
-        sa.sin6_family = AF_INET6;
-        return socket_address(sa);
-    }
-    default:
-        throw_quic_error(quic_error_code::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
-    }
-}
-
-std::optional<congestion_control_algorithm> effective_congestion_control(const transport_config& cfg) {
-    if (!cfg.congestion_control) {
-        return std::nullopt;
-    }
-    auto algo = *cfg.congestion_control;
-    // ngtcp2 BBR regresses sharply on the small-datagram benchmark profile.
-    if ((algo == congestion_control_algorithm::bbr || algo == congestion_control_algorithm::bbr2)
-        && cfg.max_tx_udp_payload_size
-        && *cfg.max_tx_udp_payload_size <= 4096) {
-        return congestion_control_algorithm::cubic;
-    }
-    return algo;
-}
-
-future<> send_datagram(net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {
-    if (packet.empty()) {
-        co_return;
-    }
-    quic_client_log.trace("udp send datagram: dst={} bytes={}", dst, packet.size());
-    std::array<temporary_buffer<char>, 1> bufs{std::move(packet)};
-    co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
-}
 
 struct rx_event {
     socket_address src;
@@ -311,7 +264,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
-        return ngtcp2_conn_write_pkt(conn, &path, &pkt_info, outbuf, outbuf_size, now_ns());
+        return ngtcp2_conn_write_pkt(conn, &path, &pkt_info, outbuf, outbuf_size, quic_now_ns());
     }
 
     internal::transport_stream_write_result write_stream_packet(
@@ -342,7 +295,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
           sid,
           (data && len) ? &vec : nullptr,
           (data && len) ? 1 : 0,
-          now_ns());
+          quic_now_ns());
         return internal::transport_stream_write_result{
           .nwrite = nwrite,
           .consumed = consumed > 0 ? static_cast<size_t>(consumed) : 0,
@@ -401,7 +354,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
           &pkt_info,
           reinterpret_cast<const uint8_t*>(data),
           len,
-          now_ns());
+          quic_now_ns());
     }
 
     void sync_transport_path() {
@@ -421,7 +374,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 
     future<> send_datagram_packet(temporary_buffer<char> packet) {
-        return send_datagram(channel, remote_address, std::move(packet));
+        return send_datagram(quic_client_log, channel, remote_address, std::move(packet));
     }
 
     bool can_send_connection_close() const noexcept {
@@ -442,7 +395,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
           outbuf,
           outbuf_size,
           &ccerr,
-          now_ns());
+          quic_now_ns());
     }
 
     void on_stream_write_closed(stream_id sid) {
@@ -462,7 +415,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
             engine->cancel_timer();
             return;
         }
-        engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), now_ns(), stopping);
+        engine->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), quic_now_ns(), stopping);
     }
 
     void request_close() {
@@ -1077,7 +1030,7 @@ void init_client_connection(client_state& st) {
 
     ngtcp2_settings settings{};
     ngtcp2_settings_default(&settings);
-    settings.initial_ts = now_ns();
+    settings.initial_ts = quic_now_ns();
     if (st.cfg.session_options.transport.initial_rtt_ns
         && *st.cfg.session_options.transport.initial_rtt_ns > 0) {
         settings.initial_rtt = *st.cfg.session_options.transport.initial_rtt_ns;
@@ -1214,7 +1167,9 @@ void start_background_tasks(const lw_shared_ptr<client_state>& st) {
       .or_terminate();
 }
 
-class quic_client_impl {
+} // namespace
+
+class quic_client::impl final {
 public:
     future<internal::connection_engine_ptr> connect(quic_client_config config) {
         if (_state) {
@@ -1304,11 +1259,6 @@ public:
 
 private:
     lw_shared_ptr<client_state> _state;
-};
-
-} // namespace
-
-class quic_client::impl final : public quic_client_impl {
 };
 
 quic_client::quic_client()

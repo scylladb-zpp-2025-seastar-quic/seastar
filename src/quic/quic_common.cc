@@ -21,6 +21,8 @@
 
 #include "quic_common.hh"
 
+#include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -166,6 +168,51 @@ std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
     default:
         return std::nullopt;
     }
+}
+
+ngtcp2_tstamp quic_now_ns() noexcept {
+    using namespace std::chrono;
+    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+socket_address wildcard_address_for_family(sa_family_t family) {
+    switch (family) {
+    case AF_INET: {
+        sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        return socket_address(sa);
+    }
+    case AF_INET6: {
+        sockaddr_in6 sa{};
+        sa.sin6_family = AF_INET6;
+        return socket_address(sa);
+    }
+    default:
+        throw_quic_error(quic_error_code::invalid_argument, "QUIC requires an IPv4 or IPv6 socket address");
+    }
+}
+
+std::optional<congestion_control_algorithm> effective_congestion_control(const transport_config& cfg) {
+    if (!cfg.congestion_control) {
+        return std::nullopt;
+    }
+    auto algo = *cfg.congestion_control;
+    // ngtcp2 BBR regresses sharply on the small-datagram benchmark profile.
+    if ((algo == congestion_control_algorithm::bbr || algo == congestion_control_algorithm::bbr2)
+        && cfg.max_tx_udp_payload_size
+        && *cfg.max_tx_udp_payload_size <= 4096) {
+        return congestion_control_algorithm::cubic;
+    }
+    return algo;
+}
+
+future<> send_datagram(logger& log, net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {
+    if (packet.empty()) {
+        co_return;
+    }
+    log.trace("udp send datagram: dst={} bytes={}", dst, packet.size());
+    std::array<temporary_buffer<char>, 1> bufs{std::move(packet)};
+    co_await channel.send(dst, std::span<temporary_buffer<char>>(bufs));
 }
 
 temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs) {
