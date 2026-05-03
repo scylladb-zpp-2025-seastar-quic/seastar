@@ -220,42 +220,6 @@ struct connection_transport {
     void clear_blocked_open_stream_retry(stream_type type) noexcept { clear_blocked_open_stream_retry_fn(ctx, type); }
 };
 
-struct connection_actor {
-    void* ctx = nullptr;
-
-    bool (*actor_active_fn)(void*) noexcept = nullptr;
-    bool (*actor_has_pending_work_fn)(void*) noexcept = nullptr;
-    future<> (*actor_wait_for_wakeup_fn)(void*) = nullptr;
-    bool (*actor_stop_requested_fn)(void*) noexcept = nullptr;
-    future<> (*actor_handle_stop_request_fn)(void*) = nullptr;
-    bool (*actor_transport_terminal_fn)(void*) noexcept = nullptr;
-    future<> (*actor_handle_transport_terminal_fn)(void*) = nullptr;
-    bool (*actor_has_rx_event_fn)(void*) noexcept = nullptr;
-    future<> (*actor_handle_next_rx_event_fn)(void*) = nullptr;
-    bool (*actor_has_transport_command_fn)(void*) noexcept = nullptr;
-    future<> (*actor_handle_next_transport_command_fn)(void*) = nullptr;
-    future<> (*actor_retry_blocked_open_streams_fn)(void*) = nullptr;
-    bool (*actor_tick_pending_fn)(void*) noexcept = nullptr;
-    void (*actor_clear_tick_fn)(void*) noexcept = nullptr;
-    future<> (*actor_handle_timer_tick_fn)(void*) = nullptr;
-
-    bool actor_active() const noexcept { return actor_active_fn(ctx); }
-    bool actor_has_pending_work() const noexcept { return actor_has_pending_work_fn(ctx); }
-    future<> actor_wait_for_wakeup() { return actor_wait_for_wakeup_fn(ctx); }
-    bool actor_stop_requested() const noexcept { return actor_stop_requested_fn(ctx); }
-    future<> actor_handle_stop_request() { return actor_handle_stop_request_fn(ctx); }
-    bool actor_transport_terminal() const noexcept { return actor_transport_terminal_fn(ctx); }
-    future<> actor_handle_transport_terminal() { return actor_handle_transport_terminal_fn(ctx); }
-    bool actor_has_rx_event() const noexcept { return actor_has_rx_event_fn(ctx); }
-    future<> actor_handle_next_rx_event() { return actor_handle_next_rx_event_fn(ctx); }
-    bool actor_has_transport_command() const noexcept { return actor_has_transport_command_fn(ctx); }
-    future<> actor_handle_next_transport_command() { return actor_handle_next_transport_command_fn(ctx); }
-    future<> actor_retry_blocked_open_streams() { return actor_retry_blocked_open_streams_fn(ctx); }
-    bool actor_tick_pending() const noexcept { return actor_tick_pending_fn(ctx); }
-    void actor_clear_tick() noexcept { actor_clear_tick_fn(ctx); }
-    future<> actor_handle_timer_tick() { return actor_handle_timer_tick_fn(ctx); }
-};
-
 template <typename Owner>
 connection_transport make_connection_transport(Owner& owner) {
     return connection_transport{
@@ -312,28 +276,6 @@ connection_transport make_connection_transport(Owner& owner) {
       .clear_blocked_open_stream_retry_fn = [] (void* ctx, stream_type type) noexcept {
           static_cast<Owner*>(ctx)->clear_blocked_open_stream_retry(type);
       },
-    };
-}
-
-template <typename Owner>
-connection_actor make_connection_actor(Owner& owner) {
-    return connection_actor{
-      .ctx = &owner,
-      .actor_active_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->actor_active(); },
-      .actor_has_pending_work_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->actor_has_pending_work(); },
-      .actor_wait_for_wakeup_fn = [] (void* ctx) { return static_cast<Owner*>(ctx)->actor_wait_for_wakeup(); },
-      .actor_stop_requested_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->actor_stop_requested(); },
-      .actor_handle_stop_request_fn = [] (void* ctx) { return static_cast<Owner*>(ctx)->actor_handle_stop_request(); },
-      .actor_transport_terminal_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->actor_transport_terminal(); },
-      .actor_handle_transport_terminal_fn = [] (void* ctx) { return static_cast<Owner*>(ctx)->actor_handle_transport_terminal(); },
-      .actor_has_rx_event_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->actor_has_rx_event(); },
-      .actor_handle_next_rx_event_fn = [] (void* ctx) { return static_cast<Owner*>(ctx)->actor_handle_next_rx_event(); },
-      .actor_has_transport_command_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->actor_has_transport_command(); },
-      .actor_handle_next_transport_command_fn = [] (void* ctx) { return static_cast<Owner*>(ctx)->actor_handle_next_transport_command(); },
-      .actor_retry_blocked_open_streams_fn = [] (void* ctx) { return static_cast<Owner*>(ctx)->actor_retry_blocked_open_streams(); },
-      .actor_tick_pending_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->actor_tick_pending(); },
-      .actor_clear_tick_fn = [] (void* ctx) noexcept { static_cast<Owner*>(ctx)->actor_clear_tick(); },
-      .actor_handle_timer_tick_fn = [] (void* ctx) { return static_cast<Owner*>(ctx)->actor_handle_timer_tick(); },
     };
 }
 
@@ -401,7 +343,6 @@ future<std::optional<transport_command>> handle_transport_command(connection_tra
 future<> recv_transport_datagram(connection_transport& transport, const socket_address& src, temporary_buffer<char> pkt);
 future<> handle_transport_timer(connection_transport& transport);
 future<> send_connection_close(connection_transport& transport);
-future<> run_connection_actor(connection_actor& actor);
 
 session_runtime_ptr make_session_runtime(connection_options options = {});
 

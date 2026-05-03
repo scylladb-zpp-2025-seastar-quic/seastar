@@ -43,6 +43,7 @@
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_gnutls.h>
 
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
@@ -109,11 +110,9 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     std::optional<internal::transport_command> blocked_send_command;
     bool blocked_send_retry_requested = false;
     internal::connection_transport transport;
-    internal::connection_actor actor;
 
     client_state()
-        : transport(internal::make_connection_transport(*this))
-        , actor(internal::make_connection_actor(*this)) {
+        : transport(internal::make_connection_transport(*this)) {
     }
 
     ~client_state() {
@@ -1075,7 +1074,60 @@ future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
 }
 
 future<> actor_loop(lw_shared_ptr<client_state> st) {
-    co_await internal::run_connection_actor(st->actor);
+    constexpr size_t actor_batch_limit = 64;
+
+    while (st->actor_active()) {
+        if (!st->actor_has_pending_work()) {
+            co_await st->actor_wait_for_wakeup();
+            if (!st->actor_active()) {
+                co_return;
+            }
+        }
+
+        if (st->actor_stop_requested()) {
+            co_await st->actor_handle_stop_request();
+            co_return;
+        }
+
+        if (st->actor_transport_terminal()) {
+            co_await st->actor_handle_transport_terminal();
+            continue;
+        }
+
+        size_t rx_processed = 0;
+        while (st->actor_active()
+               && !st->actor_stop_requested()
+               && st->actor_has_rx_event()
+               && rx_processed < actor_batch_limit) {
+            co_await st->actor_handle_next_rx_event();
+            ++rx_processed;
+        }
+
+        size_t commands_processed = 0;
+        while (st->actor_active()
+               && !st->actor_stop_requested()
+               && st->actor_has_transport_command()
+               && commands_processed < actor_batch_limit) {
+            co_await st->actor_handle_next_transport_command();
+            ++commands_processed;
+        }
+
+        if (st->actor_active() && !st->actor_stop_requested()) {
+            co_await st->actor_retry_blocked_open_streams();
+        }
+
+        if (st->actor_active() && !st->actor_stop_requested() && st->actor_tick_pending()) {
+            st->actor_clear_tick();
+            co_await st->actor_handle_timer_tick();
+        }
+
+        if (st->actor_active()
+            && !st->actor_stop_requested()
+            && st->actor_has_pending_work()
+            && (rx_processed == actor_batch_limit || commands_processed == actor_batch_limit)) {
+            co_await seastar::coroutine::maybe_yield();
+        }
+    }
 }
 
 void start_background_tasks(const lw_shared_ptr<client_state>& st) {

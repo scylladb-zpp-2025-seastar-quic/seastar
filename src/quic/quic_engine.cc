@@ -1073,63 +1073,6 @@ future<> send_connection_close(connection_transport& transport) {
     co_await transport.send_datagram_packet(outbuf.share(0, static_cast<size_t>(nwrite)));
 }
 
-future<> run_connection_actor(connection_actor& actor) {
-    constexpr size_t actor_batch_limit = 64;
-
-    while (actor.actor_active()) {
-        if (!actor.actor_has_pending_work()) {
-            co_await actor.actor_wait_for_wakeup();
-            if (!actor.actor_active()) {
-                co_return;
-            }
-        }
-
-        if (actor.actor_stop_requested()) {
-            co_await actor.actor_handle_stop_request();
-            co_return;
-        }
-
-        if (actor.actor_transport_terminal()) {
-            co_await actor.actor_handle_transport_terminal();
-            continue;
-        }
-
-        size_t rx_processed = 0;
-        while (actor.actor_active()
-               && !actor.actor_stop_requested()
-               && actor.actor_has_rx_event()
-               && rx_processed < actor_batch_limit) {
-            co_await actor.actor_handle_next_rx_event();
-            ++rx_processed;
-        }
-
-        size_t commands_processed = 0;
-        while (actor.actor_active()
-               && !actor.actor_stop_requested()
-               && actor.actor_has_transport_command()
-               && commands_processed < actor_batch_limit) {
-            co_await actor.actor_handle_next_transport_command();
-            ++commands_processed;
-        }
-
-        if (actor.actor_active() && !actor.actor_stop_requested()) {
-            co_await actor.actor_retry_blocked_open_streams();
-        }
-
-        if (actor.actor_active() && !actor.actor_stop_requested() && actor.actor_tick_pending()) {
-            actor.actor_clear_tick();
-            co_await actor.actor_handle_timer_tick();
-        }
-
-        if (actor.actor_active()
-            && !actor.actor_stop_requested()
-            && actor.actor_has_pending_work()
-            && (rx_processed == actor_batch_limit || commands_processed == actor_batch_limit)) {
-            co_await seastar::coroutine::maybe_yield();
-        }
-    }
-}
-
 connection_engine_ptr make_connection_engine(session_runtime_ptr runtime, connection_options options) {
     return make_shared<connection_engine>(std::move(runtime), std::move(options));
 }
