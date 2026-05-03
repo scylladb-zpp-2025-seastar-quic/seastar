@@ -33,7 +33,6 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/net/api.hh>
@@ -87,10 +86,7 @@ struct stream_open_options {
 };
 
 namespace internal {
-class stream_state;
 class connection_engine;
-using stream_state_ptr = shared_ptr<stream_state>;
-using connection_engine_ptr = shared_ptr<connection_engine>;
 }
 
 class stream final {
@@ -119,9 +115,10 @@ public:
     future<> wait_input_shutdown();
 
 private:
-    explicit stream(internal::stream_state_ptr state);
+    class impl;
+    explicit stream(std::unique_ptr<impl> state);
 
-    internal::stream_state_ptr _state;
+    std::unique_ptr<impl> _impl;
 
     friend class connection;
     friend class internal::connection_engine;
@@ -149,9 +146,10 @@ public:
     future<> close();
 
 private:
-    explicit connection(internal::connection_engine_ptr state);
+    class impl;
+    explicit connection(std::unique_ptr<impl> state);
 
-    internal::connection_engine_ptr _state;
+    std::unique_ptr<impl> _impl;
 
     friend class quic_client;
     friend class quic_server;

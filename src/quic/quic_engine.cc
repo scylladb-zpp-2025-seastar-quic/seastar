@@ -536,12 +536,12 @@ future<stream> connection_engine::open_stream(stream_open_options options) {
         it->second = make_shared<stream_state>(_impl->runtime, _impl->receive_window, sid, options.type, false);
     }
     auto st = it->second;
-    co_return stream(std::move(st));
+    co_return stream(std::make_unique<stream::impl>(std::move(st)));
 }
 
 future<stream> connection_engine::accept_stream() {
     auto st = co_await _impl->accepted_streams.pop_eventually();
-    co_return stream(std::move(st));
+    co_return stream(std::make_unique<stream::impl>(std::move(st)));
 }
 
 future<> connection_engine::close() {
@@ -1215,70 +1215,70 @@ stream::~stream() = default;
 stream::stream(stream&&) noexcept = default;
 stream& stream::operator=(stream&&) noexcept = default;
 
-stream::stream(internal::stream_state_ptr state)
-    : _state(std::move(state)) {
+stream::stream(std::unique_ptr<impl> state)
+    : _impl(std::move(state)) {
 }
 
 bool stream::is_open() const noexcept {
-    return _state && _state->is_open();
+    return _impl && _impl->state && _impl->state->is_open();
 }
 
 bool stream::can_read() const noexcept {
-    return _state && _state->can_read();
+    return _impl && _impl->state && _impl->state->can_read();
 }
 
 bool stream::can_write() const noexcept {
-    return _state && _state->can_write();
+    return _impl && _impl->state && _impl->state->can_write();
 }
 
 stream_id stream::id() const noexcept {
-    return _state ? _state->id() : invalid_stream_id;
+    return (_impl && _impl->state) ? _impl->state->id() : invalid_stream_id;
 }
 
 stream_type stream::type() const noexcept {
-    return _state ? _state->type() : stream_type::bidirectional;
+    return (_impl && _impl->state) ? _impl->state->type() : stream_type::bidirectional;
 }
 
 input_stream<char> stream::input(connected_socket_input_stream_config cfg) {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         throw_quic_error(quic_error_code::invalid_state, "stream state is null");
     }
-    return _state->input(cfg);
+    return _impl->state->input(cfg);
 }
 
 output_stream<char> stream::output(size_t buffer_size) {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         throw_quic_error(quic_error_code::invalid_state, "stream state is null");
     }
-    return _state->output(buffer_size);
+    return _impl->state->output(buffer_size);
 }
 
 future<> stream::close_output() {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream state is null"));
     }
-    return _state->close_output();
+    return _impl->state->close_output();
 }
 
 future<> stream::reset(application_error_code app_error_code) {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream state is null"));
     }
-    return _state->reset(app_error_code);
+    return _impl->state->reset(app_error_code);
 }
 
 future<> stream::stop_sending(application_error_code app_error_code) {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream state is null"));
     }
-    return _state->stop_sending(app_error_code);
+    return _impl->state->stop_sending(app_error_code);
 }
 
 future<> stream::wait_input_shutdown() {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         return make_exception_future<>(quic_error(quic_error_code::invalid_state, "stream state is null"));
     }
-    return _state->wait_input_shutdown();
+    return _impl->state->wait_input_shutdown();
 }
 
 connection::connection() = default;
@@ -1286,55 +1286,56 @@ connection::~connection() = default;
 connection::connection(connection&&) noexcept = default;
 connection& connection::operator=(connection&&) noexcept = default;
 
-connection::connection(internal::connection_engine_ptr state)
-    : _state(std::move(state)) {
+connection::connection(std::unique_ptr<impl> state)
+    : _impl(std::move(state)) {
 }
 
 bool connection::is_open() const noexcept {
-    return _state && _state->is_open();
+    return _impl && _impl->state && _impl->state->is_open();
 }
 
 socket_address connection::local_address() const {
-    return _state ? _state->local_address() : socket_address();
+    return (_impl && _impl->state) ? _impl->state->local_address() : socket_address();
 }
 
 socket_address connection::peer_address() const {
-    return _state ? _state->peer_address() : socket_address();
+    return (_impl && _impl->state) ? _impl->state->peer_address() : socket_address();
 }
 
 sstring connection::selected_alpn() const {
-    return _state ? _state->selected_alpn() : sstring();
+    return (_impl && _impl->state) ? _impl->state->selected_alpn() : sstring();
 }
 
 future<stream> connection::open_stream(stream_open_options options) {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         return make_exception_future<stream>(quic_error(quic_error_code::invalid_state, "connection state is null"));
     }
-    return _state->open_stream(options);
+    return _impl->state->open_stream(options);
 }
 
 future<stream> connection::accept_stream() {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         return make_exception_future<stream>(quic_error(quic_error_code::invalid_state, "connection state is null"));
     }
-    return _state->accept_stream();
+    return _impl->state->accept_stream();
 }
 
 future<> connection::close() {
-    if (!_state) {
+    if (!_impl || !_impl->state) {
         co_return;
     }
-    co_await _state->close();
+    co_await _impl->state->close();
 }
 
 connected_socket to_connected_socket(stream&& s) {
-    if (!s._state) {
+    if (!s._impl || !s._impl->state) {
         throw_quic_error(quic_error_code::invalid_state, "stream state is null");
     }
-    if (!s._state->can_read() || !s._state->can_write()) {
+    auto state = std::move(s._impl->state);
+    if (!state->can_read() || !state->can_write()) {
         throw_quic_error(quic_error_code::invalid_state, "connected_socket requires a bidirectional stream");
     }
-    return connected_socket(std::make_unique<quic_connected_socket_impl>(std::move(s._state)));
+    return connected_socket(std::make_unique<quic_connected_socket_impl>(std::move(state)));
 }
 
 } // namespace seastar::quic::experimental

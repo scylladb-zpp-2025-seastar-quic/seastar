@@ -1322,7 +1322,7 @@ quic_client& quic_client::operator=(quic_client&&) noexcept = default;
 future<connection> quic_client::connect(quic_client_config config) {
     quic_client_log.debug("quic_client::connect");
     auto engine = co_await _impl->connect(std::move(config));
-    co_return connection(std::move(engine));
+    co_return connection(std::make_unique<connection::impl>(std::move(engine)));
 }
 
 future<> quic_client::stop() {

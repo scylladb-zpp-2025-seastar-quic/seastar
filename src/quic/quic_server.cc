@@ -1530,7 +1530,7 @@ future<> quic_server::start(quic_server_config config) {
 future<connection> quic_server::accept() {
     quic_server_log.debug("quic_server::accept");
     auto engine = co_await _impl->accept();
-    co_return connection(std::move(engine));
+    co_return connection(std::make_unique<connection::impl>(std::move(engine)));
 }
 
 future<> quic_server::stop() {

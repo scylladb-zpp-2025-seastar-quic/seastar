@@ -25,6 +25,36 @@
 
 #include <seastar/quic/quic.hh>
 
+namespace seastar::quic::experimental {
+
+namespace internal {
+class stream_state;
+class connection_engine;
+
+using stream_state_ptr = shared_ptr<stream_state>;
+using connection_engine_ptr = shared_ptr<connection_engine>;
+}
+
+class stream::impl {
+public:
+    explicit impl(internal::stream_state_ptr state)
+        : state(std::move(state)) {
+    }
+
+    internal::stream_state_ptr state;
+};
+
+class connection::impl {
+public:
+    explicit impl(internal::connection_engine_ptr state)
+        : state(std::move(state)) {
+    }
+
+    internal::connection_engine_ptr state;
+};
+
+} // namespace seastar::quic::experimental
+
 namespace seastar::quic::experimental::internal {
 
 class session_runtime;
