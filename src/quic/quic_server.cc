@@ -130,77 +130,6 @@ struct server_connection;
 void sync_current_path(server_connection& conn);
 
 struct server_connection : public enable_lw_shared_from_this<server_connection> {
-    struct transport_adapter final : internal::connection_transport {
-        server_connection& owner;
-
-        explicit transport_adapter(server_connection& owner) noexcept
-            : owner(owner) {
-        }
-
-        bool transport_active() const noexcept override { return owner.transport_active(); }
-        bool has_transport_connection() const noexcept override { return owner.has_transport_connection(); }
-        bool can_retry_blocked_open_streams() const noexcept override { return owner.can_retry_blocked_open_streams(); }
-        size_t tx_payload_limit_bytes() const noexcept override { return owner.tx_payload_limit_bytes(); }
-        int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override { return owner.write_pending_packet(outbuf, outbuf_size); }
-        internal::transport_stream_write_result write_stream_packet(
-          stream_id sid,
-          const char* data,
-          size_t len,
-          bool fin,
-          uint8_t* outbuf,
-          size_t outbuf_size) override { return owner.write_stream_packet(sid, data, len, fin, outbuf, outbuf_size); }
-        internal::transport_open_stream_result try_open_stream(stream_type type) override { return owner.try_open_stream(type); }
-        void complete_send_bytes(size_t len) override { owner.complete_send_bytes(len); }
-        int consume_stream_data(stream_id sid, size_t len) override { return owner.consume_stream_data(sid, len); }
-        int shutdown_stream_write(stream_id sid, application_error_code app_error_code) override { return owner.shutdown_stream_write(sid, app_error_code); }
-        int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override { return owner.shutdown_stream_read(sid, app_error_code); }
-        int read_transport_datagram(const socket_address& src, const char* data, size_t len) override { return owner.read_transport_datagram(src, data, len); }
-        void sync_transport_path() override { owner.sync_transport_path(); }
-        uint64_t transport_expiry_ns() const noexcept override { return owner.transport_expiry_ns(); }
-        int handle_transport_expiry(uint64_t now_ns) override { return owner.handle_transport_expiry(now_ns); }
-        temporary_buffer<char>& tx_packet_buffer() override { return owner.tx_packet_buffer(); }
-        future<> send_datagram_packet(temporary_buffer<char> packet) override { return owner.send_datagram_packet(std::move(packet)); }
-        bool can_send_connection_close() const noexcept override { return owner.can_send_connection_close(); }
-        int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) override { return owner.write_connection_close_packet(outbuf, outbuf_size); }
-        void on_stream_write_closed(stream_id sid) override { owner.on_stream_write_closed(sid); }
-        void rearm_transport_timer() override { owner.rearm_transport_timer(); }
-        void request_close() override { owner.request_close(); }
-        void stop_transport() override { owner.stop_transport(); }
-        void fail_transport(quic_error_code error, sstring detail) override { owner.fail_transport(error, std::move(detail)); }
-        void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override { owner.complete_open_stream(std::move(result), sid); }
-        void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) override {
-            owner.fail_open_stream(std::move(result), error, std::move(detail));
-        }
-        void defer_blocked_open_stream(transport_command cmd) override { owner.defer_blocked_open_stream(std::move(cmd)); }
-        std::optional<transport_command> pop_blocked_open_stream(stream_type type) override { return owner.pop_blocked_open_stream(type); }
-        bool blocked_open_stream_retry_pending(stream_type type) const noexcept override { return owner.blocked_open_stream_retry_pending(type); }
-        void clear_blocked_open_stream_retry(stream_type type) noexcept override { owner.clear_blocked_open_stream_retry(type); }
-    };
-
-    struct actor_adapter final : internal::connection_actor {
-        server_connection& owner;
-
-        explicit actor_adapter(server_connection& owner) noexcept
-            : owner(owner) {
-        }
-
-        bool actor_active() const noexcept override { return owner.actor_active(); }
-        bool actor_has_pending_work() const noexcept override { return owner.actor_has_pending_work(); }
-        future<> actor_wait_for_wakeup() override { return owner.actor_wait_for_wakeup(); }
-        bool actor_stop_requested() const noexcept override { return owner.actor_stop_requested(); }
-        future<> actor_handle_stop_request() override { return owner.actor_handle_stop_request(); }
-        bool actor_transport_terminal() const noexcept override { return owner.actor_transport_terminal(); }
-        future<> actor_handle_transport_terminal() override { return owner.actor_handle_transport_terminal(); }
-        bool actor_has_rx_event() const noexcept override { return owner.actor_has_rx_event(); }
-        future<> actor_handle_next_rx_event() override { return owner.actor_handle_next_rx_event(); }
-        bool actor_has_transport_command() const noexcept override { return owner.actor_has_transport_command(); }
-        future<> actor_handle_next_transport_command() override { return owner.actor_handle_next_transport_command(); }
-        future<> actor_retry_blocked_open_streams() override { return owner.actor_retry_blocked_open_streams(); }
-        bool actor_tick_pending() const noexcept override { return owner.actor_tick_pending(); }
-        void actor_clear_tick() noexcept override { owner.actor_clear_tick(); }
-        future<> actor_handle_timer_tick() override { return owner.actor_handle_timer_tick(); }
-    };
-
     std::weak_ptr<quic_server_impl> server;
     internal::session_runtime_ptr runtime;
     internal::connection_engine_ptr engine;
@@ -230,12 +159,12 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     std::optional<transport_command> blocked_send_command;
     bool blocked_send_retry_requested = false;
     std::unordered_set<std::string> mapped_dcids;
-    transport_adapter transport;
-    actor_adapter actor;
+    internal::connection_transport transport;
+    internal::connection_actor actor;
 
     server_connection()
-        : transport(*this)
-        , actor(*this) {
+        : transport(internal::make_connection_transport(*this))
+        , actor(internal::make_connection_actor(*this)) {
     }
 
     ~server_connection() {
