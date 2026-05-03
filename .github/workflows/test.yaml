@@ -40,11 +40,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: "${{ contains(inputs.enables, 'dpdk') }}"
+
+      - name: Sync submodule metadata
+        run: git submodule sync --recursive
 
       - name: Checkout ngtcp2 submodule
         run: git submodule update --init --recursive ngtcp2
+
+      - name: Checkout dpdk submodule
+        if: ${{ contains(inputs.enables, 'dpdk') }}
+        run: git submodule update --init --recursive dpdk
 
       - run: |
           sudo apt-get update
