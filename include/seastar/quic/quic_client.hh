@@ -30,6 +30,8 @@
 
 namespace seastar::quic::experimental {
 
+class quic_client_impl;
+
 struct quic_client_config {
     socket_address remote_address;
     std::optional<socket_address> local_address{};
@@ -54,8 +56,7 @@ public:
     future<> stop();
 
 private:
-    class impl;
-    std::unique_ptr<impl> _impl;
+    std::unique_ptr<quic_client_impl> _impl;
 };
 
 } // namespace seastar::quic::experimental

@@ -1169,7 +1169,7 @@ void start_background_tasks(const lw_shared_ptr<client_state>& st) {
 
 } // namespace
 
-class quic_client::impl final {
+class quic_client_impl final {
 public:
     future<internal::connection_engine_ptr> connect(quic_client_config config) {
         if (_state) {
@@ -1262,7 +1262,7 @@ private:
 };
 
 quic_client::quic_client()
-    : _impl(std::make_unique<impl>()) {
+    : _impl(std::make_unique<quic_client_impl>()) {
 }
 
 quic_client::~quic_client() = default;
