@@ -37,6 +37,8 @@ struct quic_server_config {
     connection_options session_options{};
 };
 
+class quic_server_impl;
+
 class quic_server final {
 public:
     quic_server();
@@ -53,8 +55,7 @@ public:
     future<> stop();
 
 private:
-    class impl;
-    std::shared_ptr<impl> _impl;
+    std::shared_ptr<quic_server_impl> _impl;
 };
 
 } // namespace seastar::quic::experimental

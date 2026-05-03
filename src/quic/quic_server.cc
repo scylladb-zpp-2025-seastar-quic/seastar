@@ -71,8 +71,6 @@ std::string cid_key(const uint8_t* data, size_t len) {
     return std::string(reinterpret_cast<const char*>(data), len);
 }
 
-class quic_server_impl;
-
 enum class quic_long_type : uint8_t {
     initial = 0,
     zero_rtt = 1,
@@ -675,6 +673,8 @@ void sync_current_path(server_connection& conn) {
     to_sockaddr_storage(*local, conn.local_ss, conn.local_ss_len);
     to_sockaddr_storage(conn.peer, conn.peer_ss, conn.peer_ss_len);
 }
+
+} // namespace
 
 class quic_server_impl : public std::enable_shared_from_this<quic_server_impl> {
 public:
@@ -1476,13 +1476,8 @@ void server_connection::fail_transport(quic_error_code error, sstring detail) {
     fail(error, detail);
 }
 
-} // namespace
-
-class quic_server::impl final : public quic_server_impl {
-};
-
 quic_server::quic_server()
-    : _impl(std::make_shared<impl>()) {
+    : _impl(std::make_shared<quic_server_impl>()) {
 }
 
 quic_server::~quic_server() {
