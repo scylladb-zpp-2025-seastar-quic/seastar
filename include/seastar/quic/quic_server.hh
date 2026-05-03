@@ -29,6 +29,7 @@
 
 namespace seastar::quic::experimental {
 
+// Listener configuration shared by all connections accepted from this server.
 struct quic_server_config {
     socket_address listen_address;
     sstring crt_file;
@@ -39,6 +40,7 @@ struct quic_server_config {
 
 class quic_server_impl;
 
+// Server-side owner of the listening transport and accepted QUIC connections.
 class quic_server final {
 public:
     quic_server();

@@ -65,6 +65,7 @@ using session_runtime_ptr = shared_ptr<session_runtime>;
 using stream_state_ptr = shared_ptr<stream_state>;
 using connection_engine_ptr = shared_ptr<connection_engine>;
 
+// Payload scheduled by the session runtime to be written by the transport.
 struct quic_message {
     stream_id stream = invalid_stream_id;
     temporary_buffer<char> payload;
@@ -76,6 +77,7 @@ enum class stream_shutdown_side : uint8_t {
     write,
 };
 
+// Commands emitted by the runtime and executed by the transport-facing actor loop.
 struct transport_command {
     enum class kind : uint8_t {
         send,
@@ -94,6 +96,7 @@ struct transport_command {
     std::shared_ptr<promise<stream_id>> open_result;
 };
 
+// Bridge between the public stream API and the transport actor.
 class session_runtime {
 public:
     virtual ~session_runtime() = default;
@@ -135,6 +138,7 @@ struct transport_open_stream_result {
     stream_id sid = invalid_stream_id;
 };
 
+// Callback-based view of client/server transport operations shared by common helpers.
 struct connection_transport {
     void* ctx = nullptr;
 

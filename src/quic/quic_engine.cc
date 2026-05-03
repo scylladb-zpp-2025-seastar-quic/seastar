@@ -118,6 +118,7 @@ private:
     size_t _pending_bytes = 0;
 };
 
+// Internal state for a single stream, including its Seastar IO queues and flow control.
 class stream_state final : public enable_shared_from_this<stream_state> {
     class source_impl;
     class sink_impl;
@@ -296,6 +297,7 @@ public:
         });
     }
 
+    // Shared state behind the public connection handle.
     session_runtime_ptr runtime;
     connection_options options;
     queue<shared_ptr<stream_state>> accepted_streams;

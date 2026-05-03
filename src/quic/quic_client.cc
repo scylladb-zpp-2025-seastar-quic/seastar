@@ -76,6 +76,7 @@ struct rx_event {
 struct client_state;
 void sync_current_path(client_state& st);
 
+// Owns one client-side transport instance: socket, TLS, ngtcp2 state and actor queues.
 struct client_state : public enable_lw_shared_from_this<client_state> {
     quic_client_config cfg{};
     internal::session_runtime_ptr runtime;
@@ -582,6 +583,8 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
 
     future<> actor_handle_next_transport_command() {
         std::optional<internal::transport_command> cmd;
+        // A partially written send must be retried before polling a fresh command to
+        // preserve stream write ordering from the runtime queue.
         if (blocked_send_retry_pending()) {
             clear_blocked_send_retry();
             cmd = take_blocked_send();
@@ -1125,6 +1128,7 @@ future<> actor_loop(lw_shared_ptr<client_state> st) {
             && !st->actor_stop_requested()
             && st->actor_has_pending_work()
             && (rx_processed == actor_batch_limit || commands_processed == actor_batch_limit)) {
+            // Keep a busy connection from monopolizing the reactor when work keeps arriving.
             co_await seastar::coroutine::maybe_yield();
         }
     }

@@ -32,6 +32,7 @@ namespace seastar::quic::experimental {
 
 class quic_client_impl;
 
+// Configuration for a single outbound QUIC connection attempt.
 struct quic_client_config {
     socket_address remote_address;
     std::optional<socket_address> local_address{};
@@ -41,6 +42,7 @@ struct quic_client_config {
     connection_options session_options{};
 };
 
+// Client-side owner of the transport state that yields one established connection.
 class quic_client final {
 public:
     quic_client();

@@ -130,6 +130,7 @@ struct conn_rx_event {
 struct server_connection;
 void sync_current_path(server_connection& conn);
 
+// Per-peer server-side transport state created after the first Initial packet.
 struct server_connection : public enable_lw_shared_from_this<server_connection> {
     std::weak_ptr<quic_server_impl> server;
     internal::session_runtime_ptr runtime;
@@ -534,6 +535,8 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     }
     future<> actor_handle_next_transport_command() {
         std::optional<transport_command> cmd;
+        // Retry a blocked send before taking a new command so the connection keeps
+        // its original send ordering.
         if (blocked_send_retry_pending()) {
             clear_blocked_send_retry();
             cmd = take_blocked_send();
@@ -604,6 +607,7 @@ void sync_current_path(server_connection& conn) {
 
 } // namespace
 
+// Owns the listener socket and tracks the set of active server-side connections.
 class quic_server_impl : public std::enable_shared_from_this<quic_server_impl> {
 public:
     quic_server_impl() = default;
@@ -1259,6 +1263,7 @@ private:
                 && !conn->actor_stop_requested()
                 && conn->actor_has_pending_work()
                 && (rx_processed == actor_batch_limit || commands_processed == actor_batch_limit)) {
+                // Yield between batches so one busy peer does not starve other work.
                 co_await seastar::coroutine::maybe_yield();
             }
         }

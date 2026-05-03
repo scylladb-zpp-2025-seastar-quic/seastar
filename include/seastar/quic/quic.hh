@@ -56,6 +56,7 @@ enum class congestion_control_algorithm : uint8_t {
     bbr2,
 };
 
+// Transport-level knobs passed to ngtcp2 when a connection is created.
 struct transport_config {
     uint64_t max_idle_timeout_ns = 60ULL * 1000 * 1000 * 1000;
     uint64_t initial_max_stream_data_bidi_local = 256 * 1024;
@@ -75,12 +76,14 @@ struct transport_config {
     bool disable_pmtud = false;
 };
 
+// Per-connection runtime limits plus transport setup shared by client and server.
 struct connection_options {
     size_t max_pending_send_bytes = 4 * 1024 * 1024;
     size_t max_pending_receive_bytes = 4 * 1024 * 1024;
     transport_config transport{};
 };
 
+// Options for locally opening a new QUIC stream.
 struct stream_open_options {
     stream_type type = stream_type::bidirectional;
 };
@@ -89,6 +92,7 @@ namespace internal {
 class connection_engine;
 }
 
+// Public handle to a single QUIC stream.
 class stream final {
 public:
     stream();
@@ -125,6 +129,7 @@ private:
     friend connected_socket to_connected_socket(stream&& s);
 };
 
+// Public handle to an established QUIC connection.
 class connection final {
 public:
     connection();
