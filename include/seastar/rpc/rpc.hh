@@ -591,6 +591,7 @@ class client : public rpc::connection, public weakly_referencable<client> {
         virtual void operator()(client&, id_type, rcv_buf data) = 0;
         virtual void timeout() {}
         virtual void cancel() {}
+        virtual void closed() {}
         virtual ~reply_handler_base() {
             if (pcancel) {
                 pcancel->cancel_wait = std::function<void()>();
@@ -638,6 +639,10 @@ public:
         virtual void cancel() override {
             reply.done = true;
             reply.p.set_exception(canceled_error());
+        }
+        virtual void closed() override {
+            reply.done = true;
+            reply.p.set_exception(closed_error());
         }
         virtual ~reply_handler() {}
     };

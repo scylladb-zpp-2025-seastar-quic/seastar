@@ -153,22 +153,26 @@ static future<> write_snd_buf(output_stream<char>& out, snd_buf buf) {
     }
 }
 
+static bool is_quic_closed_exception(std::exception_ptr ep) noexcept {
+    try {
+        std::rethrow_exception(ep);
+    } catch (const quic::experimental::quic_exception& ex) {
+        return ex.code() == quic::experimental::quic_error::closed;
+    } catch (...) {
+        return false;
+    }
+}
+
+static future<> ignore_quic_closed_exception(std::exception_ptr ep) {
+    if (is_quic_closed_exception(ep)) {
+        return make_ready_future<>();
+    }
+    return make_exception_future<>(ep);
+}
+
 class quic_reply_stream_state {
     output_stream<char> _out;
     bool _closed = false;
-
-    static future<> ignore_closed(std::exception_ptr ep) {
-        try {
-            std::rethrow_exception(ep);
-        } catch (const quic::experimental::quic_exception& ex) {
-            if (ex.code() == quic::experimental::quic_error::closed) {
-                return make_ready_future<>();
-            }
-            return make_exception_future<>(ep);
-        } catch (...) {
-            return make_exception_future<>(ep);
-        }
-    }
 
 public:
     explicit quic_reply_stream_state(output_stream<char> out)
@@ -181,7 +185,7 @@ public:
         }
         _closed = true;
         return _out.close().handle_exception([] (std::exception_ptr ep) {
-            return ignore_closed(ep);
+            return ignore_quic_closed_exception(ep);
         });
     }
 
@@ -192,7 +196,7 @@ public:
         return write_snd_buf(_out, std::move(data)).then([this] {
             return _out.flush();
         }).handle_exception([] (std::exception_ptr ep) {
-            return ignore_closed(ep);
+            return ignore_quic_closed_exception(ep);
         }).finally([this] {
             return close();
         });
@@ -336,6 +340,11 @@ future<internal::incoming_request> connection::transport_receive_request() {
 }
 
 future<> connection::transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) {
+    if (_negotiated) {
+        return _negotiated->get_shared_future().then([this, msg_id, buf = std::move(buf), timeout, cancel] () mutable {
+            return _transport->send_request(*this, msg_id, std::move(buf), timeout, cancel);
+        });
+    }
     return _transport->send_request(*this, msg_id, std::move(buf), timeout, cancel);
 }
 
@@ -1178,7 +1187,10 @@ future<> client::loop_with_transport(bool read_responses_from_transport) {
         co_await process_client_connection(read_responses_from_transport);
     } catch (...) {
         ep = std::current_exception();
-        if (connected()) {
+        auto expected_close = _error && is_quic_closed_exception(ep);
+        if (expected_close) {
+            ep = nullptr;
+        } else if (connected()) {
             if (is_stream()) {
                 log_exception(*this, log_level::error, "client stream connection dropped", ep);
             } else {
@@ -1546,12 +1558,12 @@ output_stream<char>& quic_client_transport::output() {
 }
 
 void quic_client_transport::shutdown_input() {
-    (void)_control_stream.stop_sending();
-    (void)_response_gate.close();
+    (void)_control_stream.stop_sending().handle_exception([] (std::exception_ptr) {});
+    (void)_response_gate.close().handle_exception([] (std::exception_ptr) {});
 }
 
 void quic_client_transport::shutdown_output() {
-    (void)_control_output.close();
+    (void)_control_output.close().handle_exception([] (std::exception_ptr) {});
 }
 
 future<> quic_client_transport::stop() {
@@ -1590,26 +1602,57 @@ future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, 
     }
 
     auto& rpc_client = dynamic_cast<client&>(owner);
+    if (data.size && rpc_client._propagate_timeout) {
+        static_assert(snd_buf::chunk_size >= sizeof(uint64_t), "send buffer chunk size is too small");
+        if (rpc_client._timeout_negotiated) {
+            uint64_t left = 0;
+            if (timeout) {
+                left = std::chrono::duration_cast<std::chrono::milliseconds>(*timeout - rpc_clock_type::now()).count();
+            }
+            write_le<uint64_t>(data.front().get_write(), left);
+        } else {
+            data.front().trim_front(sizeof(uint64_t));
+            data.size -= sizeof(uint64_t);
+        }
+    }
+    data = rpc_client.compress(std::move(data));
+
     auto stream = co_await _conn.open_stream();
     auto input = stream.input();
     auto output = stream.output();
 
     co_await write_snd_buf(output, std::move(data));
     co_await output.flush();
+    rpc_client._stats.sent_messages++;
     co_await output.close();
 
     try {
         (void)with_gate(_response_gate, [&rpc_client, msg_id, input = std::move(input)] () mutable {
-            return do_with(std::move(input), [&rpc_client] (input_stream<char>& in) {
-                return rpc_client.receive_response_frame(in).then([&rpc_client] (internal::incoming_response response) {
+            return do_with(std::move(input), [&rpc_client, msg_id] (input_stream<char>& in) {
+                return rpc_client.receive_response_frame(in).then([&rpc_client, msg_id] (internal::incoming_response response) {
+                    if (!response.data) {
+                        auto it = rpc_client._outstanding.find(msg_id);
+                        if (it != rpc_client._outstanding.end()) {
+                            auto handler = std::move(it->second);
+                            rpc_client._outstanding.erase(it);
+                            handler->closed();
+                        }
+                        return;
+                    }
                     rpc_client.handle_response(std::move(response));
                 }).finally([&in] {
-                    return in.close();
+                    return in.close().handle_exception([] (std::exception_ptr ep) {
+                        return ignore_quic_closed_exception(ep);
+                    });
                 });
             }).handle_exception([&rpc_client, msg_id] (std::exception_ptr ep) {
-                if (rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
+                auto it = rpc_client._outstanding.find(msg_id);
+                if (it == rpc_client._outstanding.end()) {
                     return;
                 }
+                auto handler = std::move(it->second);
+                rpc_client._outstanding.erase(it);
+                handler->closed();
                 if (!rpc_client.error()) {
                     log_exception(rpc_client, log_level::error, "client QUIC request stream failed", ep);
                 }
@@ -1638,27 +1681,48 @@ output_stream<char>& quic_server_transport::output() {
 }
 
 void quic_server_transport::shutdown_input() {
-    (void)_control_stream.stop_sending();
+    (void)_control_stream.stop_sending().handle_exception([] (std::exception_ptr) {});
 }
 
 void quic_server_transport::shutdown_output() {
-    (void)_control_output.close();
+    (void)_control_output.close().handle_exception([] (std::exception_ptr) {});
+}
+
+future<> quic_server_transport::stop() {
+    try {
+        co_await _control_stream.stop_sending();
+    } catch (...) {
+    }
+    try {
+        co_await _control_output.close();
+    } catch (...) {
+    }
+    try {
+        co_await _conn.close();
+    } catch (...) {
+    }
 }
 
 future<internal::incoming_request> quic_server_transport::receive_request(connection& owner) {
-    auto stream = co_await _conn.accept_stream();
-    auto input = stream.input();
-    auto output = make_lw_shared<quic_reply_stream_state>(stream.output());
-    auto request = co_await owner.receive_request_frame(input);
-    request.reply = internal::reply_handle([output] (snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout) mutable {
-        if (timeout && *timeout <= rpc_clock_type::now()) {
-            return output->close();
+    while (true) {
+        auto stream = co_await _conn.accept_stream();
+        auto input = stream.input();
+        auto output = make_lw_shared<quic_reply_stream_state>(stream.output());
+        auto request = co_await owner.receive_request_frame(input);
+        if (!request.data) {
+            co_await output->close();
+            continue;
         }
-        return output->write_and_close(std::move(data));
-    }, [output] () mutable {
-        return output->close();
-    });
-    co_return request;
+        request.reply = internal::reply_handle([output] (snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout) mutable {
+            if (timeout && *timeout <= rpc_clock_type::now()) {
+                return output->close();
+            }
+            return output->write_and_close(std::move(data));
+        }, [output] () mutable {
+            return output->close();
+        });
+        co_return request;
+    }
 }
 
 future<> quic_server_transport::send_request(connection&, int64_t, snd_buf, std::optional<rpc_clock_type::time_point>, cancellable*) {
@@ -1754,8 +1818,9 @@ void server::accept_quic(::seastar::quic::experimental::quic_server& qs) {
     // Run asynchronously in background. The caller owns qs and is responsible for stopping it.
     (void)keep_doing([this, &qs] () mutable {
         return qs.accept().then([this] (::seastar::quic::experimental::connection session) mutable {
-            (void)handle_quic_session(std::move(session));
+            (void)handle_quic_session(std::move(session)).handle_exception([] (std::exception_ptr) {});
         });
+    }).handle_exception([] (std::exception_ptr) {
     });
 }
 
