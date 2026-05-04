@@ -913,23 +913,23 @@ SEASTAR_TEST_CASE(test_quic_runtime_close_and_error_drain_pending_open_streams) 
 
 SEASTAR_TEST_CASE(test_quic_reading_stream_queues_consumed_credit) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto command_runtime = quic_internal::make_command_runtime();
+        auto connection_state = quic_internal::make_connection_state(command_runtime);
 
-        engine->on_stream_data(
+        connection_state->on_stream_data(
           0,
           stream_type::bidirectional,
           true,
           temporary_buffer<char>("ping", 4),
           false);
 
-        auto accepted = engine->accept_stream().get();
+        auto accepted = connection_state->accept_stream().get();
         auto input = accepted.input();
         auto chunk = input.read().get();
 
         BOOST_REQUIRE_EQUAL(to_sstring(std::move(chunk)), "ping");
 
-        auto cmd = runtime->poll_command();
+        auto cmd = command_runtime->poll_command();
         BOOST_REQUIRE(cmd.has_value());
         BOOST_REQUIRE(cmd->op == quic_internal::transport_command::kind::consume_stream_data);
         BOOST_REQUIRE_EQUAL(cmd->msg.stream, 0);
@@ -962,18 +962,18 @@ SEASTAR_TEST_CASE(test_quic_send_backpressure_waits_for_transport_consumption) {
         connection_options options;
         options.max_pending_send_bytes = 4;
 
-        auto runtime = quic_internal::make_session_runtime(options);
-        runtime->send(make_message(0, "ping")).get();
+        auto command_runtime = quic_internal::make_command_runtime(options);
+        command_runtime->send(make_message(0, "ping")).get();
 
-        auto second_send = runtime->send(make_message(0, "x"));
+        auto second_send = command_runtime->send(make_message(0, "x"));
         BOOST_REQUIRE(!second_send.available());
 
-        auto first = runtime->poll_command();
+        auto first = command_runtime->poll_command();
         BOOST_REQUIRE(first.has_value());
         BOOST_REQUIRE(first->op == quic_internal::transport_command::kind::send);
         BOOST_REQUIRE(!second_send.available());
 
-        runtime->complete_send_bytes(first->msg.payload.size());
+        command_runtime->complete_send_bytes(first->msg.payload.size());
         second_send.get();
     });
 }

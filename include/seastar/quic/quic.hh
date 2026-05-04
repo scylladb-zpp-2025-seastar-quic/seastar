@@ -89,7 +89,7 @@ struct stream_open_options {
 };
 
 namespace internal {
-class connection_engine;
+class connection_state;
 }
 
 // Public handle to a single QUIC stream.
@@ -125,7 +125,7 @@ private:
     std::unique_ptr<impl> _impl;
 
     friend class connection;
-    friend class internal::connection_engine;
+    friend class internal::connection_state;
     friend connected_socket to_connected_socket(stream&& s);
 };
 

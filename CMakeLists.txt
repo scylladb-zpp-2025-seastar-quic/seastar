@@ -769,10 +769,10 @@ add_library (seastar
   src/websocket/parser.cc
   src/websocket/common.cc
   src/websocket/server.cc
-  src/quic/quic.cc
+  src/quic/quic_command_runtime.cc
   src/quic/quic_common.cc
   src/quic/quic_client.cc
-  src/quic/quic_engine.cc
+  src/quic/quic_connection_state.cc
   src/quic/quic_server.cc
   src/quic/quic_error.cc
   )

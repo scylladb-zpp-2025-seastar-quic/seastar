@@ -29,10 +29,10 @@ namespace seastar::quic::experimental {
 
 namespace internal {
 class stream_state;
-class connection_engine;
+class connection_state;
 
 using stream_state_ptr = shared_ptr<stream_state>;
-using connection_engine_ptr = shared_ptr<connection_engine>;
+using connection_state_ptr = shared_ptr<connection_state>;
 }
 
 class stream::impl {
@@ -46,26 +46,26 @@ public:
 
 class connection::impl {
 public:
-    explicit impl(internal::connection_engine_ptr state)
+    explicit impl(internal::connection_state_ptr state)
         : state(std::move(state)) {
     }
 
-    internal::connection_engine_ptr state;
+    internal::connection_state_ptr state;
 };
 
 } // namespace seastar::quic::experimental
 
 namespace seastar::quic::experimental::internal {
 
-class session_runtime;
+class command_runtime;
 class stream_state;
-class connection_engine;
+class connection_state;
 
-using session_runtime_ptr = shared_ptr<session_runtime>;
+using command_runtime_ptr = shared_ptr<command_runtime>;
 using stream_state_ptr = shared_ptr<stream_state>;
-using connection_engine_ptr = shared_ptr<connection_engine>;
+using connection_state_ptr = shared_ptr<connection_state>;
 
-// Payload scheduled by the session runtime to be written by the transport.
+// Payload scheduled by the command runtime to be written by the transport.
 struct quic_message {
     stream_id stream = invalid_stream_id;
     temporary_buffer<char> payload;
@@ -77,7 +77,7 @@ enum class stream_shutdown_side : uint8_t {
     write,
 };
 
-// Commands emitted by the runtime and executed by the transport-facing actor loop.
+// Commands emitted by the command runtime and executed by the transport-facing actor loop.
 struct transport_command {
     enum class kind : uint8_t {
         send,
@@ -97,9 +97,9 @@ struct transport_command {
 };
 
 // Bridge between the public stream API and the transport actor.
-class session_runtime {
+class command_runtime {
 public:
-    virtual ~session_runtime() = default;
+    virtual ~command_runtime() = default;
 
     virtual bool is_open() const noexcept = 0;
     virtual socket_address local_address() const = 0;
@@ -283,13 +283,13 @@ connection_transport make_connection_transport(Owner& owner) {
     };
 }
 
-class connection_engine {
+class connection_state {
 public:
-    explicit connection_engine(session_runtime_ptr runtime, connection_options options = {});
-    ~connection_engine();
+    explicit connection_state(command_runtime_ptr runtime, connection_options options = {});
+    ~connection_state();
 
-    connection_engine(const connection_engine&) = delete;
-    connection_engine& operator=(const connection_engine&) = delete;
+    connection_state(const connection_state&) = delete;
+    connection_state& operator=(const connection_state&) = delete;
 
     bool is_open() const noexcept;
     socket_address local_address() const;
@@ -334,7 +334,7 @@ private:
     std::unique_ptr<impl> _impl;
 };
 
-connection_engine_ptr make_connection_engine(session_runtime_ptr runtime, connection_options options = {});
+connection_state_ptr make_connection_state(command_runtime_ptr runtime, connection_options options = {});
 
 future<> flush_pending_transport_packets(connection_transport& transport);
 future<std::optional<quic_message>> send_stream_message(connection_transport& transport, quic_message msg);
@@ -348,6 +348,6 @@ future<> recv_transport_datagram(connection_transport& transport, const socket_a
 future<> handle_transport_timer(connection_transport& transport);
 future<> send_connection_close(connection_transport& transport);
 
-session_runtime_ptr make_session_runtime(connection_options options = {});
+command_runtime_ptr make_command_runtime(connection_options options = {});
 
 } // namespace seastar::quic::experimental::internal
