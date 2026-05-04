@@ -496,8 +496,8 @@ future<> run_connection_actor(fake_connection_actor& actor) {
 }
 
 stream open_stream_from_engine(
-  const quic_internal::session_runtime_ptr& runtime,
-  const quic_internal::connection_engine_ptr& engine,
+  const quic_internal::command_runtime_ptr& runtime,
+  const quic_internal::connection_state_ptr& engine,
   stream_id sid,
   stream_type type) {
     auto opened = engine->open_stream(stream_open_options{.type = type});
@@ -538,8 +538,8 @@ SEASTAR_TEST_CASE(test_quic_default_public_objects_are_safe) {
 
 SEASTAR_TEST_CASE(test_quic_connection_metadata_tracks_transport_ready) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
         auto local = socket_address(ipv4_addr("127.0.0.1", 1111));
         auto peer = socket_address(ipv4_addr("127.0.0.1", 2222));
 
@@ -554,8 +554,8 @@ SEASTAR_TEST_CASE(test_quic_connection_metadata_tracks_transport_ready) {
 
 SEASTAR_TEST_CASE(test_quic_open_stream_exposes_directional_capabilities) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         auto bidi = open_stream_from_engine(runtime, engine, 0, stream_type::bidirectional);
         BOOST_REQUIRE(bidi.is_open());
@@ -580,8 +580,8 @@ SEASTAR_TEST_CASE(test_quic_open_stream_exposes_directional_capabilities) {
 
 SEASTAR_TEST_CASE(test_quic_accept_stream_exposes_peer_directional_capabilities_once) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         engine->on_stream_data(5, stream_type::unidirectional, true, temporary_buffer<char>("abc", 3), false);
         engine->on_stream_data(5, stream_type::unidirectional, true, temporary_buffer<char>("def", 3), false);
@@ -604,8 +604,8 @@ SEASTAR_TEST_CASE(test_quic_accept_stream_exposes_peer_directional_capabilities_
 
 SEASTAR_TEST_CASE(test_quic_fin_completes_input_shutdown_and_eof) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         engine->on_stream_data(7, stream_type::bidirectional, true, temporary_buffer<char>("ping", 4), true);
         auto accepted = engine->accept_stream().get();
@@ -623,8 +623,8 @@ SEASTAR_TEST_CASE(test_quic_fin_completes_input_shutdown_and_eof) {
 
 SEASTAR_TEST_CASE(test_quic_stream_close_reset_and_stop_sending_queue_commands) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         auto output_stream = open_stream_from_engine(runtime, engine, 9, stream_type::bidirectional);
         output_stream.close_output().get();
@@ -658,8 +658,8 @@ SEASTAR_TEST_CASE(test_quic_stream_close_reset_and_stop_sending_queue_commands) 
 
 SEASTAR_TEST_CASE(test_quic_peer_reset_aborts_stream_input) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         engine->on_stream_data(14, stream_type::bidirectional, true, temporary_buffer<char>("payload", 7), false);
         auto accepted = engine->accept_stream().get();
@@ -681,8 +681,8 @@ SEASTAR_TEST_CASE(test_quic_peer_reset_aborts_stream_input) {
 
 SEASTAR_TEST_CASE(test_quic_peer_stop_sending_closes_stream_output) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         auto opened = open_stream_from_engine(runtime, engine, 16, stream_type::bidirectional);
         BOOST_REQUIRE(opened.can_write());
@@ -703,8 +703,8 @@ SEASTAR_TEST_CASE(test_quic_peer_stop_sending_closes_stream_output) {
 
 SEASTAR_TEST_CASE(test_quic_peer_stop_sending_read_aborts_stream_input) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         engine->on_stream_data(18, stream_type::bidirectional, true, temporary_buffer<char>("payload", 7), false);
         auto accepted = engine->accept_stream().get();
@@ -731,8 +731,8 @@ SEASTAR_TEST_CASE(test_quic_peer_stop_sending_read_aborts_stream_input) {
 
 SEASTAR_TEST_CASE(test_quic_connected_socket_wraps_bidirectional_stream) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
         auto local = socket_address(ipv4_addr("127.0.0.1", 3333));
         auto peer = socket_address(ipv4_addr("127.0.0.1", 4444));
         runtime->mark_transport_ready(local, peer, "h3");
@@ -773,8 +773,8 @@ SEASTAR_TEST_CASE(test_quic_connected_socket_wraps_bidirectional_stream) {
 
 SEASTAR_TEST_CASE(test_quic_connection_close_terminates_pending_accept_and_open) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         auto pending_accept = engine->accept_stream();
         auto pending_open = engine->open_stream();
@@ -803,8 +803,8 @@ SEASTAR_TEST_CASE(test_quic_connection_close_terminates_pending_accept_and_open)
 
 SEASTAR_TEST_CASE(test_quic_stream_closed_detaches_old_handle_from_reused_stream_id) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         engine->on_stream_data(22, stream_type::bidirectional, true, temporary_buffer<char>("old", 3), false);
         auto old_stream = engine->accept_stream().get();
@@ -836,8 +836,8 @@ SEASTAR_TEST_CASE(test_quic_stream_closed_detaches_old_handle_from_reused_stream
 
 SEASTAR_TEST_CASE(test_quic_transport_close_aborts_pending_accept_and_existing_streams) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
-        auto engine = quic_internal::make_connection_engine(runtime);
+        auto runtime = quic_internal::make_command_runtime();
+        auto engine = quic_internal::make_connection_state(runtime);
 
         engine->on_stream_data(17, stream_type::bidirectional, true, temporary_buffer<char>("payload", 7), false);
         auto accepted = engine->accept_stream().get();
@@ -856,8 +856,8 @@ SEASTAR_TEST_CASE(test_quic_receive_budget_accepts_payload_at_limit) {
     return seastar::async([] {
         connection_options options;
         options.max_pending_receive_bytes = 4;
-        auto runtime = quic_internal::make_session_runtime(options);
-        auto engine = quic_internal::make_connection_engine(runtime, options);
+        auto runtime = quic_internal::make_command_runtime(options);
+        auto engine = quic_internal::make_connection_state(runtime, options);
 
         engine->on_stream_data(20, stream_type::bidirectional, true, temporary_buffer<char>("ping", 4), false);
 
@@ -879,8 +879,8 @@ SEASTAR_TEST_CASE(test_quic_receive_budget_failure_marks_runtime_error) {
     return seastar::async([] {
         connection_options options;
         options.max_pending_receive_bytes = 4;
-        auto runtime = quic_internal::make_session_runtime(options);
-        auto engine = quic_internal::make_connection_engine(runtime, options);
+        auto runtime = quic_internal::make_command_runtime(options);
+        auto engine = quic_internal::make_connection_state(runtime, options);
 
         engine->on_stream_data(19, stream_type::bidirectional, true, temporary_buffer<char>("hello", 5), false);
 
@@ -894,7 +894,7 @@ SEASTAR_TEST_CASE(test_quic_receive_budget_failure_marks_runtime_error) {
 
 SEASTAR_TEST_CASE(test_quic_runtime_close_and_error_drain_pending_open_streams) {
     return seastar::async([] {
-        auto runtime = quic_internal::make_session_runtime();
+        auto runtime = quic_internal::make_command_runtime();
         auto open = runtime->open_stream(stream_type::bidirectional);
         BOOST_REQUIRE(!open.available());
 
@@ -903,7 +903,7 @@ SEASTAR_TEST_CASE(test_quic_runtime_close_and_error_drain_pending_open_streams) 
         require_quic_future_exception(std::move(open), quic_error::closed);
         require_quic_future_exception(runtime->send(make_message(1, "x")), quic_error::closed);
 
-        auto failed_runtime = quic_internal::make_session_runtime();
+        auto failed_runtime = quic_internal::make_command_runtime();
         auto failed_open = failed_runtime->open_stream(stream_type::bidirectional);
         failed_runtime->mark_error(quic_error::protocol, "bad packet");
         require_quic_future_exception(std::move(failed_open), quic_error::protocol);
