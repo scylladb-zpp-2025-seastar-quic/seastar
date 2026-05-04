@@ -656,6 +656,79 @@ SEASTAR_TEST_CASE(test_quic_stream_close_reset_and_stop_sending_queue_commands) 
     });
 }
 
+SEASTAR_TEST_CASE(test_quic_peer_reset_aborts_stream_input) {
+    return seastar::async([] {
+        auto runtime = quic_internal::make_session_runtime();
+        auto engine = quic_internal::make_connection_engine(runtime);
+
+        engine->on_stream_data(14, stream_type::bidirectional, true, temporary_buffer<char>("payload", 7), false);
+        auto accepted = engine->accept_stream().get();
+        auto input = accepted.input();
+        auto chunk = input.read().get();
+        BOOST_REQUIRE_EQUAL(to_sstring(std::move(chunk)), "payload");
+
+        auto shutdown = accepted.wait_input_shutdown();
+        BOOST_REQUIRE(!shutdown.available());
+
+        engine->on_stream_reset(14, stream_type::bidirectional, true, 1234);
+
+        shutdown.get();
+        require_quic_future_exception(input.read(), quic_error::closed);
+        BOOST_REQUIRE(accepted.is_open());
+        (void)accepted.output();
+    });
+}
+
+SEASTAR_TEST_CASE(test_quic_peer_stop_sending_closes_stream_output) {
+    return seastar::async([] {
+        auto runtime = quic_internal::make_session_runtime();
+        auto engine = quic_internal::make_connection_engine(runtime);
+
+        auto opened = open_stream_from_engine(runtime, engine, 16, stream_type::bidirectional);
+        BOOST_REQUIRE(opened.can_write());
+        (void)opened.output();
+
+        engine->on_stream_stop_sending(
+          16,
+          stream_type::bidirectional,
+          false,
+          4321,
+          quic_internal::stream_shutdown_side::write);
+
+        require_quic_error([&opened] { (void)opened.output(); }, quic_error::closed);
+        opened.close_output().get();
+        BOOST_REQUIRE(!runtime->poll_command().has_value());
+    });
+}
+
+SEASTAR_TEST_CASE(test_quic_peer_stop_sending_read_aborts_stream_input) {
+    return seastar::async([] {
+        auto runtime = quic_internal::make_session_runtime();
+        auto engine = quic_internal::make_connection_engine(runtime);
+
+        engine->on_stream_data(18, stream_type::bidirectional, true, temporary_buffer<char>("payload", 7), false);
+        auto accepted = engine->accept_stream().get();
+        auto input = accepted.input();
+        auto chunk = input.read().get();
+        BOOST_REQUIRE_EQUAL(to_sstring(std::move(chunk)), "payload");
+
+        auto shutdown = accepted.wait_input_shutdown();
+        BOOST_REQUIRE(!shutdown.available());
+
+        engine->on_stream_stop_sending(
+          18,
+          stream_type::bidirectional,
+          true,
+          5678,
+          quic_internal::stream_shutdown_side::read);
+
+        shutdown.get();
+        require_quic_future_exception(input.read(), quic_error::closed);
+        BOOST_REQUIRE(accepted.is_open());
+        (void)accepted.output();
+    });
+}
+
 SEASTAR_TEST_CASE(test_quic_connected_socket_wraps_bidirectional_stream) {
     return seastar::async([] {
         auto runtime = quic_internal::make_session_runtime();
@@ -698,6 +771,69 @@ SEASTAR_TEST_CASE(test_quic_connected_socket_wraps_bidirectional_stream) {
     });
 }
 
+SEASTAR_TEST_CASE(test_quic_connection_close_terminates_pending_accept_and_open) {
+    return seastar::async([] {
+        auto runtime = quic_internal::make_session_runtime();
+        auto engine = quic_internal::make_connection_engine(runtime);
+
+        auto pending_accept = engine->accept_stream();
+        auto pending_open = engine->open_stream();
+        BOOST_REQUIRE(!pending_accept.available());
+        BOOST_REQUIRE(!pending_open.available());
+
+        engine->close().get();
+        BOOST_REQUIRE(!engine->is_open());
+
+        runtime->mark_transport_closed();
+        engine->on_transport_closed(std::make_exception_ptr(quic_error(quic_error::closed, "transport closed")));
+
+        require_quic_future_exception(std::move(pending_accept), quic_error::closed);
+        require_quic_future_exception(std::move(pending_open), quic_error::closed);
+
+        auto open_cmd = runtime->poll_command();
+        BOOST_REQUIRE(open_cmd.has_value());
+        BOOST_REQUIRE(open_cmd->op == quic_internal::transport_command::kind::open_stream);
+        BOOST_REQUIRE(!open_cmd->open_result);
+
+        auto close_cmd = runtime->poll_command();
+        BOOST_REQUIRE(close_cmd.has_value());
+        BOOST_REQUIRE(close_cmd->op == quic_internal::transport_command::kind::close_connection);
+    });
+}
+
+SEASTAR_TEST_CASE(test_quic_stream_closed_detaches_old_handle_from_reused_stream_id) {
+    return seastar::async([] {
+        auto runtime = quic_internal::make_session_runtime();
+        auto engine = quic_internal::make_connection_engine(runtime);
+
+        engine->on_stream_data(22, stream_type::bidirectional, true, temporary_buffer<char>("old", 3), false);
+        auto old_stream = engine->accept_stream().get();
+        auto old_input = old_stream.input();
+        auto old_chunk = old_input.read().get();
+        BOOST_REQUIRE_EQUAL(to_sstring(std::move(old_chunk)), "old");
+        auto old_consume_cmd = runtime->poll_command();
+        BOOST_REQUIRE(old_consume_cmd.has_value());
+        BOOST_REQUIRE(old_consume_cmd->op == quic_internal::transport_command::kind::consume_stream_data);
+
+        engine->on_stream_closed(22);
+        engine->on_stream_data(22, stream_type::bidirectional, true, temporary_buffer<char>("new", 3), true);
+
+        auto new_stream = engine->accept_stream().get();
+        BOOST_REQUIRE_EQUAL(new_stream.id(), 22);
+        auto new_input = new_stream.input();
+        auto new_chunk = new_input.read().get();
+        BOOST_REQUIRE_EQUAL(to_sstring(std::move(new_chunk)), "new");
+        BOOST_REQUIRE(new_input.read().get().empty());
+
+        old_stream.close_output().get();
+        auto close_cmd = runtime->poll_command();
+        BOOST_REQUIRE(close_cmd.has_value());
+        BOOST_REQUIRE(close_cmd->op == quic_internal::transport_command::kind::send);
+        BOOST_REQUIRE_EQUAL(close_cmd->msg.stream, 22);
+        BOOST_REQUIRE(close_cmd->msg.fin);
+    });
+}
+
 SEASTAR_TEST_CASE(test_quic_transport_close_aborts_pending_accept_and_existing_streams) {
     return seastar::async([] {
         auto runtime = quic_internal::make_session_runtime();
@@ -713,6 +849,29 @@ SEASTAR_TEST_CASE(test_quic_transport_close_aborts_pending_accept_and_existing_s
         require_quic_future_exception(std::move(pending_accept), quic_error::closed);
         require_quic_future_exception(input.read(), quic_error::closed);
         BOOST_REQUIRE(!accepted.is_open());
+    });
+}
+
+SEASTAR_TEST_CASE(test_quic_receive_budget_accepts_payload_at_limit) {
+    return seastar::async([] {
+        connection_options options;
+        options.max_pending_receive_bytes = 4;
+        auto runtime = quic_internal::make_session_runtime(options);
+        auto engine = quic_internal::make_connection_engine(runtime, options);
+
+        engine->on_stream_data(20, stream_type::bidirectional, true, temporary_buffer<char>("ping", 4), false);
+
+        BOOST_REQUIRE(!runtime->transport_failed());
+        auto accepted = engine->accept_stream().get();
+        auto input = accepted.input();
+        auto chunk = input.read().get();
+        BOOST_REQUIRE_EQUAL(to_sstring(std::move(chunk)), "ping");
+
+        auto consume_cmd = runtime->poll_command();
+        BOOST_REQUIRE(consume_cmd.has_value());
+        BOOST_REQUIRE(consume_cmd->op == quic_internal::transport_command::kind::consume_stream_data);
+        BOOST_REQUIRE_EQUAL(consume_cmd->msg.stream, 20);
+        BOOST_REQUIRE_EQUAL(consume_cmd->consumed_bytes, 4);
     });
 }
 
@@ -1206,6 +1365,21 @@ SEASTAR_TEST_CASE(test_quic_transport_command_failures_mark_transport_error) {
     });
 }
 
+SEASTAR_TEST_CASE(test_quic_flush_pending_packet_error_marks_transport_error) {
+    return seastar::async([] {
+        fake_connection_transport transport;
+        transport.pending_packet_results.push_back(NGTCP2_ERR_PROTO);
+
+        quic_internal::flush_pending_transport_packets(transport).get();
+
+        BOOST_REQUIRE_EQUAL(transport.write_pending_calls, 1);
+        BOOST_REQUIRE_EQUAL(transport.send_datagram_calls, 0);
+        BOOST_REQUIRE_EQUAL(transport.stop_transport_calls, 0);
+        BOOST_REQUIRE(transport.last_error.has_value());
+        BOOST_REQUIRE(*transport.last_error == quic_error::protocol);
+    });
+}
+
 SEASTAR_TEST_CASE(test_quic_recv_datagram_success_and_draining_paths) {
     return seastar::async([] {
         auto peer = socket_address(ipv4_addr("127.0.0.1", 5555));
@@ -1225,6 +1399,29 @@ SEASTAR_TEST_CASE(test_quic_recv_datagram_success_and_draining_paths) {
         BOOST_REQUIRE_EQUAL(draining_transport.stop_transport_calls, 1);
         BOOST_REQUIRE(!draining_transport.active);
         BOOST_REQUIRE_EQUAL(draining_transport.sync_path_calls, 0);
+
+        fake_connection_transport failed_transport;
+        failed_transport.read_datagram_result = NGTCP2_ERR_PROTO;
+        quic_internal::recv_transport_datagram(failed_transport, peer, temporary_buffer<char>("pkt", 3)).get();
+        BOOST_REQUIRE_EQUAL(failed_transport.read_datagram_calls, 1);
+        BOOST_REQUIRE_EQUAL(failed_transport.sync_path_calls, 0);
+        BOOST_REQUIRE_EQUAL(failed_transport.write_pending_calls, 0);
+        BOOST_REQUIRE_EQUAL(failed_transport.rearm_calls, 0);
+        BOOST_REQUIRE(failed_transport.last_error.has_value());
+        BOOST_REQUIRE(*failed_transport.last_error == quic_error::protocol);
+    });
+}
+
+SEASTAR_TEST_CASE(test_quic_connection_close_not_sent_when_transport_cannot_close) {
+    return seastar::async([] {
+        fake_connection_transport transport;
+        transport.can_close = false;
+
+        quic_internal::send_connection_close(transport).get();
+
+        BOOST_REQUIRE_EQUAL(transport.write_connection_close_calls, 0);
+        BOOST_REQUIRE_EQUAL(transport.send_datagram_calls, 0);
+        BOOST_REQUIRE(!transport.last_error.has_value());
     });
 }
 
