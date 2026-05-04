@@ -47,6 +47,7 @@ private:
     seastar::quic::experimental::stream _control_stream;
     input_stream<char> _control_input;
     output_stream<char> _control_output;
+    semaphore _send_sem = semaphore(1);
     gate _response_gate;
 };
 

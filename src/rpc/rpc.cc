@@ -170,6 +170,16 @@ static future<> ignore_quic_closed_exception(std::exception_ptr ep) {
     return make_exception_future<>(ep);
 }
 
+static future<> drain_quic_stream_fin(input_stream<char>& in) {
+    return repeat([&in] {
+        return in.read().then([] (temporary_buffer<char> data) {
+            return data.empty() ? stop_iteration::yes : stop_iteration::no;
+        });
+    }).handle_exception([] (std::exception_ptr ep) {
+        return ignore_quic_closed_exception(ep);
+    });
+}
+
 class quic_reply_stream_state {
     output_stream<char> _out;
     bool _closed = false;
@@ -1494,8 +1504,12 @@ future<> server::connection::process() {
         }
     } catch (...) {
         ep = std::current_exception();
-        log_exception(*this, log_level::error,
-            format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
+        if (is_quic_closed_exception(ep)) {
+            ep = nullptr;
+        } else {
+            log_exception(*this, log_level::error,
+                format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
+        }
     }
     shutdown_transport_input();
     if (is_stream() && (ep || _error)) {
@@ -1617,6 +1631,7 @@ future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, 
     }
     data = rpc_client.compress(std::move(data));
 
+    auto units = co_await get_units(_send_sem, 1);
     auto stream = co_await _conn.open_stream();
     auto input = stream.input();
     auto output = stream.output();
@@ -1626,9 +1641,14 @@ future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, 
     rpc_client._stats.sent_messages++;
     co_await output.close();
 
+    if (rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
+        co_await drain_quic_stream_fin(input);
+        co_return;
+    }
+
     try {
-        (void)with_gate(_response_gate, [&rpc_client, msg_id, input = std::move(input)] () mutable {
-            return do_with(std::move(input), [&rpc_client, msg_id] (input_stream<char>& in) {
+        (void)with_gate(_response_gate, [&rpc_client, msg_id, input = std::move(input), units = std::move(units)] () mutable {
+            return do_with(std::move(units), std::move(input), [&rpc_client, msg_id] (semaphore_units<>&, input_stream<char>& in) {
                 return rpc_client.receive_response_frame(in).then([&rpc_client, msg_id] (internal::incoming_response response) {
                     if (!response.data) {
                         auto it = rpc_client._outstanding.find(msg_id);
@@ -1641,9 +1661,7 @@ future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, 
                     }
                     rpc_client.handle_response(std::move(response));
                 }).finally([&in] {
-                    return in.close().handle_exception([] (std::exception_ptr ep) {
-                        return ignore_quic_closed_exception(ep);
-                    });
+                    return drain_quic_stream_fin(in);
                 });
             }).handle_exception([&rpc_client, msg_id] (std::exception_ptr ep) {
                 auto it = rpc_client._outstanding.find(msg_id);
@@ -1709,6 +1727,7 @@ future<internal::incoming_request> quic_server_transport::receive_request(connec
         auto input = stream.input();
         auto output = make_lw_shared<quic_reply_stream_state>(stream.output());
         auto request = co_await owner.receive_request_frame(input);
+        co_await drain_quic_stream_fin(input);
         if (!request.data) {
             co_await output->close();
             continue;
