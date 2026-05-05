@@ -1056,6 +1056,7 @@ private:
         conn->server = shared_from_this();
         conn->command_runtime = internal::make_command_runtime(_cfg.session_options);
         conn->connection_state = internal::make_connection_state(conn->command_runtime, _cfg.session_options);
+        conn->rx_queue.set_max_size(recommended_rx_queue_capacity(_cfg.session_options));
         conn->command_runtime->set_command_notifier([raw = conn.get()] {
             raw->wake_actor();
         });

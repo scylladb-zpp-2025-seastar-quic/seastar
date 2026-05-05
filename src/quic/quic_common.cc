@@ -21,6 +21,7 @@
 
 #include "quic_common.hh"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -34,6 +35,10 @@
 namespace seastar::quic::experimental {
 
 namespace {
+
+constexpr size_t default_quic_rx_queue_capacity = 1024;
+constexpr size_t default_quic_datagram_payload_size = 1200;
+constexpr size_t max_quic_rx_queue_capacity = 65536;
 
 class gnutls_global_guard {
 public:
@@ -204,6 +209,17 @@ std::optional<congestion_control_algorithm> effective_congestion_control(const t
         return congestion_control_algorithm::cubic;
     }
     return algo;
+}
+
+size_t recommended_rx_queue_capacity(const connection_options& options) noexcept {
+    const auto pending_receive_bytes = options.max_pending_receive_bytes;
+    if (!pending_receive_bytes) {
+        return default_quic_rx_queue_capacity;
+    }
+
+    const auto packet_count =
+      (pending_receive_bytes + default_quic_datagram_payload_size - 1) / default_quic_datagram_payload_size;
+    return std::clamp(packet_count, default_quic_rx_queue_capacity, max_quic_rx_queue_capacity);
 }
 
 future<> send_datagram(logger& log, net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet) {

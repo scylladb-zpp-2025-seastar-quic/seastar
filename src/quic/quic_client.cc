@@ -1172,6 +1172,7 @@ public:
         st->cfg = std::move(config);
         st->command_runtime = internal::make_command_runtime(st->cfg.session_options);
         st->connection_state = internal::make_connection_state(st->command_runtime, st->cfg.session_options);
+        st->rx_queue.set_max_size(recommended_rx_queue_capacity(st->cfg.session_options));
         st->command_runtime->set_command_notifier([raw = st.get()] {
             raw->wake_actor();
         });

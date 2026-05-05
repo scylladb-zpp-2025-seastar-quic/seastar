@@ -20,6 +20,7 @@
  */
 
 #include "quic_impl.hh"
+#include "quic_common.hh"
 
 #include <chrono>
 #include <cstring>
@@ -127,6 +128,7 @@ public:
     stream_state(
       command_runtime_ptr command_runtime,
       shared_ptr<receive_budget> receive_budget,
+      size_t read_queue_capacity,
       stream_id sid,
       stream_type type,
       bool peer_initiated)
@@ -136,6 +138,7 @@ public:
         , _type(type)
         , _can_read(type == stream_type::bidirectional || peer_initiated)
         , _can_write(type == stream_type::bidirectional || !peer_initiated) {
+        _read_queue.set_max_size(read_queue_capacity);
         if (!_can_read) {
             notify_input_shutdown();
         }
@@ -282,7 +285,8 @@ public:
         : command_runtime(std::move(command_runtime_arg))
         , options(std::move(options_arg))
         , accepted_streams(1024)
-        , receive_window(make_shared<receive_budget>(options.max_pending_receive_bytes)) {
+        , receive_window(make_shared<receive_budget>(options.max_pending_receive_bytes))
+        , read_queue_capacity(recommended_rx_queue_capacity(options)) {
         _timer.set_callback([this] {
             if (transport_closed || tick_pending) {
                 return;
@@ -303,6 +307,7 @@ public:
     queue<shared_ptr<stream_state>> accepted_streams;
     std::unordered_map<stream_id, shared_ptr<stream_state>> streams;
     shared_ptr<receive_budget> receive_window;
+    size_t read_queue_capacity = 1024;
     bool transport_closed = false;
 
     std::deque<transport_command> blocked_bidi_open_streams;
@@ -535,7 +540,13 @@ future<stream> connection_state::open_stream(stream_open_options options) {
     auto sid = co_await _impl->command_runtime->open_stream(options.type);
     auto [it, inserted] = _impl->streams.emplace(sid, shared_ptr<stream_state>{});
     if (inserted || !it->second) {
-        it->second = make_shared<stream_state>(_impl->command_runtime, _impl->receive_window, sid, options.type, false);
+        it->second = make_shared<stream_state>(
+          _impl->command_runtime,
+          _impl->receive_window,
+          _impl->read_queue_capacity,
+          sid,
+          options.type,
+          false);
     }
     auto st = it->second;
     co_return stream(std::make_unique<stream::impl>(std::move(st)));
@@ -556,7 +567,13 @@ future<> connection_state::close() {
 void connection_state::on_stream_data(stream_id sid, stream_type type, bool peer_initiated, temporary_buffer<char> payload, bool fin) {
     auto [it, inserted] = _impl->streams.emplace(sid, shared_ptr<stream_state>{});
     if (inserted || !it->second) {
-        it->second = make_shared<stream_state>(_impl->command_runtime, _impl->receive_window, sid, type, peer_initiated);
+        it->second = make_shared<stream_state>(
+          _impl->command_runtime,
+          _impl->receive_window,
+          _impl->read_queue_capacity,
+          sid,
+          type,
+          peer_initiated);
     }
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {
@@ -574,7 +591,13 @@ void connection_state::on_stream_reset(
   application_error_code app_error_code) {
     auto [it, inserted] = _impl->streams.emplace(sid, shared_ptr<stream_state>{});
     if (inserted || !it->second) {
-        it->second = make_shared<stream_state>(_impl->command_runtime, _impl->receive_window, sid, type, peer_initiated);
+        it->second = make_shared<stream_state>(
+          _impl->command_runtime,
+          _impl->receive_window,
+          _impl->read_queue_capacity,
+          sid,
+          type,
+          peer_initiated);
     }
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {
@@ -593,7 +616,13 @@ void connection_state::on_stream_stop_sending(
   stream_shutdown_side shutdown_side) {
     auto [it, inserted] = _impl->streams.emplace(sid, shared_ptr<stream_state>{});
     if (inserted || !it->second) {
-        it->second = make_shared<stream_state>(_impl->command_runtime, _impl->receive_window, sid, type, peer_initiated);
+        it->second = make_shared<stream_state>(
+          _impl->command_runtime,
+          _impl->receive_window,
+          _impl->read_queue_capacity,
+          sid,
+          type,
+          peer_initiated);
     }
     auto st = it->second;
     if (peer_initiated && st->mark_accepted_for_delivery()) {

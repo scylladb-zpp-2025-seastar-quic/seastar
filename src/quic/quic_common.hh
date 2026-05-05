@@ -49,6 +49,7 @@ std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr);
 ngtcp2_tstamp quic_now_ns() noexcept;
 socket_address wildcard_address_for_family(sa_family_t family);
 std::optional<congestion_control_algorithm> effective_congestion_control(const transport_config& cfg);
+size_t recommended_rx_queue_capacity(const connection_options& options) noexcept;
 future<> send_datagram(logger& log, net::datagram_channel& channel, const socket_address& dst, temporary_buffer<char> packet);
 
 temporary_buffer<char> linearize_packet(std::span<temporary_buffer<char>> bufs);
