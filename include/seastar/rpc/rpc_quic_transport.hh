@@ -39,7 +39,7 @@ public:
     void shutdown_output() override;
     future<> stop() override;
     future<internal::incoming_request> receive_request(connection& owner) override;
-    future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) override;
+    future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) override;
 
 private:
     std::optional<seastar::quic::experimental::quic_client> _client;
@@ -63,7 +63,7 @@ public:
     void shutdown_output() override;
     future<> stop() override;
     future<internal::incoming_request> receive_request(connection& owner) override;
-    future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) override;
+    future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) override;
 
 private:
     seastar::quic::experimental::connection _conn;

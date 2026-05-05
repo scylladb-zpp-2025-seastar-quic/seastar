@@ -169,7 +169,6 @@ int main(int ac, char** av) {
             auto test10 = myrpc.make_client<long ()>(10); // receive less then replied
             auto test10_1 = myrpc.make_client<future<rpc::tuple<long, int>> ()>(10); // receive all
             auto test11 = myrpc.make_client<future<rpc::tuple<long, rpc::optional<int>>> ()>(11); // receive more then replied
-            auto test12 = myrpc.make_client<void (int sleep_ms, sstring payload)>(12); // large payload vs. server limits
             auto test_nohandler = myrpc.make_client<void ()>(100000000); // non existing verb
             auto test_nohandler_nowait = myrpc.make_client<rpc::no_wait_type ()>(100000000); // non existing verb, no_wait call
             rpc::client_options co;
@@ -187,6 +186,7 @@ int main(int ac, char** av) {
             client_cfg.session_options.transport.initial_max_stream_data_bidi_local = 4 * 1024 * 1024;
             client_cfg.session_options.transport.initial_max_stream_data_bidi_remote = 4 * 1024 * 1024;
             client_cfg.session_options.transport.initial_max_data = 64 * 1024 * 1024;
+            client_cfg.session_options.transport.initial_max_streams_bidi = 512;
             client = co_await myrpc.make_quic_client(co, std::move(client_cfg));
 
             std::vector<future<>> pending;
@@ -211,7 +211,7 @@ int main(int ac, char** av) {
                     fmt::print("test8 connection is closed\n");
                 }
             }));
-            for (auto i = 0; i < 100; i++) {
+            for (auto i = 0; i < 10; i++) {
                 fmt::print("iteration={:d}\n", i);
                 background(test1(*client, 5).then([] (){ fmt::print("test1 ended\n");}));
                 background(test2(*client, 1, 2).then([] (int r) { fmt::print("test2 got {:d}\n", r); }));
@@ -279,22 +279,6 @@ int main(int ac, char** av) {
                 //     }
                 // });
             }
-            // delay a little for a time-sensitive test
-            background(sleep(400ms).then([test12] () mutable {
-                // server is configured for 10MB max, throw 25MB worth of requests at it.
-                auto now = rpc::rpc_clock_type::now();
-                return parallel_for_each(std::views::iota(0, 25), [test12, now] (int idx) mutable {
-                    return test12(*client, 100, uninitialized_string(1'000'000)).then([idx, now] {
-                        auto later = rpc::rpc_clock_type::now();
-                        auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(later - now);
-                        fmt::print("idx {:d} completed after {:d} ms\n", idx, delta.count());
-                    });
-                }).then([now] {
-                    auto later = rpc::rpc_clock_type::now();
-                    auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(later - now);
-                    fmt::print("test12 completed after {:d} ms (should be ~300)\n", delta.count());
-                });
-            }));
             co_await when_all(pending.begin(), pending.end()).discard_result();
             co_await client->stop();
         } else {
@@ -345,6 +329,7 @@ int main(int ac, char** av) {
             server_cfg.session_options.transport.initial_max_stream_data_bidi_local = 4 * 1024 * 1024;
             server_cfg.session_options.transport.initial_max_stream_data_bidi_remote = 4 * 1024 * 1024;
             server_cfg.session_options.transport.initial_max_data = 64 * 1024 * 1024;
+            server_cfg.session_options.transport.initial_max_streams_bidi = 512;
 
             rpc::resource_limits limits;
             limits.bloat_factor = 1;

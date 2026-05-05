@@ -324,7 +324,7 @@ void connection::set_socket(connected_socket&& fd) {
             return owner.receive_request_frame(_input);
         }
 
-        future<> send_request(connection& owner, int64_t, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) override {
+        future<> send_request(connection& owner, int64_t, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool) override {
             return owner.send(std::move(data), timeout, cancel);
         }
     };
@@ -349,13 +349,13 @@ future<internal::incoming_request> connection::transport_receive_request() {
     return _transport->receive_request(*this);
 }
 
-future<> connection::transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) {
+future<> connection::transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) {
     if (_negotiated) {
-        return _negotiated->get_shared_future().then([this, msg_id, buf = std::move(buf), timeout, cancel] () mutable {
-            return _transport->send_request(*this, msg_id, std::move(buf), timeout, cancel);
+        return _negotiated->get_shared_future().then([this, msg_id, buf = std::move(buf), timeout, cancel, expect_response] () mutable {
+            return _transport->send_request(*this, msg_id, std::move(buf), timeout, cancel, expect_response);
         });
     }
-    return _transport->send_request(*this, msg_id, std::move(buf), timeout, cancel);
+    return _transport->send_request(*this, msg_id, std::move(buf), timeout, cancel, expect_response);
 }
 
 future<internal::incoming_request> connection::receive_request_frame(input_stream<char>&) {
@@ -787,9 +787,90 @@ struct request_frame_with_timeout : request_frame {
     }
 };
 
-future<> client::request(uint64_t type, int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) {
+template <typename FrameType>
+future<request_frame::return_type>
+read_quic_request_frame_uncompressed(server::connection& owner, input_stream<char>& in) {
+    auto header_size = FrameType::header_size();
+    auto header = co_await in.read_exactly(header_size);
+    if (header.size() != header_size) {
+        if (header.size() != 0) {
+            owner.get_logger()(owner.peer_address(), format(
+                    "dropping truncated QUIC request stream header: expected {:d} got {:d}",
+                    header_size, header.size()));
+        }
+        co_return FrameType::empty_value();
+    }
+
+    auto [size, h] = FrameType::decode_header(header.get());
+    if (owner.estimate_request_size(size) > owner.max_request_size()) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping invalid QUIC request stream: payload size {:d} exceeds memory limit {:d}",
+                size, owner.max_request_size()));
+        co_return FrameType::empty_value();
+    }
+
+    if (!size) {
+        co_return FrameType::make_value(h, rcv_buf());
+    }
+
+    auto rb = co_await read_rcv_buf(in, size);
+    if (rb.size != size) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping truncated QUIC request stream data: expected {:d} got {:d}",
+                size, rb.size));
+        co_return FrameType::empty_value();
+    }
+
+    co_return FrameType::make_value(h, std::move(rb));
+}
+
+template <typename FrameType>
+future<request_frame::return_type>
+read_quic_request_frame_compressed(server::connection& owner, std::unique_ptr<compressor>& compressor, input_stream<char>& in) {
+    auto compress_header = co_await in.read_exactly(sizeof(uint32_t));
+    if (compress_header.size() != sizeof(uint32_t)) {
+        if (compress_header.size() != 0) {
+            owner.get_logger()(owner.peer_address(), format(
+                    "dropping truncated compressed QUIC request stream header: expected {:d} got {:d}",
+                    sizeof(uint32_t), compress_header.size()));
+        }
+        co_return FrameType::empty_value();
+    }
+
+    auto ptr = compress_header.get();
+    auto compressed_size = read_le<uint32_t>(ptr);
+    if (owner.estimate_request_size(compressed_size) > owner.max_request_size()) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping invalid compressed QUIC request stream: compressed payload size {:d} exceeds memory limit {:d}",
+                compressed_size, owner.max_request_size()));
+        co_return FrameType::empty_value();
+    }
+
+    auto compressed_data = co_await read_rcv_buf(in, compressed_size);
+    if (compressed_data.size != compressed_size) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping truncated compressed QUIC request stream data: expected {:d} got {:d}",
+                compressed_size, compressed_data.size));
+        co_return FrameType::empty_value();
+    }
+
+    auto decompressed = compressor->decompress(std::move(compressed_data));
+    if (decompressed.size == 0) {
+        co_return FrameType::empty_value();
+    }
+
+    auto source = std::visit([] (auto&& b) {
+        return util::as_input_stream(std::move(b));
+    }, decompressed.bufs);
+    auto frame = co_await do_with(std::move(source), [&owner] (input_stream<char>& decompressed_in) {
+        return read_quic_request_frame_uncompressed<FrameType>(owner, decompressed_in);
+    });
+    co_return frame;
+}
+
+future<> client::request(uint64_t type, int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) {
     request_frame_with_timeout::encode_header(type, msg_id, buf);
-    return transport_send_request(msg_id, std::move(buf), timeout, cancel);
+    return transport_send_request(msg_id, std::move(buf), timeout, cancel, expect_response);
 }
 
 void
@@ -1415,6 +1496,33 @@ server::connection::receive_request_frame(input_stream<char>& in) {
 }
 
 future<internal::incoming_request>
+server::connection::receive_quic_request_frame(input_stream<char>& in) {
+    request_frame::return_type frame;
+    if (_timeout_negotiated) {
+        if (_compressor) {
+            frame = co_await read_quic_request_frame_compressed<request_frame_with_timeout>(*this, _compressor, in);
+        } else {
+            frame = co_await read_quic_request_frame_uncompressed<request_frame_with_timeout>(*this, in);
+        }
+    } else {
+        if (_compressor) {
+            frame = co_await read_quic_request_frame_compressed<request_frame>(*this, _compressor, in);
+        } else {
+            frame = co_await read_quic_request_frame_uncompressed<request_frame>(*this, in);
+        }
+    }
+
+    auto [expire, type, msg_id, data] = std::move(frame);
+    co_return internal::incoming_request{
+        .expire = expire,
+        .type = type,
+        .msg_id = msg_id,
+        .data = std::move(data),
+        .reply = make_reply_handle(),
+    };
+}
+
+future<internal::incoming_request>
 server::connection::receive_request() {
     return transport_receive_request();
 }
@@ -1610,7 +1718,7 @@ future<internal::incoming_request> quic_client_transport::receive_request(connec
     return make_exception_future<internal::incoming_request>(std::runtime_error("client QUIC transport does not receive server requests"));
 }
 
-future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable*) {
+future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable*, bool expect_response) {
     if (timeout && *timeout <= rpc_clock_type::now()) {
         co_return;
     }
@@ -1632,6 +1740,13 @@ future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, 
     data = rpc_client.compress(std::move(data));
 
     auto units = co_await get_units(_send_sem, 1);
+    if (timeout && *timeout <= rpc_clock_type::now()) {
+        co_return;
+    }
+    if (expect_response && rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
+        co_return;
+    }
+
     auto stream = co_await _conn.open_stream();
     auto input = stream.input();
     auto output = stream.output();
@@ -1641,7 +1756,7 @@ future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, 
     rpc_client._stats.sent_messages++;
     co_await output.close();
 
-    if (rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
+    if (!expect_response || rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
         co_await drain_quic_stream_fin(input);
         co_return;
     }
@@ -1726,17 +1841,18 @@ future<internal::incoming_request> quic_server_transport::receive_request(connec
         auto stream = co_await _conn.accept_stream();
         auto input = stream.input();
         auto output = make_lw_shared<quic_reply_stream_state>(stream.output());
-        auto request = co_await owner.receive_request_frame(input);
-        co_await drain_quic_stream_fin(input);
+        auto request = co_await dynamic_cast<server::connection&>(owner).receive_quic_request_frame(input);
         if (!request.data) {
             co_await output->close();
             continue;
         }
-        request.reply = internal::reply_handle([output] (snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout) mutable {
+        co_await drain_quic_stream_fin(input);
+        auto rpc_owner = dynamic_cast<server::connection&>(owner).shared_from_this();
+        request.reply = internal::reply_handle([output, rpc_owner] (snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout) mutable {
             if (timeout && *timeout <= rpc_clock_type::now()) {
                 return output->close();
             }
-            return output->write_and_close(std::move(data));
+            return output->write_and_close(rpc_owner->compress(std::move(data)));
         }, [output] () mutable {
             return output->close();
         });
@@ -1744,7 +1860,7 @@ future<internal::incoming_request> quic_server_transport::receive_request(connec
     }
 }
 
-future<> quic_server_transport::send_request(connection&, int64_t, snd_buf, std::optional<rpc_clock_type::time_point>, cancellable*) {
+future<> quic_server_transport::send_request(connection&, int64_t, snd_buf, std::optional<rpc_clock_type::time_point>, cancellable*, bool) {
     return make_exception_future<>(std::runtime_error("server QUIC transport does not send client requests"));
 }
 

@@ -574,7 +574,8 @@ auto send_helper(MsgType xt, signature<Ret (InArgs...)> xsig) {
 
             // prepare reply handler, if return type is now_wait_type this does nothing, since no reply will be sent
             using wait = wait_signature_t<Ret>;
-            return when_all(dst.request(uint64_t(t), msg_id, std::move(data), timeout, cancel), wait_for_reply<Serializer>(wait(), timeout, start, cancel, dst, msg_id, sig)).then([] (auto r) {
+            constexpr bool expect_response = !std::is_same_v<wait, no_wait_type>;
+            return when_all(dst.request(uint64_t(t), msg_id, std::move(data), timeout, cancel, expect_response), wait_for_reply<Serializer>(wait(), timeout, start, cancel, dst, msg_id, sig)).then([] (auto r) {
                     std::get<0>(r).ignore_ready_future();
                     return std::move(std::get<1>(r)); // return future of wait_for_reply
             });

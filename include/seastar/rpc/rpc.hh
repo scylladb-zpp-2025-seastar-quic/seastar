@@ -299,7 +299,7 @@ public:
             return make_ready_future<>();
         }
         virtual future<internal::incoming_request> receive_request(connection& owner) = 0;
-        virtual future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) = 0;
+        virtual future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) = 0;
     };
 
 protected:
@@ -405,7 +405,7 @@ protected:
     void set_transport(std::unique_ptr<transport> t);
     internal::reply_handle make_reply_handle();
     future<internal::incoming_request> transport_receive_request();
-    future<> transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr);
+    future<> transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr, bool expect_response = true);
     virtual future<internal::incoming_request> receive_request_frame(input_stream<char>& in);
 
     friend class experimental::quic_server_transport;
@@ -749,7 +749,7 @@ public:
         return make_stream_sink<Serializer, Out...>(make_socket());
     }
 
-    future<> request(uint64_t type, int64_t id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr);
+    future<> request(uint64_t type, int64_t id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr, bool expect_response = true);
 };
 
 class protocol_base;
@@ -768,6 +768,7 @@ public:
         future<std::tuple<std::optional<uint64_t>, uint64_t, int64_t, std::optional<rcv_buf>>>
         read_request_frame_compressed(input_stream<char>& in);
         future<internal::incoming_request> receive_request_frame(input_stream<char>& in) override;
+        future<internal::incoming_request> receive_quic_request_frame(input_stream<char>& in);
         future<internal::incoming_request> receive_request();
         future<feature_map> negotiate(feature_map requested);
         future<> send_unknown_verb_reply(internal::reply_handle reply, std::optional<rpc_clock_type::time_point> timeout, int64_t msg_id, uint64_t type);
@@ -801,6 +802,7 @@ public:
         size_t max_request_size() const {
             return get_server()._limits.max_memory;
         }
+        friend class experimental::quic_server_transport;
         server& get_server() {
             return _info.server;
         }
