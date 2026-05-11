@@ -418,6 +418,12 @@ seastar_add_test (rpc
     loopback_socket.hh
     rpc_test.cc)
 
+seastar_add_test (rpc_maximus
+  SOURCES
+    loopback_socket.hh
+    rpc_test_body.inc.hh
+    rpc_maximus_test.cc)
+
 seastar_add_test (semaphore
   SOURCES
     semaphore_test.cc
