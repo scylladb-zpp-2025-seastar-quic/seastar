@@ -34,6 +34,8 @@ set (NGTCP2_DISABLE_TESTS
   BOOL 
   "Disable tests")
 
+enable_language (C)
+
 add_subdirectory (ngtcp2)
 
 set (NGTCP2_SRC "${CMAKE_CURRENT_SOURCE_DIR}/ngtcp2")
