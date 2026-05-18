@@ -44,6 +44,7 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/log.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 namespace bi = boost::intrusive;
 
@@ -236,22 +237,65 @@ class sink_impl;
 
 template<typename Serializer, typename... In>
 class source_impl;
+
+struct reply_handle {
+    using sender = noncopyable_function<future<> (snd_buf&&, std::optional<rpc_clock_type::time_point>)>;
+    using closer = noncopyable_function<future<> ()>;
+
+    sender send;
+    closer close;
+
+    reply_handle() = default;
+    explicit reply_handle(sender s, closer c = {}) noexcept
+        : send(std::move(s))
+        , close(std::move(c)) {
+    }
+
+    explicit operator bool() const noexcept {
+        return static_cast<bool>(send) || static_cast<bool>(close);
+    }
+};
+
+struct incoming_response {
+    int64_t msg_id = 0;
+    std::optional<uint32_t> handler_duration;
+    std::optional<rcv_buf> data;
+};
+
+struct incoming_request {
+    std::optional<uint64_t> expire;
+    uint64_t type = 0;
+    int64_t msg_id = 0;
+    std::optional<rcv_buf> data;
+    reply_handle reply;
+};
 }
 
 class connection {
-protected:
-    struct socket_and_buffers {
-        connected_socket fd;
-        input_stream<char> read_buf;
-        output_stream<char> write_buf;
-        socket_and_buffers(connected_socket cs) noexcept
-                : fd(std::move(cs))
-                , read_buf(fd.input())
-                , write_buf(fd.output())
-        {}
+public:
+    class transport {
+    public:
+        virtual ~transport() = default;
+
+        virtual input_stream<char>& input() = 0;
+        virtual output_stream<char>& output() = 0;
+        virtual void shutdown_input() = 0;
+        virtual void shutdown_output() = 0;
+        virtual future<> stop() {
+            shutdown_input();
+            shutdown_output();
+            return make_ready_future<>();
+        }
+        virtual bool supports_concurrent_request_processing() const {
+            return false;
+        }
+        virtual future<internal::incoming_request> receive_request(connection& owner) = 0;
+        virtual future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) = 0;
     };
+
+protected:
     bool _error = false;
-    std::optional<socket_and_buffers> _connected;
+    std::unique_ptr<transport> _transport;
     std::optional<shared_promise<>> _negotiated = shared_promise<>();
     promise<> _stopped;
     stats _stats;
@@ -308,6 +352,30 @@ protected:
 
     void set_negotiated() noexcept;
 
+    bool connected() const noexcept {
+        return static_cast<bool>(_transport);
+    }
+
+    input_stream<char>& transport_input() {
+        return _transport->input();
+    }
+
+    output_stream<char>& transport_output() {
+        return _transport->output();
+    }
+
+    void shutdown_transport_input() {
+        if (_transport) {
+            _transport->shutdown_input();
+        }
+    }
+
+    void shutdown_transport_output() {
+        if (_transport) {
+            _transport->shutdown_output();
+        }
+    }
+
     bool is_stream() const noexcept {
         return _is_stream;
     }
@@ -325,6 +393,11 @@ protected:
     future<> stream_process_incoming(rcv_buf&&);
     future<> handle_stream_frame();
     future<> send_negotiation_frame(feature_map features);
+    void set_transport(std::unique_ptr<transport> t);
+    internal::reply_handle make_reply_handle();
+    future<internal::incoming_request> transport_receive_request();
+    future<> transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr, bool expect_response = true);
+    virtual future<internal::incoming_request> receive_request_frame(input_stream<char>& in);
 
 public:
     connection(connected_socket&& fd, const logger& l, void* s, connection_id id = invalid_connection_id) : connection(l, s, id) {
@@ -507,6 +580,7 @@ class client : public rpc::connection, public weakly_referencable<client> {
         virtual void operator()(client&, id_type, rcv_buf data) = 0;
         virtual void timeout() {}
         virtual void cancel() {}
+        virtual void closed() {}
         virtual ~reply_handler_base() {
             if (pcancel) {
                 pcancel->cancel_wait = std::function<void()>();
@@ -535,6 +609,9 @@ class client : public rpc::connection, public weakly_referencable<client> {
 
     void enqueue_zero_frame();
     future<> loop(client_options ops, const socket_address& addr, const socket_address& local);
+    feature_map make_client_features() const;
+    future<> process_client_connection(bool read_responses_from_transport);
+    future<> loop_with_transport(bool read_responses_from_transport);
 public:
     template<typename Reply, typename Func>
     struct reply_handler final : reply_handler_base {
@@ -551,6 +628,10 @@ public:
         virtual void cancel() override {
             reply.done = true;
             reply.p.set_exception(canceled_error());
+        }
+        virtual void closed() override {
+            reply.done = true;
+            reply.p.set_exception(closed_error());
         }
         virtual ~reply_handler() {}
     };
@@ -571,6 +652,10 @@ private:
     // - message payload
     future<std::tuple<int64_t, std::optional<uint32_t>, std::optional<rcv_buf>>>
     read_response_frame_compressed(input_stream<char>& in);
+    future<internal::incoming_response> receive_response_frame(input_stream<char>& in);
+    future<internal::incoming_response> receive_response();
+    void handle_response(internal::incoming_response response);
+
 public:
     /**
      * Create client object which will attempt to connect to the remote address.
@@ -595,6 +680,7 @@ public:
      */
     client(const logger& l, void* s, socket socket, const socket_address& addr, const socket_address& local = {});
     client(const logger& l, void* s, client_options options, socket socket, const socket_address& addr, const socket_address& local = {});
+    client(const logger& l, void* s, client_options options, std::unique_ptr<transport> transport, const socket_address& addr, const socket_address& local = {}, bool read_responses_from_transport = false);
 
     stats get_stats() const;
     size_t incoming_queue_length() const noexcept {
@@ -651,7 +737,7 @@ public:
         return make_stream_sink<Serializer, Out...>(make_socket());
     }
 
-    future<> request(uint64_t type, int64_t id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr);
+    future<> request(uint64_t type, int64_t id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr, bool expect_response = true);
 };
 
 class protocol_base;
@@ -669,11 +755,17 @@ public:
         future<> negotiate_protocol();
         future<std::tuple<std::optional<uint64_t>, uint64_t, int64_t, std::optional<rcv_buf>>>
         read_request_frame_compressed(input_stream<char>& in);
+        future<internal::incoming_request> receive_request_frame(input_stream<char>& in) override;
+        future<internal::incoming_request> receive_request();
+        future<> process_request(internal::incoming_request request);
         future<feature_map> negotiate(feature_map requested);
-        future<> send_unknown_verb_reply(std::optional<rpc_clock_type::time_point> timeout, int64_t msg_id, uint64_t type);
+        future<> send_unknown_verb_reply(internal::reply_handle reply, std::optional<rpc_clock_type::time_point> timeout, int64_t msg_id, uint64_t type);
+        gate _request_gate;
     public:
         connection(server& s, connected_socket&& fd, socket_address&& addr, const logger& l, void* seralizer, connection_id id);
+        connection(server& s, std::unique_ptr<transport> transport, socket_address&& addr, const logger& l, void* serializer, connection_id id);
         future<> process();
+        future<> respond(internal::reply_handle reply, int64_t msg_id, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout, std::optional<rpc_clock_type::duration> handler_duration);
         future<> respond(int64_t msg_id, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout, std::optional<rpc_clock_type::duration> handler_duration);
         client_info& info() { return _info; }
         const client_info& info() const { return _info; }
@@ -767,7 +859,7 @@ public:
 };
 
 using rpc_handler_func = std::function<future<> (shared_ptr<server::connection>, std::optional<rpc_clock_type::time_point> timeout, int64_t msgid,
-                                                 rcv_buf data, gate::holder guard)>;
+                                                 rcv_buf data, internal::reply_handle reply, gate::holder guard)>;
 
 struct rpc_handler {
     scheduling_group sg;
@@ -779,6 +871,7 @@ class protocol_base {
 public:
     virtual ~protocol_base() {};
     virtual shared_ptr<server::connection> make_server_connection(rpc::server& server, connected_socket fd, socket_address addr, connection_id id) = 0;
+    virtual shared_ptr<server::connection> make_server_connection(rpc::server& server, std::unique_ptr<connection::transport> transport, socket_address addr, connection_id id) = 0;
 protected:
     friend class server;
 
@@ -922,6 +1015,8 @@ public:
             rpc::client(p.get_logger(), &p._serializer, std::move(socket), addr, local) {}
         client(protocol& p, client_options options, socket socket, const socket_address& addr, const socket_address& local = {}) :
             rpc::client(p.get_logger(), &p._serializer, options, std::move(socket), addr, local) {}
+        client(protocol& p, client_options options, std::unique_ptr<rpc::connection::transport> transport, const socket_address& addr, const socket_address& local = {}, bool read_responses_from_transport = false) :
+            rpc::client(p.get_logger(), &p._serializer, options, std::move(transport), addr, local, read_responses_from_transport) {}
     };
 
     friend server;
@@ -1004,6 +1099,10 @@ public:
 
     shared_ptr<rpc::server::connection> make_server_connection(rpc::server& server, connected_socket fd, socket_address addr, connection_id id) override {
         return make_shared<rpc::server::connection>(server, std::move(fd), std::move(addr), _logger, &_serializer, id);
+    }
+
+    shared_ptr<rpc::server::connection> make_server_connection(rpc::server& server, std::unique_ptr<connection::transport> transport, socket_address addr, connection_id id) override {
+        return seastar::make_shared<rpc::server::connection>(server, std::move(transport), std::move(addr), _logger, &_serializer, id);
     }
 
     bool has_handler(MsgType msg_id);
