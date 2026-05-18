@@ -48,6 +48,13 @@
 
 namespace bi = boost::intrusive;
 
+namespace seastar::quic::experimental {
+class connection;
+class quic_server;
+struct quic_client_config;
+class stream;
+}
+
 namespace seastar {
 
 namespace rpc {
@@ -271,6 +278,11 @@ struct incoming_request {
 };
 }
 
+namespace experimental {
+class quic_client_transport;
+class quic_server_transport;
+}
+
 class connection {
 public:
     class transport {
@@ -398,6 +410,8 @@ protected:
     future<internal::incoming_request> transport_receive_request();
     future<> transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr, bool expect_response = true);
     virtual future<internal::incoming_request> receive_request_frame(input_stream<char>& in);
+
+    friend class experimental::quic_server_transport;
 
 public:
     connection(connected_socket&& fd, const logger& l, void* s, connection_id id = invalid_connection_id) : connection(l, s, id) {
@@ -656,6 +670,7 @@ private:
     future<internal::incoming_response> receive_response();
     void handle_response(internal::incoming_response response);
 
+    friend class experimental::quic_client_transport;
 public:
     /**
      * Create client object which will attempt to connect to the remote address.
@@ -756,6 +771,7 @@ public:
         future<std::tuple<std::optional<uint64_t>, uint64_t, int64_t, std::optional<rcv_buf>>>
         read_request_frame_compressed(input_stream<char>& in);
         future<internal::incoming_request> receive_request_frame(input_stream<char>& in) override;
+        future<internal::incoming_request> receive_quic_request_frame(input_stream<char>& in);
         future<internal::incoming_request> receive_request();
         future<> process_request(internal::incoming_request request);
         future<feature_map> negotiate(feature_map requested);
@@ -791,6 +807,7 @@ public:
         size_t max_request_size() const {
             return get_server()._limits.max_memory;
         }
+        friend class experimental::quic_server_transport;
         server& get_server() {
             return _info.server;
         }
@@ -818,6 +835,9 @@ public:
     server(protocol_base* proto, server_socket, resource_limits memory_limit = resource_limits(), server_options opts = server_options{});
     server(protocol_base* proto, server_options opts, server_socket, resource_limits memory_limit = resource_limits());
     void accept();
+    void accept(::seastar::quic::experimental::quic_server& qs);
+    shared_ptr<connection> make_quic_connection(::seastar::quic::experimental::connection session, ::seastar::quic::experimental::stream control_stream, connection_id id);
+    future<> handle_quic_session(::seastar::quic::experimental::connection session);
     /**
      * Stops the server.
      *
@@ -856,6 +876,7 @@ public:
     }
     friend connection;
     friend client;
+    friend class experimental::quic_server_transport;
 };
 
 using rpc_handler_func = std::function<future<> (shared_ptr<server::connection>, std::optional<rpc_clock_type::time_point> timeout, int64_t msgid,
@@ -1039,6 +1060,9 @@ public:
     ///     signature: `future<Ret>(protocol::client&, Args...)`.
     template<typename Func>
     auto make_client(MsgType t);
+
+    future<std::unique_ptr<client>> make_quic_client(::seastar::quic::experimental::quic_client_config config);
+    future<std::unique_ptr<client>> make_quic_client(client_options options, ::seastar::quic::experimental::quic_client_config config);
 
     /// Register a handler to be called when this verb is invoked.
     ///

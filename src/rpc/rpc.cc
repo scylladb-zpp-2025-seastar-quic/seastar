@@ -1,5 +1,7 @@
 #include <seastar/rpc/rpc.hh>
+#include <seastar/rpc/rpc_quic_transport.hh>
 #include <seastar/rpc/multi_algo_compressor_factory.hh>
+#include <seastar/quic/quic_server.hh>
 #include <seastar/core/align.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/print.hh>
@@ -150,6 +152,70 @@ static future<> write_snd_buf(output_stream<char>& out, snd_buf buf) {
         });
     }
 }
+
+static bool is_quic_closed_exception(std::exception_ptr ep) noexcept {
+    try {
+        std::rethrow_exception(ep);
+    } catch (const quic::experimental::quic_error& ex) {
+        return ex.code() == quic::experimental::quic_error::closed;
+    } catch (...) {
+        return false;
+    }
+}
+
+static future<> ignore_quic_closed_exception(std::exception_ptr ep) {
+    if (is_quic_closed_exception(ep)) {
+        return make_ready_future<>();
+    }
+    return make_exception_future<>(ep);
+}
+
+static future<> drain_quic_stream_fin(input_stream<char>& in) {
+    return repeat([&in] {
+        return in.read().then([] (temporary_buffer<char> data) {
+            return data.empty() ? stop_iteration::yes : stop_iteration::no;
+        });
+    }).handle_exception([] (std::exception_ptr ep) {
+        return ignore_quic_closed_exception(ep);
+    });
+}
+
+static future<> drain_quic_stream_fin_background(input_stream<char> in) {
+    return do_with(std::move(in), [] (input_stream<char>& input) {
+        return drain_quic_stream_fin(input);
+    });
+}
+
+class quic_reply_stream_state {
+    output_stream<char> _out;
+    bool _closed = false;
+
+public:
+    explicit quic_reply_stream_state(output_stream<char> out)
+            : _out(std::move(out)) {
+    }
+
+    future<> close() {
+        if (_closed) {
+            return make_ready_future<>();
+        }
+        _closed = true;
+        return _out.close().handle_exception([] (std::exception_ptr ep) {
+            return ignore_quic_closed_exception(ep);
+        });
+    }
+
+    future<> write_and_close(snd_buf data) {
+        if (_closed) {
+            return make_ready_future<>();
+        }
+        return write_snd_buf(_out, std::move(data)).handle_exception([] (std::exception_ptr ep) {
+            return ignore_quic_closed_exception(ep);
+        }).finally([this] {
+            return close();
+        });
+    }
+};
 
 snd_buf connection::compress(snd_buf buf) {
     if (_compressor) {
@@ -725,6 +791,87 @@ struct request_frame_with_timeout : request_frame {
     }
 };
 
+template <typename FrameType>
+future<request_frame::return_type>
+read_quic_request_frame_uncompressed(server::connection& owner, input_stream<char>& in) {
+    auto header_size = FrameType::header_size();
+    auto header = co_await in.read_exactly(header_size);
+    if (header.size() != header_size) {
+        if (header.size() != 0) {
+            owner.get_logger()(owner.peer_address(), format(
+                    "dropping truncated QUIC request stream header: expected {:d} got {:d}",
+                    header_size, header.size()));
+        }
+        co_return FrameType::empty_value();
+    }
+
+    auto [size, h] = FrameType::decode_header(header.get());
+    if (owner.estimate_request_size(size) > owner.max_request_size()) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping invalid QUIC request stream: payload size {:d} exceeds memory limit {:d}",
+                size, owner.max_request_size()));
+        co_return FrameType::empty_value();
+    }
+
+    if (!size) {
+        co_return FrameType::make_value(h, rcv_buf());
+    }
+
+    auto rb = co_await read_rcv_buf(in, size);
+    if (rb.size != size) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping truncated QUIC request stream data: expected {:d} got {:d}",
+                size, rb.size));
+        co_return FrameType::empty_value();
+    }
+
+    co_return FrameType::make_value(h, std::move(rb));
+}
+
+template <typename FrameType>
+future<request_frame::return_type>
+read_quic_request_frame_compressed(server::connection& owner, std::unique_ptr<compressor>& compressor, input_stream<char>& in) {
+    auto compress_header = co_await in.read_exactly(sizeof(uint32_t));
+    if (compress_header.size() != sizeof(uint32_t)) {
+        if (compress_header.size() != 0) {
+            owner.get_logger()(owner.peer_address(), format(
+                    "dropping truncated compressed QUIC request stream header: expected {:d} got {:d}",
+                    sizeof(uint32_t), compress_header.size()));
+        }
+        co_return FrameType::empty_value();
+    }
+
+    auto ptr = compress_header.get();
+    auto compressed_size = read_le<uint32_t>(ptr);
+    if (owner.estimate_request_size(compressed_size) > owner.max_request_size()) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping invalid compressed QUIC request stream: compressed payload size {:d} exceeds memory limit {:d}",
+                compressed_size, owner.max_request_size()));
+        co_return FrameType::empty_value();
+    }
+
+    auto compressed_data = co_await read_rcv_buf(in, compressed_size);
+    if (compressed_data.size != compressed_size) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping truncated compressed QUIC request stream data: expected {:d} got {:d}",
+                compressed_size, compressed_data.size));
+        co_return FrameType::empty_value();
+    }
+
+    auto decompressed = compressor->decompress(std::move(compressed_data));
+    if (decompressed.size == 0) {
+        co_return FrameType::empty_value();
+    }
+
+    auto source = std::visit([] (auto&& b) {
+        return util::as_input_stream(std::move(b));
+    }, decompressed.bufs);
+    auto frame = co_await do_with(std::move(source), [&owner] (input_stream<char>& decompressed_in) {
+        return read_quic_request_frame_uncompressed<FrameType>(owner, decompressed_in);
+    });
+    co_return frame;
+}
+
 future<> client::request(uint64_t type, int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) {
     request_frame_with_timeout::encode_header(type, msg_id, buf);
     return transport_send_request(msg_id, std::move(buf), timeout, cancel, expect_response);
@@ -1121,8 +1268,7 @@ future<> client::process_client_connection(bool read_responses_from_transport) {
             continue;
         }
 
-        // Some transports deliver responses on per-request streams instead of
-        // the negotiated control stream.
+        // QUIC version doesn't need to wait for response.
         if (!read_responses_from_transport) {
             co_await transport_input().read();
         }
@@ -1139,7 +1285,10 @@ future<> client::loop_with_transport(bool read_responses_from_transport) {
         co_await process_client_connection(read_responses_from_transport);
     } catch (...) {
         ep = std::current_exception();
-        if (connected()) {
+        auto expected_close = _error && is_quic_closed_exception(ep);
+        if (expected_close) {
+            ep = nullptr;
+        } else if (connected()) {
             if (is_stream()) {
                 log_exception(*this, log_level::error, "client stream connection dropped", ep);
             } else {
@@ -1354,6 +1503,33 @@ server::connection::receive_request_frame(input_stream<char>& in) {
 }
 
 future<internal::incoming_request>
+server::connection::receive_quic_request_frame(input_stream<char>& in) {
+    request_frame::return_type frame;
+    if (_timeout_negotiated) {
+        if (_compressor) {
+            frame = co_await read_quic_request_frame_compressed<request_frame_with_timeout>(*this, _compressor, in);
+        } else {
+            frame = co_await read_quic_request_frame_uncompressed<request_frame_with_timeout>(*this, in);
+        }
+    } else {
+        if (_compressor) {
+            frame = co_await read_quic_request_frame_compressed<request_frame>(*this, _compressor, in);
+        } else {
+            frame = co_await read_quic_request_frame_uncompressed<request_frame>(*this, in);
+        }
+    }
+
+    auto [expire, type, msg_id, data] = std::move(frame);
+    co_return internal::incoming_request{
+        .expire = expire,
+        .type = type,
+        .msg_id = msg_id,
+        .data = std::move(data),
+        .reply = make_reply_handle(),
+    };
+}
+
+future<internal::incoming_request>
 server::connection::receive_request() {
     return transport_receive_request();
 }
@@ -1448,9 +1624,11 @@ future<> server::connection::process() {
                 (void)try_with_gate(_request_gate, [this, conn = shared_from_this(), request = std::move(request)] () mutable {
                     return process_request(std::move(request)).finally([conn = std::move(conn)] {});
                 }).handle_exception([this, error_conn = std::move(error_conn)] (std::exception_ptr handler_ep) {
-                    _error = true;
-                    shutdown_transport_input();
-                    log_exception(*this, log_level::error, "server request handler failed", handler_ep);
+                    if (!is_quic_closed_exception(handler_ep)) {
+                        _error = true;
+                        shutdown_transport_input();
+                        log_exception(*this, log_level::error, "server request handler failed", handler_ep);
+                    }
                 });
                 continue;
             }
@@ -1458,8 +1636,12 @@ future<> server::connection::process() {
         }
     } catch (...) {
         ep = std::current_exception();
-        log_exception(*this, log_level::error,
-            format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
+        if (is_quic_closed_exception(ep)) {
+            ep = nullptr;
+        } else {
+            log_exception(*this, log_level::error,
+                format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
+        }
     }
     co_await _request_gate.close();
     shutdown_transport_input();
@@ -1491,6 +1673,233 @@ server::connection::connection(server& s, std::unique_ptr<transport> transport, 
         , _info{.addr{std::move(addr)}, .server{s}, .conn_id{id}} {
     set_transport(std::move(transport));
 }
+
+namespace experimental {
+
+quic_client_transport::quic_client_transport(
+        seastar::quic::experimental::quic_client client,
+        seastar::quic::experimental::connection conn,
+        seastar::quic::experimental::stream control_stream)
+        : _client(std::move(client))
+        , _conn(std::move(conn))
+        , _control_stream(std::move(control_stream))
+        , _control_input(_control_stream.input())
+        , _control_output(_control_stream.output()) {
+}
+
+quic_client_transport::quic_client_transport(
+        seastar::quic::experimental::connection conn,
+        seastar::quic::experimental::stream control_stream)
+        : _conn(std::move(conn))
+        , _control_stream(std::move(control_stream))
+        , _control_input(_control_stream.input())
+        , _control_output(_control_stream.output()) {
+}
+
+input_stream<char>& quic_client_transport::input() {
+    return _control_input;
+}
+
+output_stream<char>& quic_client_transport::output() {
+    return _control_output;
+}
+
+void quic_client_transport::shutdown_input() {
+    (void)_control_stream.stop_sending().handle_exception([] (std::exception_ptr) {});
+    (void)_response_gate.close().handle_exception([] (std::exception_ptr) {});
+}
+
+void quic_client_transport::shutdown_output() {
+    (void)_control_output.close().handle_exception([] (std::exception_ptr) {});
+}
+
+future<> quic_client_transport::stop() {
+    try {
+        co_await _control_stream.stop_sending();
+    } catch (...) {
+    }
+    try {
+        co_await _control_output.close();
+    } catch (...) {
+    }
+    try {
+        co_await _response_gate.close();
+    } catch (...) {
+    }
+    if (_client) {
+        try {
+            co_await _client->stop();
+        } catch (...) {
+        }
+    } else {
+        try {
+            co_await _conn.close();
+        } catch (...) {
+        }
+    }
+}
+
+future<internal::incoming_request> quic_client_transport::receive_request(connection&) {
+    return make_exception_future<internal::incoming_request>(std::runtime_error("client QUIC transport does not receive server requests"));
+}
+
+future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable*, bool expect_response) {
+    if (timeout && *timeout <= rpc_clock_type::now()) {
+        co_return;
+    }
+
+    auto& rpc_client = dynamic_cast<client&>(owner);
+    if (data.size && rpc_client._propagate_timeout) {
+        static_assert(snd_buf::chunk_size >= sizeof(uint64_t), "send buffer chunk size is too small");
+        if (rpc_client._timeout_negotiated) {
+            uint64_t left = 0;
+            if (timeout) {
+                left = std::chrono::duration_cast<std::chrono::milliseconds>(*timeout - rpc_clock_type::now()).count();
+            }
+            write_le<uint64_t>(data.front().get_write(), left);
+        } else {
+            data.front().trim_front(sizeof(uint64_t));
+            data.size -= sizeof(uint64_t);
+        }
+    }
+    data = rpc_client.compress(std::move(data));
+
+    auto units = co_await get_units(_send_sem, 1);
+    if (timeout && *timeout <= rpc_clock_type::now()) {
+        co_return;
+    }
+    if (expect_response && rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
+        co_return;
+    }
+
+    auto stream = co_await _conn.open_stream();
+    auto input = stream.input();
+    auto output = stream.output();
+
+    co_await write_snd_buf(output, std::move(data));
+    rpc_client._stats.sent_messages++;
+    co_await output.close();
+
+    if (!expect_response || rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
+        try {
+            (void)with_gate(_response_gate, [input = std::move(input)] () mutable {
+                return drain_quic_stream_fin_background(std::move(input)).handle_exception([] (std::exception_ptr) {});
+            });
+        } catch (gate_closed_exception&) {
+        }
+        co_return;
+    }
+
+    try {
+        (void)with_gate(_response_gate, [&rpc_client, msg_id, input = std::move(input), units = std::move(units)] () mutable {
+            return do_with(std::move(input), [&rpc_client, msg_id, units = std::move(units)] (input_stream<char>& in) mutable {
+                return do_with(std::move(units), [&rpc_client, msg_id, &in] (semaphore_units<>&) {
+                    return rpc_client.receive_response_frame(in).then([&rpc_client, msg_id] (internal::incoming_response response) {
+                        if (!response.data) {
+                            auto it = rpc_client._outstanding.find(msg_id);
+                            if (it != rpc_client._outstanding.end()) {
+                                auto handler = std::move(it->second);
+                                rpc_client._outstanding.erase(it);
+                                handler->closed();
+                            }
+                            return;
+                        }
+                        rpc_client.handle_response(std::move(response));
+                    });
+                }).finally([&in] {
+                    return drain_quic_stream_fin(in);
+                });
+            }).handle_exception([&rpc_client, msg_id] (std::exception_ptr ep) {
+                auto it = rpc_client._outstanding.find(msg_id);
+                if (it == rpc_client._outstanding.end()) {
+                    return;
+                }
+                auto handler = std::move(it->second);
+                rpc_client._outstanding.erase(it);
+                handler->closed();
+                if (!rpc_client.error()) {
+                    log_exception(rpc_client, log_level::error, "client QUIC request stream failed", ep);
+                }
+            });
+        });
+    } catch (gate_closed_exception&) {
+        throw closed_error();
+    }
+}
+
+quic_server_transport::quic_server_transport(
+        seastar::quic::experimental::connection conn,
+        seastar::quic::experimental::stream control_stream)
+        : _conn(std::move(conn))
+        , _control_stream(std::move(control_stream))
+        , _control_input(_control_stream.input())
+        , _control_output(_control_stream.output()) {
+}
+
+input_stream<char>& quic_server_transport::input() {
+    return _control_input;
+}
+
+output_stream<char>& quic_server_transport::output() {
+    return _control_output;
+}
+
+void quic_server_transport::shutdown_input() {
+    (void)_control_stream.stop_sending().handle_exception([] (std::exception_ptr) {});
+}
+
+void quic_server_transport::shutdown_output() {
+    (void)_control_output.close().handle_exception([] (std::exception_ptr) {});
+}
+
+future<> quic_server_transport::stop() {
+    try {
+        co_await _control_stream.stop_sending();
+    } catch (...) {
+    }
+    try {
+        co_await _control_output.close();
+    } catch (...) {
+    }
+    try {
+        co_await _conn.close();
+    } catch (...) {
+    }
+}
+
+bool quic_server_transport::supports_concurrent_request_processing() const {
+    return true;
+}
+
+future<internal::incoming_request> quic_server_transport::receive_request(connection& owner) {
+    while (true) {
+        auto stream = co_await _conn.accept_stream();
+        auto input = stream.input();
+        auto output = make_lw_shared<quic_reply_stream_state>(stream.output());
+        auto request = co_await dynamic_cast<server::connection&>(owner).receive_quic_request_frame(input);
+        if (!request.data) {
+            co_await output->close();
+            continue;
+        }
+        (void)drain_quic_stream_fin_background(std::move(input)).handle_exception([] (std::exception_ptr) {});
+        auto rpc_owner = dynamic_cast<server::connection&>(owner).shared_from_this();
+        request.reply = internal::reply_handle([output, rpc_owner] (snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout) mutable {
+            if (timeout && *timeout <= rpc_clock_type::now()) {
+                return output->close();
+            }
+            return output->write_and_close(rpc_owner->compress(std::move(data)));
+        }, [output] () mutable {
+            return output->close();
+        });
+        co_return request;
+    }
+}
+
+future<> quic_server_transport::send_request(connection&, int64_t, snd_buf, std::optional<rpc_clock_type::time_point>, cancellable*, bool) {
+    return make_exception_future<>(std::runtime_error("server QUIC transport does not send client requests"));
+}
+
+} // namespace experimental
 
 future<> server::connection::deregister_this_stream() {
     if (!get_server()._options.streaming_domain) {
@@ -1544,35 +1953,82 @@ server::server(protocol_base* proto, server_options opts, server_socket ss, reso
         : server(proto, std::move(ss), limits, opts)
 {}
 
-void server::accept() {
+namespace {
+
+template <typename Acceptor, typename Handler, typename OnStop>
+void run_accept_loop(Acceptor& acceptor, Handler handler, OnStop on_stop) {
     // Run asynchronously in background.
     // Communicate result via __ss_stopped.
     // The caller has to call server::stop() to synchronize.
-    (void)keep_doing([this] () mutable {
-        return _ss.accept().then([this] (accept_result ar) mutable {
-            if (_options.filter_connection && !_options.filter_connection(ar.remote_address)) {
-                return;
-            }
-            auto fd = std::move(ar.connection);
-            auto addr = std::move(ar.remote_address);
-            fd.set_nodelay(_options.tcp_nodelay);
-            connection_id id = _options.streaming_domain
-                    ? connection_id::make_id(_next_client_id++, uint16_t(this_shard_id()))
-                    : connection_id::make_invalid_id(_next_client_id++);
-            auto conn = _proto.make_server_connection(*this, std::move(fd), std::move(addr), id);
-            auto r = _conns.emplace(id, conn);
-            SEASTAR_ASSERT(r.second);
-            // Process asynchronously in background.
-            (void)conn->process();
+    (void)keep_doing([&acceptor, handler = std::move(handler)] () mutable {
+        return acceptor.accept().then([handler] (auto accepted) mutable {
+            return handler(std::move(accepted));
         });
-    }).then_wrapped([this] (future<>&& f){
+    }).then_wrapped([on_stop = std::move(on_stop)] (future<>&& f) mutable {
         try {
             f.get();
             SEASTAR_ASSERT(false);
         } catch (...) {
-            _ss_stopped.set_value();
+            on_stop();
         }
     });
+}
+
+}
+
+void server::accept() {
+    run_accept_loop(_ss, [this] (accept_result ar) mutable {
+        if (_options.filter_connection && !_options.filter_connection(ar.remote_address)) {
+            return;
+        }
+        auto fd = std::move(ar.connection);
+        auto addr = std::move(ar.remote_address);
+        fd.set_nodelay(_options.tcp_nodelay);
+        connection_id id = _options.streaming_domain
+                ? connection_id::make_id(_next_client_id++, uint16_t(this_shard_id()))
+                : connection_id::make_invalid_id(_next_client_id++);
+        auto conn = _proto.make_server_connection(*this, std::move(fd), std::move(addr), id);
+        auto r = _conns.emplace(id, conn);
+        SEASTAR_ASSERT(r.second);
+        // Process asynchronously in background.
+        (void)conn->process();
+    }, [this] {
+        _ss_stopped.set_value();
+    });
+}
+
+void server::accept(::seastar::quic::experimental::quic_server& qs) {
+    // The caller owns qs and is responsible for stopping it.
+    run_accept_loop(qs, [this] (::seastar::quic::experimental::connection session) mutable {
+        (void)handle_quic_session(std::move(session)).handle_exception([] (std::exception_ptr) {});
+    }, [] {
+    });
+}
+
+shared_ptr<server::connection> server::make_quic_connection(
+        ::seastar::quic::experimental::connection session,
+        ::seastar::quic::experimental::stream control_stream,
+        connection_id id) {
+    auto addr = session.peer_address();
+    auto transport = std::make_unique<experimental::quic_server_transport>(std::move(session), std::move(control_stream));
+    return _proto.make_server_connection(*this, std::move(transport), std::move(addr), id);
+}
+
+future<> server::handle_quic_session(::seastar::quic::experimental::connection session) {
+    auto addr = session.peer_address();
+    if (_options.filter_connection && !_options.filter_connection(addr)) {
+        co_await session.close();
+        co_return;
+    }
+
+    auto control_stream = co_await session.accept_stream();
+    connection_id id = _options.streaming_domain
+            ? connection_id::make_id(_next_client_id++, uint16_t(this_shard_id()))
+            : connection_id::make_invalid_id(_next_client_id++);
+    auto conn = make_quic_connection(std::move(session), std::move(control_stream), id);
+    auto r = _conns.emplace(id, conn);
+    SEASTAR_ASSERT(r.second);
+    (void)conn->process();
 }
 
 future<> server::shutdown() {
