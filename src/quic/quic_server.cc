@@ -574,8 +574,10 @@ void sync_current_path(server_connection& conn) {
         return;
     }
 
+    const auto tx_payload_limit = effective_tx_payload_limit(conn.conn, default_udp_payload_size, max_udp_payload_size);
     const auto* path = ngtcp2_conn_get_path(conn.conn);
     if (!path) {
+        conn.tx_payload_limit = tx_payload_limit;
         return;
     }
 
@@ -590,17 +592,21 @@ void sync_current_path(server_connection& conn) {
       static_cast<ngtcp2_socklen>(conn.local_ss_len),
     });
 
-    if ((!old_local || *local == *old_local) && *remote == conn.peer) {
+    if ((!old_local || *local == *old_local) && *remote == conn.peer && tx_payload_limit == conn.tx_payload_limit) {
         return;
     }
 
-    quic_server_log.info("server active path updated: old_local={} old_remote={} new_local={} new_remote={}",
+    quic_server_log.info(
+      "server active path updated: old_local={} old_remote={} new_local={} new_remote={} tx_payload_limit={} old_tx_payload_limit={}",
       old_local.value_or(socket_address{}),
       conn.peer,
       *local,
-      *remote);
+      *remote,
+      tx_payload_limit,
+      conn.tx_payload_limit);
 
     conn.peer = *remote;
+    conn.tx_payload_limit = tx_payload_limit;
     to_sockaddr_storage(*local, conn.local_ss, conn.local_ss_len);
     to_sockaddr_storage(conn.peer, conn.peer_ss, conn.peer_ss_len);
 }
@@ -1172,14 +1178,7 @@ private:
         ngtcp2_conn_set_tls_native_handle(conn->conn, conn->tls);
         conn->conn_ref.user_data = conn->conn;
 
-        auto payload = ngtcp2_conn_get_path_max_tx_udp_payload_size(conn->conn);
-        if (payload == 0) {
-            payload = default_udp_payload_size;
-        }
-        if (payload > max_udp_payload_size) {
-            payload = max_udp_payload_size;
-        }
-        conn->tx_payload_limit = payload;
+        conn->tx_payload_limit = effective_tx_payload_limit(conn->conn, default_udp_payload_size, max_udp_payload_size);
 
         map_dcid(conn, odcid.data, odcid.datalen);
         map_dcid(conn, scid.data, scid.datalen);
@@ -1213,7 +1212,7 @@ private:
     }
 
     static future<> conn_actor_loop(conn_ptr conn) {
-        constexpr size_t actor_batch_limit = 64;
+        constexpr size_t actor_batch_limit = 256;
 
         while (conn->actor_active()) {
             if (!conn->actor_has_pending_work()) {

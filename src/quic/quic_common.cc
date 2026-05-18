@@ -211,6 +211,21 @@ std::optional<congestion_control_algorithm> effective_congestion_control(const t
     return algo;
 }
 
+size_t effective_tx_payload_limit(ngtcp2_conn* conn, size_t fallback, size_t clamp) noexcept {
+    if (!conn) {
+        return fallback;
+    }
+
+    auto payload = ngtcp2_conn_get_path_max_tx_udp_payload_size(conn);
+    if (payload == 0) {
+        payload = fallback;
+    }
+    if (payload > clamp) {
+        payload = clamp;
+    }
+    return payload;
+}
+
 size_t recommended_rx_queue_capacity(const connection_options& options) noexcept {
     const auto pending_receive_bytes = options.max_pending_receive_bytes;
     if (!pending_receive_bytes) {

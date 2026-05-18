@@ -627,8 +627,10 @@ void sync_current_path(client_state& st) {
         return;
     }
 
+    const auto tx_payload_limit = effective_tx_payload_limit(st.conn, default_udp_payload_size, max_udp_payload_size);
     const auto* path = ngtcp2_conn_get_path(st.conn);
     if (!path) {
+        st.tx_payload_limit = tx_payload_limit;
         return;
     }
 
@@ -638,18 +640,22 @@ void sync_current_path(client_state& st) {
         return;
     }
 
-    if (*local == st.local_address && *remote == st.remote_address) {
+    if (*local == st.local_address && *remote == st.remote_address && tx_payload_limit == st.tx_payload_limit) {
         return;
     }
 
-    quic_client_log.info("client active path updated: old_local={} old_remote={} new_local={} new_remote={}",
+    quic_client_log.info(
+      "client active path updated: old_local={} old_remote={} new_local={} new_remote={} tx_payload_limit={} old_tx_payload_limit={}",
       st.local_address,
       st.remote_address,
       *local,
-      *remote);
+      *remote,
+      tx_payload_limit,
+      st.tx_payload_limit);
 
     st.local_address = *local;
     st.remote_address = *remote;
+    st.tx_payload_limit = tx_payload_limit;
     to_sockaddr_storage(st.local_address, st.local_ss, st.local_ss_len);
     to_sockaddr_storage(st.remote_address, st.remote_ss, st.remote_ss_len);
 }
@@ -1026,14 +1032,7 @@ void init_client_connection(client_state& st) {
     ngtcp2_conn_set_tls_native_handle(st.conn, st.tls);
     st.conn_ref.user_data = st.conn;
 
-    auto payload = ngtcp2_conn_get_path_max_tx_udp_payload_size(st.conn);
-    if (payload == 0) {
-        payload = default_udp_payload_size;
-    }
-    if (payload > max_udp_payload_size) {
-        payload = max_udp_payload_size;
-    }
-    st.tx_payload_limit = payload;
+    st.tx_payload_limit = effective_tx_payload_limit(st.conn, default_udp_payload_size, max_udp_payload_size);
     quic_client_log.info(
       "client QUIC connection initialized: local={} remote={} tx_payload_limit={}",
       st.local_address,
@@ -1077,7 +1076,7 @@ future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
 }
 
 future<> actor_loop(lw_shared_ptr<client_state> st) {
-    constexpr size_t actor_batch_limit = 64;
+    constexpr size_t actor_batch_limit = 256;
 
     while (st->actor_active()) {
         if (!st->actor_has_pending_work()) {
