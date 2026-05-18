@@ -296,43 +296,6 @@ future<> connection::stop_send_loop(std::exception_ptr ex) {
 }
 
 void connection::set_socket(connected_socket&& fd) {
-    class connected_socket_transport final : public transport {
-        connected_socket _fd;
-        input_stream<char> _input;
-        output_stream<char> _output;
-
-    public:
-        explicit connected_socket_transport(connected_socket fd) noexcept
-            : _fd(std::move(fd))
-            , _input(_fd.input())
-            , _output(_fd.output()) {
-        }
-
-        input_stream<char>& input() override {
-            return _input;
-        }
-
-        output_stream<char>& output() override {
-            return _output;
-        }
-
-        void shutdown_input() override {
-            _fd.shutdown_input();
-        }
-
-        void shutdown_output() override {
-            _fd.shutdown_output();
-        }
-
-        future<internal::incoming_request> receive_request(connection& owner) override {
-            return owner.receive_request_frame(_input);
-        }
-
-        future<> send_request(connection& owner, int64_t, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool) override {
-            return owner.send(std::move(data), timeout, cancel);
-        }
-    };
-
     set_transport(std::make_unique<connected_socket_transport>(std::move(fd)));
 }
 
@@ -1226,14 +1189,14 @@ client::client(const logger& l, void* s, client_options ops, socket socket, cons
     enqueue_zero_frame();
 }
 
-client::client(const logger& l, void* s, client_options ops, std::unique_ptr<transport> transport, const socket_address& addr, const socket_address& local, bool read_responses_from_transport)
+client::client(const logger& l, void* s, client_options ops, std::unique_ptr<transport> transport, const socket_address& addr, const socket_address& local)
         : rpc::connection(l, s), _socket(make_socket()), _server_addr(addr), _local_addr(local), _options(ops), _metrics(*this)
 {
     set_transport(std::move(transport));
     // Run client in the background.
     // Communicate result via _stopped.
     // The caller has to call client::stop() to synchronize.
-    (void)loop_with_transport(read_responses_from_transport);
+    (void)loop_with_transport();
     enqueue_zero_frame();
 }
 
@@ -1257,7 +1220,7 @@ feature_map client::make_client_features() const {
     return features;
 }
 
-future<> client::process_client_connection(bool read_responses_from_transport) {
+future<> client::process_client_connection() {
     co_await negotiate_protocol(make_client_features());
 
     _propagate_timeout = !is_stream();
@@ -1268,21 +1231,23 @@ future<> client::process_client_connection(bool read_responses_from_transport) {
             continue;
         }
 
-        // QUIC version doesn't need to wait for response.
-        if (!read_responses_from_transport) {
+        switch (_transport->get_response_read_mode()) {
+        case transport::response_read_mode::read_stream:
             co_await transport_input().read();
-        }
-        else {
+            break;
+        case transport::response_read_mode::read_socket: {
             auto response = co_await receive_response();
             handle_response(std::move(response));
+            break;
+        }
         }
     }
 }
 
-future<> client::loop_with_transport(bool read_responses_from_transport) {
+future<> client::loop_with_transport() {
     std::exception_ptr ep;
     try {
-        co_await process_client_connection(read_responses_from_transport);
+        co_await process_client_connection();
     } catch (...) {
         ep = std::current_exception();
         auto expected_close = _error && is_quic_closed_exception(ep);
@@ -1331,7 +1296,7 @@ future<> client::loop(client_options ops, const socket_address& addr, const sock
         }
         set_socket(std::move(fd));
 
-        co_await process_client_connection(true);
+        co_await process_client_connection();
     } catch (...) {
         ep = std::current_exception();
         if (connected()) {
@@ -1543,7 +1508,7 @@ server::connection::respond(internal::reply_handle reply, int64_t msg_id, snd_bu
         data.size -= sizeof(uint32_t);
         response_frame::encode_header(msg_id, data);
     }
-    if (!reply) {
+    if (!reply.send) {
         return make_exception_future<>(closed_error());
     }
     return reply.send(std::move(data), timeout);
@@ -1711,6 +1676,10 @@ void quic_client_transport::shutdown_input() {
 
 void quic_client_transport::shutdown_output() {
     (void)_control_output.close().handle_exception([] (std::exception_ptr) {});
+}
+
+connection::transport::response_read_mode quic_client_transport::get_response_read_mode() const {
+    return response_read_mode::read_stream;
 }
 
 future<> quic_client_transport::stop() {

@@ -278,6 +278,8 @@ struct incoming_request {
 };
 }
 
+class connected_socket_transport;
+
 namespace experimental {
 class quic_client_transport;
 class quic_server_transport;
@@ -287,6 +289,11 @@ class connection {
 public:
     class transport {
     public:
+        enum class response_read_mode {
+            read_socket,
+            read_stream,
+        };
+
         virtual ~transport() = default;
 
         virtual input_stream<char>& input() = 0;
@@ -300,6 +307,9 @@ public:
         }
         virtual bool supports_concurrent_request_processing() const {
             return false;
+        }
+        virtual response_read_mode get_response_read_mode() const {
+            return response_read_mode::read_socket;
         }
         virtual future<internal::incoming_request> receive_request(connection& owner) = 0;
         virtual future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) = 0;
@@ -411,6 +421,7 @@ protected:
     future<> transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr, bool expect_response = true);
     virtual future<internal::incoming_request> receive_request_frame(input_stream<char>& in);
 
+    friend class connected_socket_transport;
     friend class experimental::quic_server_transport;
 
 public:
@@ -624,8 +635,8 @@ class client : public rpc::connection, public weakly_referencable<client> {
     void enqueue_zero_frame();
     future<> loop(client_options ops, const socket_address& addr, const socket_address& local);
     feature_map make_client_features() const;
-    future<> process_client_connection(bool read_responses_from_transport);
-    future<> loop_with_transport(bool read_responses_from_transport);
+    future<> process_client_connection();
+    future<> loop_with_transport();
 public:
     template<typename Reply, typename Func>
     struct reply_handler final : reply_handler_base {
@@ -695,7 +706,7 @@ public:
      */
     client(const logger& l, void* s, socket socket, const socket_address& addr, const socket_address& local = {});
     client(const logger& l, void* s, client_options options, socket socket, const socket_address& addr, const socket_address& local = {});
-    client(const logger& l, void* s, client_options options, std::unique_ptr<transport> transport, const socket_address& addr, const socket_address& local = {}, bool read_responses_from_transport = false);
+    client(const logger& l, void* s, client_options options, std::unique_ptr<transport> transport, const socket_address& addr, const socket_address& local = {});
 
     stats get_stats() const;
     size_t incoming_queue_length() const noexcept {
@@ -1036,8 +1047,8 @@ public:
             rpc::client(p.get_logger(), &p._serializer, std::move(socket), addr, local) {}
         client(protocol& p, client_options options, socket socket, const socket_address& addr, const socket_address& local = {}) :
             rpc::client(p.get_logger(), &p._serializer, options, std::move(socket), addr, local) {}
-        client(protocol& p, client_options options, std::unique_ptr<rpc::connection::transport> transport, const socket_address& addr, const socket_address& local = {}, bool read_responses_from_transport = false) :
-            rpc::client(p.get_logger(), &p._serializer, options, std::move(transport), addr, local, read_responses_from_transport) {}
+        client(protocol& p, client_options options, std::unique_ptr<rpc::connection::transport> transport, const socket_address& addr, const socket_address& local = {}) :
+            rpc::client(p.get_logger(), &p._serializer, options, std::move(transport), addr, local) {}
     };
 
     friend server;

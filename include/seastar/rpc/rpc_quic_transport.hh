@@ -21,6 +21,47 @@
 #include <seastar/quic/quic.hh>
 #include <seastar/rpc/rpc.hh>
 
+namespace seastar::rpc {
+
+class connected_socket_transport final : public connection::transport {
+    connected_socket _fd;
+    input_stream<char> _input;
+    output_stream<char> _output;
+
+public:
+    explicit connected_socket_transport(connected_socket fd) noexcept
+        : _fd(std::move(fd))
+        , _input(_fd.input())
+        , _output(_fd.output()) {
+    }
+
+    input_stream<char>& input() override {
+        return _input;
+    }
+
+    output_stream<char>& output() override {
+        return _output;
+    }
+
+    void shutdown_input() override {
+        _fd.shutdown_input();
+    }
+
+    void shutdown_output() override {
+        _fd.shutdown_output();
+    }
+
+    future<internal::incoming_request> receive_request(connection& owner) override {
+        return owner.receive_request_frame(_input);
+    }
+
+    future<> send_request(connection& owner, int64_t, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool) override {
+        return owner.send(std::move(data), timeout, cancel);
+    }
+};
+
+} // namespace seastar::rpc
+
 namespace seastar::rpc::experimental {
 
 class quic_client_transport final : public connection::transport {
@@ -38,6 +79,7 @@ public:
     void shutdown_input() override;
     void shutdown_output() override;
     future<> stop() override;
+    response_read_mode get_response_read_mode() const override;
     future<internal::incoming_request> receive_request(connection& owner) override;
     future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) override;
 
@@ -101,8 +143,7 @@ protocol<Serializer, MsgType>::make_quic_client(client_options options, quic::ex
             std::move(options),
             std::move(transport),
             peer_addr,
-            local_addr,
-            false);
+            local_addr);
 }
 
 } // namespace seastar::rpc
