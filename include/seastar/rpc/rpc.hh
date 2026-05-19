@@ -680,6 +680,7 @@ private:
     future<internal::incoming_response> receive_response_frame(input_stream<char>& in);
     future<internal::incoming_response> receive_response();
     void handle_response(internal::incoming_response response);
+    bool can_send_request(id_type id, bool expect_response) const;
 
     friend class experimental::quic_client_transport;
 public:

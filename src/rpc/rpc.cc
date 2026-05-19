@@ -186,6 +186,15 @@ static future<> drain_quic_stream_fin_background(input_stream<char> in) {
     });
 }
 
+static future<> abort_quic_stream(quic::experimental::stream& stream) {
+    co_await stream.reset().handle_exception([] (std::exception_ptr ep) {
+        return ignore_quic_closed_exception(ep);
+    });
+    co_await stream.stop_sending().handle_exception([] (std::exception_ptr ep) {
+        return ignore_quic_closed_exception(ep);
+    });
+}
+
 class quic_reply_stream_state {
     output_stream<char> _out;
     bool _closed = false;
@@ -205,17 +214,55 @@ public:
         });
     }
 
-    future<> write_and_close(snd_buf data) {
-        if (_closed) {
+    static future<> write_and_close(lw_shared_ptr<quic_reply_stream_state> self, snd_buf data) {
+        if (self->_closed) {
             return make_ready_future<>();
         }
-        return write_snd_buf(_out, std::move(data)).handle_exception([] (std::exception_ptr ep) {
+        return write_snd_buf(self->_out, std::move(data)).handle_exception([] (std::exception_ptr ep) {
             return ignore_quic_closed_exception(ep);
-        }).finally([this] {
-            return close();
+        }).finally([self] {
+            return self->close();
         });
     }
 };
+
+namespace internal {
+
+class send_cancellation_state {
+    cancellable* _cancel = nullptr;
+    bool _cancelled = false;
+
+public:
+    void attach(cancellable& cancel, lw_shared_ptr<send_cancellation_state> self) {
+        cancel.cancel_send = [self] {
+            self->_cancelled = true;
+        };
+        cancel.send_back_pointer = &_cancel;
+        _cancel = &cancel;
+    }
+
+    bool cancelled() const noexcept {
+        return _cancelled;
+    }
+
+    cancellable* cancel() const noexcept {
+        return _cancel;
+    }
+
+    void uncancellable() noexcept {
+        if (_cancel) {
+            _cancel->cancel_send = std::function<void()>();
+            _cancel->send_back_pointer = nullptr;
+            _cancel = nullptr;
+        }
+    }
+
+    ~send_cancellation_state() {
+        uncancellable();
+    }
+};
+
+} // namespace internal
 
 snd_buf connection::compress(snd_buf buf) {
     if (_compressor) {
@@ -318,7 +365,16 @@ future<internal::incoming_request> connection::transport_receive_request() {
 
 future<> connection::transport_send_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) {
     if (_negotiated) {
-        return _negotiated->get_shared_future().then([this, msg_id, buf = std::move(buf), timeout, cancel, expect_response] () mutable {
+        auto cancel_state = make_lw_shared<internal::send_cancellation_state>();
+        if (cancel) {
+            cancel_state->attach(*cancel, cancel_state);
+        }
+        return _negotiated->get_shared_future().then([this, msg_id, buf = std::move(buf), timeout, cancel_state, expect_response] () mutable {
+            if (cancel_state->cancelled()) {
+                return make_ready_future<>();
+            }
+            auto cancel = cancel_state->cancel();
+            cancel_state->uncancellable();
             return _transport->send_request(*this, msg_id, std::move(buf), timeout, cancel, expect_response);
         });
     }
@@ -1005,6 +1061,10 @@ void client::handle_response(internal::incoming_response response) {
         // this can happened if the message id is timed out already
         get_logger()(peer_address(), log_level::debug, "got a reply for an expired message id");
     }
+}
+
+bool client::can_send_request(id_type id, bool expect_response) const {
+    return !expect_response || _outstanding.find(id) != _outstanding.end();
 }
 
 stats client::get_stats() const {
@@ -1712,11 +1772,20 @@ future<internal::incoming_request> quic_client_transport::receive_request(connec
     return make_exception_future<internal::incoming_request>(std::runtime_error("client QUIC transport does not receive server requests"));
 }
 
-future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable*, bool expect_response) {
+future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) {
     if (timeout && *timeout <= rpc_clock_type::now()) {
-        co_return;
+        return make_ready_future<>();
     }
 
+    auto cancel_state = make_lw_shared<internal::send_cancellation_state>();
+    if (cancel) {
+        cancel_state->attach(*cancel, cancel_state);
+    }
+
+    return do_send_request(owner, msg_id, std::move(data), timeout, std::move(cancel_state), expect_response);
+}
+
+future<> quic_client_transport::do_send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, lw_shared_ptr<internal::send_cancellation_state> cancel_state, bool expect_response) {
     auto& rpc_client = dynamic_cast<client&>(owner);
     if (data.size && rpc_client._propagate_timeout) {
         static_assert(snd_buf::chunk_size >= sizeof(uint64_t), "send buffer chunk size is too small");
@@ -1734,14 +1803,22 @@ future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, 
     data = rpc_client.compress(std::move(data));
 
     auto units = co_await get_units(_send_sem, 1);
-    if (timeout && *timeout <= rpc_clock_type::now()) {
+    if (cancel_state->cancelled() || (timeout && *timeout <= rpc_clock_type::now())) {
         co_return;
     }
-    if (expect_response && rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
+    if (!rpc_client.can_send_request(msg_id, expect_response)) {
         co_return;
     }
 
     auto stream = co_await _conn.open_stream();
+    if (cancel_state->cancelled()
+            || (timeout && *timeout <= rpc_clock_type::now())
+            || !rpc_client.can_send_request(msg_id, expect_response)) {
+        co_await abort_quic_stream(stream);
+        co_return;
+    }
+    cancel_state->uncancellable();
+
     auto input = stream.input();
     auto output = stream.output();
 
@@ -1749,7 +1826,7 @@ future<> quic_client_transport::send_request(connection& owner, int64_t msg_id, 
     rpc_client._stats.sent_messages++;
     co_await output.close();
 
-    if (!expect_response || rpc_client._outstanding.find(msg_id) == rpc_client._outstanding.end()) {
+    if (!rpc_client.can_send_request(msg_id, expect_response)) {
         try {
             (void)with_gate(_response_gate, [input = std::move(input)] () mutable {
                 return drain_quic_stream_fin_background(std::move(input)).handle_exception([] (std::exception_ptr) {});
@@ -1856,7 +1933,7 @@ future<internal::incoming_request> quic_server_transport::receive_request(connec
             if (timeout && *timeout <= rpc_clock_type::now()) {
                 return output->close();
             }
-            return output->write_and_close(rpc_owner->compress(std::move(data)));
+            return quic_reply_stream_state::write_and_close(output, rpc_owner->compress(std::move(data)));
         }, [output] () mutable {
             return output->close();
         });

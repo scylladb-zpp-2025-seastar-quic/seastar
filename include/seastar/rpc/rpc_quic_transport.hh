@@ -23,6 +23,10 @@
 
 namespace seastar::rpc {
 
+namespace internal {
+class send_cancellation_state;
+}
+
 class connected_socket_transport final : public connection::transport {
     connected_socket _fd;
     input_stream<char> _input;
@@ -84,6 +88,8 @@ public:
     future<> send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) override;
 
 private:
+    future<> do_send_request(connection& owner, int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, lw_shared_ptr<internal::send_cancellation_state> cancel_state, bool expect_response);
+
     std::optional<seastar::quic::experimental::quic_client> _client;
     seastar::quic::experimental::connection _conn;
     seastar::quic::experimental::stream _control_stream;
