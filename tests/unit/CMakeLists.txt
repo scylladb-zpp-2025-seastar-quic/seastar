@@ -477,6 +477,11 @@ seastar_add_test (quic
   LIBRARIES ngtcp2::ngtcp2
   DEPENDS testcrt)
 
+seastar_add_test (rpc_quic_v1
+  SOURCES rpc_quic_v1_test.cc
+  LIBRARIES ngtcp2::ngtcp2
+  DEPENDS testcrt)
+
 seastar_add_test (queue
   SOURCES queue_test.cc)
 
