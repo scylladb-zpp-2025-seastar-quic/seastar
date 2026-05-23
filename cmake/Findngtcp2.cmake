@@ -34,7 +34,11 @@ set (NGTCP2_DISABLE_TESTS
   BOOL 
   "Disable tests")
 
+enable_language (C)
+
+set (Cooking_USE_CMAKE_PROJECT_COMMAND ON)
 add_subdirectory (ngtcp2)
+unset (Cooking_USE_CMAKE_PROJECT_COMMAND)
 
 set (NGTCP2_SRC "${CMAKE_CURRENT_SOURCE_DIR}/ngtcp2")
 set (NGTCP2_BIN "${CMAKE_CURRENT_BINARY_DIR}/ngtcp2")
