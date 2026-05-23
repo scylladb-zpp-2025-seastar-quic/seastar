@@ -19,9 +19,6 @@
  * Copyright 2019 ScyllaDB
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <array>
 #include <chrono>
@@ -34,10 +31,8 @@ module;
 #include <boost/container/small_vector.hpp>
 #include <sys/uio.h>
 #include <seastar/util/assert.hh>
+#include <seastar/util/integrated-length.hh>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/file.hh>
 #include <seastar/core/io_queue.hh>
 #include <seastar/core/io_intent.hh>
@@ -48,7 +43,6 @@ module seastar;
 #include <seastar/core/internal/io_sink.hh>
 #include <seastar/core/io_priority_class.hh>
 #include <seastar/util/log.hh>
-#endif
 
 namespace seastar {
 
@@ -105,13 +99,15 @@ auto io_throttler::capacity_deficiency(capacity_t from) const noexcept -> capaci
 }
 
 struct io_group::priority_class_data {
+    priority_class_group_data* parent;
+
     using token_bucket_t = internal::shared_token_bucket<uint64_t, std::ratio<1>, internal::capped_release::no>;
 
     static constexpr uint64_t bandwidth_burst_in_blocks = 10 << (20 - io_queue::block_size_shift); // 10MB
     static constexpr uint64_t bandwidth_threshold_in_blocks = 128 << (10 - io_queue::block_size_shift); // 128kB
     token_bucket_t tb;
 
-    uint64_t tokens(size_t length) const noexcept {
+    static uint64_t tokens(size_t length) noexcept {
         return length >> io_queue::block_size_shift;
     }
 
@@ -124,8 +120,9 @@ struct io_group::priority_class_data {
         tb.update_rate(tokens(bandwidth));
     }
 
-    priority_class_data() noexcept
-            : tb(std::numeric_limits<uint64_t>::max(), bandwidth_burst_in_blocks, bandwidth_threshold_in_blocks)
+    priority_class_data(priority_class_group_data* p) noexcept
+            : parent(p)
+            , tb(std::numeric_limits<uint64_t>::max(), bandwidth_burst_in_blocks, bandwidth_threshold_in_blocks)
     {
     }
 };
@@ -143,39 +140,74 @@ class io_queue::priority_class_data {
             bytes += len;
         }
     } _rwstat[2] = {}, _splits = {};
-    uint32_t _nr_queued;
-    uint32_t _nr_executing;
+    util::integrated_length<unsigned short, lowres_clock> _nr_queued;
+    util::integrated_length<unsigned short, lowres_clock> _nr_executing;
     std::chrono::duration<double> _queue_time;
     std::chrono::duration<double> _total_queue_time;
     std::chrono::duration<double> _total_execution_time;
     std::chrono::duration<double> _starvation_time;
     io_queue::clock_type::time_point _activated;
 
-    io_group::priority_class_data& _group;
-    size_t _replenish_head;
-    timer<lowres_clock> _replenish;
+    class bandwidth_throttler {
+        io_group::priority_class_data::token_bucket_t& _tb;
+        uint64_t _replenish_head;
+        priority_class_data& _pc;
+        std::optional<unsigned> _group;
+        timer<lowres_clock> _replenish;
 
-    void try_to_replenish() noexcept {
-        _group.tb.replenish(io_queue::clock_type::now());
-        auto delta = _group.tb.deficiency(_replenish_head);
-        if (delta > 0) {
-            _replenish.arm(std::chrono::duration_cast<std::chrono::microseconds>(_group.tb.duration_for(delta)));
-        } else {
-            _queue.unthrottle_priority_class(*this);
+        void throttle() noexcept {
+            if (_group) {
+                _pc._queue.throttle_priority_class_group(*_group);
+            } else {
+                _pc._queue.throttle_priority_class(_pc);
+            }
         }
-    }
+
+        void unthrottle() noexcept {
+            if (_group) {
+                _pc._queue.unthrottle_priority_class_group(*_group);
+            } else {
+                _pc._queue.unthrottle_priority_class(_pc);
+            }
+        }
+
+        void try_to_replenish() noexcept {
+            _tb.replenish(io_queue::clock_type::now());
+            auto delta = _tb.deficiency(_replenish_head);
+            if (delta > 0) {
+                _replenish.arm(std::chrono::duration_cast<std::chrono::microseconds>(_tb.duration_for(delta)));
+            } else {
+                unthrottle();
+            }
+        }
+
+    public:
+        bandwidth_throttler(io_group::priority_class_data& pg, priority_class_data& pc, std::optional<unsigned> g) noexcept
+                : _tb(pg.tb)
+                , _pc(pc)
+                , _group(g)
+                , _replenish([this] { try_to_replenish(); })
+        {}
+
+        void grab(uint64_t tokens) noexcept {
+            auto ph = _tb.grab(tokens);
+            auto delta = _tb.deficiency(ph);
+            if (delta > 0) {
+                throttle();
+                _replenish_head = ph;
+                _replenish.arm(std::chrono::duration_cast<std::chrono::microseconds>(_tb.duration_for(delta)));
+            }
+        }
+    };
+
+    boost::container::static_vector<bandwidth_throttler, 2> _bw;
 
 public:
     void update_shares(uint32_t shares) noexcept {
         _shares = std::max(shares, 1u);
     }
 
-    void update_bandwidth(uint64_t bandwidth) {
-        _group.update_bandwidth(bandwidth);
-        io_log.debug("Updated {} class bandwidth to {}MB/s", _pc.id(), bandwidth >> 20);
-    }
-
-    priority_class_data(internal::priority_class pc, uint32_t shares, io_queue& q, io_group::priority_class_data& pg)
+    priority_class_data(internal::priority_class pc, uint32_t shares, io_queue& q, io_group::priority_class_data& pg, std::optional<unsigned> group_index)
         : _queue(q)
         , _pc(pc)
         , _shares(shares)
@@ -185,9 +217,11 @@ public:
         , _total_queue_time(0)
         , _total_execution_time(0)
         , _starvation_time(0)
-        , _group(pg)
-        , _replenish([this] { try_to_replenish(); })
     {
+        _bw.emplace_back(pg, *this, std::nullopt);
+        if (pg.parent != nullptr) {
+            _bw.emplace_back(*pg.parent, *this, group_index);
+        }
     }
     priority_class_data(const priority_class_data&) = delete;
     priority_class_data(priority_class_data&&) = delete;
@@ -214,13 +248,9 @@ public:
             _starvation_time += io_queue::clock_type::now() - _activated;
         }
 
-        auto tokens = _group.tokens(dnl.length());
-        auto ph = _group.tb.grab(tokens);
-        auto delta = _group.tb.deficiency(ph);
-        if (delta > 0) {
-            _queue.throttle_priority_class(*this);
-            _replenish_head = ph;
-            _replenish.arm(std::chrono::duration_cast<std::chrono::microseconds>(_group.tb.duration_for(delta)));
+        auto tokens = io_group::priority_class_data::tokens(dnl.length());
+        for (auto& bw : _bw) {
+            bw.grab(tokens);
         }
     }
 
@@ -245,6 +275,14 @@ public:
 
     void on_split(io_direction_and_length dnl) noexcept {
         _splits.add(dnl.length());
+    }
+
+    void on_before_dispatch() noexcept {
+        _nr_queued.checkpoint();
+    }
+
+    void on_after_dispatch() noexcept {
+        _nr_executing.checkpoint();
     }
 
     fair_queue::class_id fq_class() const noexcept { return _pc.id(); }
@@ -590,7 +628,6 @@ void
 io_queue::complete_request(io_desc_read_write& desc, std::chrono::duration<double> delay) noexcept {
     _requests_executing--;
     _requests_completed++;
-    _streams[desc.stream()].fq.notify_request_finished(desc.capacity());
 
     if (delay > _stall_threshold) {
         _stall_threshold *= 2;
@@ -788,12 +825,15 @@ std::vector<seastar::metrics::impl::metric_definition_impl> io_queue::priority_c
             // In other words: the new counter tells you how busy a class is, and the
             // old counter tells you how busy the system is.
 
-            sm::make_queue_length("queue_length", _nr_queued, sm::description("Number of requests in the queue")),
-            sm::make_queue_length("disk_queue_length", _nr_executing, sm::description("Number of requests in the disk")),
+            sm::make_queue_length("queue_length", [this] { return _nr_queued.value(); }, sm::description("Number of requests in the queue")),
+            sm::make_queue_length("disk_queue_length", [this] { return _nr_executing.value(); }, sm::description("Number of requests in the disk")),
             sm::make_gauge("delay", [this] {
                 return _queue_time.count();
             }, sm::description("random delay time in the queue")),
-            sm::make_gauge("shares", _shares, sm::description("current amount of shares"))
+            sm::make_gauge("shares", _shares, sm::description("current amount of shares")),
+
+            sm::make_counter("integrated_queue_length", [this] { return _nr_queued.integral(); }, sm::description("Integrated queue length")),
+            sm::make_counter("integrated_disk_queue_length", [this] { return _nr_executing.integral(); }, sm::description("Integrated disk queue length")),
     });
 }
 
@@ -846,7 +886,6 @@ io_queue::priority_class_data& io_queue::find_or_create_class(internal::priority
         //
         // This conveys all the information we need and allows one to easily group all classes from
         // the same I/O queue (by filtering by shard)
-        auto& pg = _group->find_or_create_class(pc);
 
         std::optional<unsigned> group_index;
         if (!ssg.is_root()) {
@@ -856,8 +895,10 @@ io_queue::priority_class_data& io_queue::find_or_create_class(internal::priority
             }
         }
 
+        auto& pg = _group->find_or_create_class(pc, group_index);
+
         auto shares = sg.get_shares();
-        auto pc_data = std::make_unique<priority_class_data>(pc, shares, *this, pg);
+        auto pc_data = std::make_unique<priority_class_data>(pc, shares, *this, pg, group_index);
         for (auto&& s : _streams) {
             s.fq.register_priority_class(pc_data->fq_class(), shares, group_index);
         }
@@ -868,15 +909,46 @@ io_queue::priority_class_data& io_queue::find_or_create_class(internal::priority
     return *_priority_classes[id];
 }
 
-io_group::priority_class_data& io_group::find_or_create_class(internal::priority_class pc) {
+io_group::priority_class_group_data& io_group::find_or_create_class_group(unsigned group_index) {
     std::lock_guard _(_lock);
+    return find_or_create_class_group_locked(group_index);
+}
+
+io_group::priority_class_group_data& io_group::find_or_create_class_group_locked(unsigned id) {
+    if (id >= _priority_groups.size()) {
+        _priority_groups.resize(id + 1);
+    }
+    if (!_priority_groups[id]) {
+        auto pg = std::make_unique<priority_class_group_data>(nullptr);
+        _priority_groups[id] = std::move(pg);
+    }
+    return *_priority_groups[id];
+}
+
+io_group::priority_class_data& io_group::find_or_create_class(internal::priority_class pc) {
+    auto sg = internal::scheduling_group_from_index(pc.id());
+    auto ssg = internal::scheduling_supergroup_for(sg);
+    std::optional<unsigned> group_index;
+    if (!ssg.is_root()) {
+        group_index = ssg.index();
+    }
+    return find_or_create_class(pc, group_index);
+}
+
+io_group::priority_class_data& io_group::find_or_create_class(internal::priority_class pc, std::optional<unsigned> group_index) {
+    std::lock_guard _(_lock);
+
+    priority_class_group_data* parent = nullptr;
+    if (group_index.has_value()) {
+        parent = &find_or_create_class_group_locked(*group_index);
+    }
 
     auto id = pc.id();
     if (id >= _priority_classes.size()) {
         _priority_classes.resize(id + 1);
     }
     if (!_priority_classes[id]) {
-        auto pg = std::make_unique<priority_class_data>();
+        auto pg = std::make_unique<priority_class_data>(parent);
         _priority_classes[id] = std::move(pg);
     }
 
@@ -1047,6 +1119,12 @@ future<size_t> io_queue::submit_io_write(size_t len, internal::io_request req, i
 // This is far from ideal, but it's something.
 
 void io_queue::poll_io_queue() {
+    for (auto& pc : _priority_classes) {
+        if (pc) {
+            pc->on_before_dispatch();
+        }
+    }
+
     for (auto&& st : _streams) {
         st.out.maybe_replenish_capacity(st.replenish);
         auto available = st.reap_pending_capacity();
@@ -1079,6 +1157,12 @@ void io_queue::poll_io_queue() {
         // countermeasure for that), so we just discard the tokens. There's no harm in it, IO cancellation
         // can't have resource-saving guarantees anyway.
     }
+
+    for (auto& pc : _priority_classes) {
+        if (pc) {
+            pc->on_after_dispatch();
+        }
+    }
 }
 
 void io_queue::submit_request(io_desc_read_write* desc, internal::io_request req) noexcept {
@@ -1094,7 +1178,6 @@ void io_queue::cancel_request(queued_io_request& req) noexcept {
 }
 
 void io_queue::complete_cancelled_request(queued_io_request& req) noexcept {
-    _streams[req.stream()].fq.notify_request_finished(req.queue_entry().capacity());
 }
 
 io_queue::clock_type::time_point io_queue::next_pending_aio() const noexcept {
@@ -1129,8 +1212,19 @@ void io_queue::update_shares_for_class_group(unsigned index, size_t new_shares) 
 future<> io_queue::update_bandwidth_for_class(internal::priority_class pc, uint64_t new_bandwidth) {
     return futurize_invoke([this, pc, new_bandwidth] {
         if (_group->_allocated_on == this_shard_id()) {
-            auto& pclass = find_or_create_class(pc);
+            auto& pclass = _group->find_or_create_class(pc);
             pclass.update_bandwidth(new_bandwidth);
+            io_log.debug("Updated {} class bandwidth to {}MB/s", pc.id(), new_bandwidth >> 20);
+        }
+    });
+}
+
+future<> io_queue::update_bandwidth_for_class_group(unsigned group_index, uint64_t new_bandwidth) {
+    return futurize_invoke([this, group_index, new_bandwidth] {
+        if (_group->_allocated_on == this_shard_id()) {
+            auto& pclass = _group->find_or_create_class_group(group_index);
+            pclass.update_bandwidth(new_bandwidth);
+            io_log.debug("Updated {} class group bandwidth to {}MB/s", group_index, new_bandwidth >> 20);
         }
     });
 }
@@ -1169,6 +1263,18 @@ void io_queue::throttle_priority_class(const priority_class_data& pc) noexcept {
 void io_queue::unthrottle_priority_class(const priority_class_data& pc) noexcept {
     for (auto&& s : _streams) {
         s.fq.plug_class(pc.fq_class());
+    }
+}
+
+void io_queue::throttle_priority_class_group(unsigned group) noexcept {
+    for (auto&& s : _streams) {
+        s.fq.unplug_class_group(group);
+    }
+}
+
+void io_queue::unthrottle_priority_class_group(unsigned group) noexcept {
+    for (auto&& s : _streams) {
+        s.fq.plug_class_group(group);
     }
 }
 

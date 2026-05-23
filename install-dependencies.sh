@@ -44,6 +44,7 @@ debian_packages=(
     libpciaccess-dev
     libprotobuf-dev
     libsctp-dev
+    libssl-dev
     libtool
     liburing-dev
     libxml2-dev
@@ -96,6 +97,7 @@ redhat_packages=(
     meson
     numactl-devel
     openssl
+    openssl-devel
     protobuf-compiler
     protobuf-devel
     python3
@@ -236,7 +238,7 @@ opensuse_packages=(
 )
 
 case "$ID" in
-    ubuntu|debian|pop)
+    ubuntu|debian|pop|sparky)
         apt-get install -y "${debian_packages[@]}"
     ;;
     fedora)

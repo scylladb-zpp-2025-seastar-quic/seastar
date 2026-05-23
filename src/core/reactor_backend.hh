@@ -28,16 +28,20 @@
 #include <seastar/core/internal/poll.hh>
 #include <seastar/core/internal/linux-aio.hh>
 #include <seastar/core/cacheline.hh>
+#include <seastar/util/bool_class.hh>
 
-#ifndef SEASTAR_MODULE
 #include <fmt/ostream.h>
 #include <sys/time.h>
+#include <bitset>
 #include <thread>
 #include <stack>
 #include <boost/any.hpp>
 #include <boost/program_options.hpp>
 #include <boost/container/static_vector.hpp>
 
+
+#ifdef SEASTAR_DEBUG
+#define SEASTAR_IOCB_POOL_DEBUG
 #endif
 
 namespace seastar {
@@ -64,6 +68,11 @@ class aio_storage_context {
     class iocb_pool {
         alignas(cache_line_size) std::array<internal::linux_abi::iocb, max_aio> _all_iocbs;
         std::stack<internal::linux_abi::iocb*, boost::container::static_vector<internal::linux_abi::iocb*, max_aio>> _free_iocbs;
+#ifdef SEASTAR_IOCB_POOL_DEBUG
+        // Track which iocbs are currently allocated (not in free list)
+        // This helps detect double-free bugs
+        std::bitset<max_aio> _iocb_allocated;
+#endif
     public:
         iocb_pool();
         internal::linux_abi::iocb& get_one();
@@ -81,15 +90,14 @@ class aio_storage_context {
     pending_aio_retry_t _pending_aio_retry; // Pending retries iocbs
     pending_aio_retry_t _aio_retries;       // Currently retried iocbs
     future<> _pending_aio_retry_fut = make_ready_future<>();
+    bool _stopping = false;
     internal::linux_abi::io_event _ev_buffer[max_aio];
 
     bool need_to_retry() const noexcept {
         return !_pending_aio_retry.empty() || !_aio_retries.empty();
     }
 
-    bool retry_in_progress() const noexcept {
-        return !_pending_aio_retry_fut.available();
-    }
+    void reap_pending_retries();
 
 public:
     explicit aio_storage_context(reactor& r);
@@ -171,8 +179,17 @@ public:
 // file-descriptors (reactor_backend_epoll), one implementation based on
 // linux aio, and one implementation based on io_uring.
 class reactor_backend {
+protected:
+    using uses_blocking_io = bool_class<struct uses_blocking_io_tag>;
+    using supports_aio_fdatasync = bool_class<struct supports_aio_fdatasync_tag>;
+
+private:
+    const uses_blocking_io _blocking_io;
+    const supports_aio_fdatasync _aio_fdatasync;
+
 public:
     virtual ~reactor_backend() {};
+    virtual std::string_view get_backend_name() const = 0;
     // The methods below are used to communicate with the kernel.
     // reap_kernel_completions() will complete any previous async
     // work that is ready to consume.
@@ -202,13 +219,17 @@ public:
     virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) = 0;
     virtual future<temporary_buffer<char>> read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) = 0;
     virtual future<size_t> sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) = 0;
+    virtual future<size_t> writev(pollable_fd_state& fd, std::span<iovec> iovs) = 0;
 #if SEASTAR_API_LEVEL < 9
     virtual future<size_t> send(pollable_fd_state& fd, const void* buffer, size_t len) = 0;
 #endif
     virtual future<temporary_buffer<char>> recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba) = 0;
 
-    virtual bool do_blocking_io() const {
-        return false;
+    bool do_blocking_io() const noexcept {
+        return bool(_blocking_io);
+    }
+    bool have_aio_fdatasync() const noexcept {
+        return bool(_aio_fdatasync);
     }
     virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) = 0;
     virtual void start_tick() = 0;
@@ -219,6 +240,12 @@ public:
     virtual void start_handling_signal() = 0;
 
     virtual pollable_fd_state_ptr make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) = 0;
+
+protected:
+    reactor_backend(uses_blocking_io blocking_io, supports_aio_fdatasync aio_fdatasync)
+        : _blocking_io(blocking_io)
+        , _aio_fdatasync(aio_fdatasync)
+    {}
 };
 
 // reactor backend using file-descriptor & epoll, suitable for running on
@@ -238,6 +265,7 @@ class reactor_backend_epoll : public reactor_backend {
     // Only one of the two is active at any time.
     file_desc _steady_clock_timer_reactor_thread;
     file_desc _steady_clock_timer_timer_thread;
+    std::atomic<bool> _dying{false};
 private:
     file_desc _epollfd;
     void task_quota_timer_thread_fn();
@@ -253,6 +281,7 @@ public:
     explicit reactor_backend_epoll(reactor& r);
     virtual ~reactor_backend_epoll() override;
 
+    virtual std::string_view get_backend_name() const override;
     virtual bool reap_kernel_completions() override;
     virtual bool kernel_submit_work() override;
     virtual bool kernel_events_can_sleep() const override;
@@ -270,6 +299,7 @@ public:
     virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
     virtual future<temporary_buffer<char>> read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) override;
     virtual future<size_t> sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) override;
+    virtual future<size_t> writev(pollable_fd_state& fd, std::span<iovec> iovs) override;
 #if SEASTAR_API_LEVEL < 9
     virtual future<size_t> send(pollable_fd_state& fd, const void* buffer, size_t len) override;
 #endif
@@ -303,6 +333,7 @@ class reactor_backend_aio : public reactor_backend {
 public:
     explicit reactor_backend_aio(reactor& r);
 
+    virtual std::string_view get_backend_name() const override;
     virtual bool reap_kernel_completions() override;
     virtual bool kernel_submit_work() override;
     virtual bool kernel_events_can_sleep() const override;
@@ -320,6 +351,7 @@ public:
     virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
     virtual future<temporary_buffer<char>> read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) override;
     virtual future<size_t> sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) override;
+    virtual future<size_t> writev(pollable_fd_state& fd, std::span<iovec> iovs) override;
 #if SEASTAR_API_LEVEL < 9
     virtual future<size_t> send(pollable_fd_state& fd, const void* buffer, size_t len) override;
 #endif

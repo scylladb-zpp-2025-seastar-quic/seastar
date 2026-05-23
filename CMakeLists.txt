@@ -182,11 +182,45 @@ mark_as_advanced (
     CMAKE_EXE_LINKER_FLAGS_SANITIZE
     CMAKE_SHARED_LINKER_FLAGS_SANITIZE)
 
+set (CMAKE_CXX_FLAGS_FUZZ
+  "-O1 -g"
+  CACHE
+  STRING
+  "Flags used by the C++ compiler during fuzz builds."
+  FORCE)
+
+set (CMAKE_C_FLAGS_FUZZ
+  "-O1 -g"
+  CACHE
+  STRING
+  "Flags used by the C compiler during fuzz builds."
+  FORCE)
+
+set (CMAKE_EXE_LINKER_FLAGS_FUZZ
+  ""
+  CACHE
+  STRING
+  "Flags used for linking binaries during fuzz builds."
+  FORCE)
+
+set (CMAKE_SHARED_LINKER_FLAGS_FUZZ
+  ""
+  CACHE
+  STRING
+  "Flags used by the shared libraries linker during fuzz builds."
+  FORCE)
+
+mark_as_advanced (
+    CMAKE_CXX_FLAGS_FUZZ
+    CMAKE_C_FLAGS_FUZZ
+    CMAKE_EXE_LINKER_FLAGS_FUZZ
+    CMAKE_SHARED_LINKER_FLAGS_FUZZ)
+
 set (CMAKE_BUILD_TYPE
   "${CMAKE_BUILD_TYPE}"
   CACHE
   STRING
-  "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel Dev Sanitize."
+  "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel Dev Sanitize Fuzz."
   FORCE)
 
 if (NOT CMAKE_BUILD_TYPE)
@@ -227,6 +261,12 @@ set (Seastar_CXX_FLAGS
   CACHE
   STRING
   "Semicolon-separated list of extra compilation flags for Seastar itself.")
+
+set (Seastar_SOURCE_SUBDIR
+  ""
+  CACHE
+  STRING
+  "When non-empty, add -ffile-prefix-map rules so that gdb can resolve Seastar sources. Set to the path of the Seastar source tree relative to the consumer project root (e.g. 'seastar/'). The rules map CMAKE_CURRENT_BINARY_DIR to '.' and paths under it to this subdir, and are appended after Seastar_CXX_FLAGS so they take precedence over any broader -ffile-prefix-map rule.")
 
 option (Seastar_DEMOS
   "Enable demonstration targets."
@@ -486,6 +526,13 @@ seastar_generate_protobuf (
   IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/metrics2.proto
   OUT_DIR ${Seastar_GEN_BINARY_DIR}/src/proto)
 
+set_option_if_package_is_found (Seastar_GNUTLS GnuTLS)
+set_option_if_package_is_found (Seastar_OPENSSL OpenSSL)
+
+if (NOT Seastar_GNUTLS AND NOT Seastar_OPENSSL)
+  message (FATAL_ERROR "At least one TLS/crypto backend is required. Install GnuTLS or OpenSSL development packages.")
+endif ()
+
 add_library (seastar
   ${http_chunk_parsers_file}
   ${http_request_parser_file}
@@ -602,6 +649,7 @@ add_library (seastar
   include/seastar/http/short_streams.hh
   include/seastar/http/transformers.hh
   include/seastar/http/client.hh
+  include/seastar/core/internal/md5.hh
   include/seastar/json/formatter.hh
   include/seastar/json/json_elements.hh
   include/seastar/net/api.hh
@@ -666,6 +714,7 @@ add_library (seastar
   include/seastar/util/variant_utils.hh
   include/seastar/util/closeable.hh
   include/seastar/util/short_streams.hh
+  include/seastar/websocket/client.hh
   include/seastar/websocket/common.hh
   include/seastar/websocket/server.hh
   include/seastar/quic/quic.hh
@@ -710,6 +759,7 @@ add_library (seastar
   src/core/io_queue.cc
   src/core/semaphore.cc
   src/core/condition-variable.cc
+  src/core/crypto.cc
   src/http/api_docs.cc
   src/http/common.cc
   src/http/file_handler.cc
@@ -744,7 +794,7 @@ add_library (seastar
   src/net/socket_address.cc
   src/net/stack.cc
   src/net/tcp.cc
-  src/net/tls.cc
+  src/net/tls-impl.cc
   src/net/udp.cc
   src/net/unix_address.cc
   src/net/virtio.cc
@@ -762,8 +812,10 @@ add_library (seastar
   src/util/read_first_line.cc
   src/util/tmp_file.cc
   src/util/short_streams.cc
+  src/util/build_id.cc
   src/websocket/parser.cc
   src/websocket/common.cc
+  src/websocket/client.cc
   src/websocket/server.cc
   src/quic/quic_command_runtime.cc
   src/quic/quic_common.cc
@@ -773,6 +825,22 @@ add_library (seastar
   src/quic/quic_error.cc
   )
 
+if (Seastar_GNUTLS)
+  target_sources(seastar
+    PRIVATE
+      src/net/tls_gnutls.cc
+      src/core/crypto_gnutls.cc
+  )
+endif ()
+
+if (Seastar_OPENSSL)
+  target_sources(seastar
+    PRIVATE
+      src/net/tls_openssl.cc
+      src/core/crypto_openssl.cc
+  )
+endif ()
+
 if (Seastar_MODULE)
   target_sources(seastar
     PUBLIC
@@ -781,6 +849,12 @@ if (Seastar_MODULE)
       FILES
         src/seastar.cppm
   )
+  # CMake passes both --precompile and -c when building BMIs with Clang;
+  # --precompile supersedes -c, making it unused and triggering
+  # -Wunused-command-line-argument.  Remove -Werror for module interface
+  # units so that the spurious warning does not become a hard error.
+  # see https://gitlab.kitware.com/cmake/cmake/-/work_items/27794
+  set_source_files_properties(src/seastar.cppm PROPERTIES COMPILE_OPTIONS "-Wno-error=unused-command-line-argument")
 endif ()
 
 add_library (Seastar::seastar ALIAS seastar)
@@ -883,7 +957,7 @@ endif ()
 
 include (TriStateOption)
 tri_state_option (${Seastar_SANITIZE}
-  DEFAULT_BUILD_TYPES "Debug" "Sanitize"
+  DEFAULT_BUILD_TYPES "Debug" "Sanitize" "Fuzz"
   CONDITION condition)
 if (condition)
   if (NOT Sanitizers_FOUND)
@@ -895,6 +969,13 @@ if (condition)
       $<${condition}:Sanitizers::address>
       $<${condition}:Sanitizers::undefined_behavior>
       $<${condition}:Sanitizers::vptr>)
+endif ()
+
+# Link with fuzzer instrumentation for Fuzz builds
+if (CMAKE_BUILD_TYPE STREQUAL "Fuzz")
+  find_package (Sanitizers REQUIRED COMPONENTS fuzzer)
+  target_link_libraries (seastar
+    PUBLIC Sanitizers::fuzzer)
 endif ()
 
 # We only need valgrind to find uninitialized memory uses, so disable
@@ -984,6 +1065,25 @@ if (Seastar_CXX_FLAGS)
   list (APPEND Seastar_PRIVATE_CXX_FLAGS ${Seastar_CXX_FLAGS})
 endif ()
 
+# When the consumer specifies Seastar_SOURCE_SUBDIR, add -ffile-prefix-map
+# rules so that gdb can resolve Seastar sources correctly.
+#
+# Without these rules, a broader -ffile-prefix-map=<project_root>=. (typically
+# passed via Seastar_CXX_FLAGS) maps CMAKE_CURRENT_BINARY_DIR to a relative
+# build path (e.g. ./build/dev/seastar).  GDB then concatenates that with the
+# source-relative DW_AT_name and looks for a non-existent path like
+# ./build/dev/seastar/./seastar/src/core/reactor_backend.cc.
+#
+# Rule 1 maps the build dir itself to ".", fixing DW_AT_comp_dir.
+# Rule 2 maps paths *under* the build dir (generated sources) to the subdir.
+# Both rules must appear AFTER Seastar_CXX_FLAGS because both GCC and clang
+# apply the last matching -ffile-prefix-map rule.
+if (Seastar_SOURCE_SUBDIR)
+  list (APPEND Seastar_PRIVATE_CXX_FLAGS
+    -ffile-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=.
+    -ffile-prefix-map=${CMAKE_CURRENT_BINARY_DIR}/=${Seastar_SOURCE_SUBDIR})
+endif ()
+
 # When using split dwarf --gdb-index is effectively required since
 # otherwise gdb is just too slow. We also want to use split dwarf in
 # as many compilation units as possible.  So while these flags don't
@@ -1034,6 +1134,24 @@ if (Seastar_HWLOC)
     PRIVATE hwloc::hwloc)
 endif ()
 
+if (Seastar_GNUTLS)
+  if (NOT GnuTLS_FOUND)
+    message (FATAL_ERROR "Seastar_GNUTLS is enabled but GnuTLS was not found!")
+  endif ()
+  list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_GNUTLS)
+  target_link_libraries (seastar
+    PRIVATE GnuTLS::gnutls)
+endif ()
+
+if (Seastar_OPENSSL)
+  if (NOT OpenSSL_FOUND)
+    message (FATAL_ERROR "Seastar_OPENSSL is enabled but OpenSSL was not found!")
+  endif ()
+  list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_OPENSSL)
+  target_link_libraries (seastar
+    PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif ()
+
 set_option_if_package_is_found (Seastar_IO_URING LibUring)
 if (Seastar_IO_URING)
   list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_URING)
@@ -1076,11 +1194,11 @@ foreach (definition
     SEASTAR_SHUFFLE_TASK_QUEUE)
   target_compile_definitions (seastar
     PUBLIC
-      $<$<IN_LIST:$<CONFIG>,Debug;Sanitize>:${definition}>)
+      $<$<IN_LIST:$<CONFIG>,Debug;Sanitize;Fuzz>:${definition}>)
 endforeach ()
 
 tri_state_option (${Seastar_DEBUG_SHARED_PTR}
-  DEFAULT_BUILD_TYPES "Debug" "Sanitize"
+  DEFAULT_BUILD_TYPES "Debug" "Sanitize" "Fuzz"
   CONDITION condition)
 if (condition)
   target_compile_definitions (seastar
@@ -1089,7 +1207,7 @@ if (condition)
 endif ()
 
 tri_state_option (${Seastar_DEBUG_SHARED_PTR}
-  DEFAULT_BUILD_TYPES "Debug" "Sanitize"
+  DEFAULT_BUILD_TYPES "Debug" "Sanitize" "Fuzz"
   CONDITION condition)
 if (condition)
   target_compile_definitions (seastar
@@ -1100,7 +1218,7 @@ endif ()
 include (CheckLibc)
 
 tri_state_option (${Seastar_STACK_GUARDS}
-  DEFAULT_BUILD_TYPES "Debug" "Sanitize" "Dev"
+  DEFAULT_BUILD_TYPES "Debug" "Sanitize" "Dev" "Fuzz"
   CONDITION condition)
 if (condition)
   # check for -fstack-clash-protection together with -Werror, because

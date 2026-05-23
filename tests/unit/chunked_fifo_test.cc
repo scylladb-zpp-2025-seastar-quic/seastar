@@ -285,7 +285,7 @@ BOOST_AUTO_TEST_CASE(chunked_fifo_copy_move_test) {
         BOOST_REQUIRE_EQUAL(calls.ccons_called, 5);
         BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
         BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
-    } 
+    }
 
     BOOST_REQUIRE_EQUAL(calls.dtor_called, 5);
     fifo1.clear();
@@ -295,13 +295,13 @@ BOOST_AUTO_TEST_CASE(chunked_fifo_copy_move_test) {
 
     {
         // move ctor, no element ctors are called at all
-        auto fifox{std::move(fifo1)}; 
+        auto fifox{std::move(fifo1)};
 
         BOOST_REQUIRE_EQUAL(calls.cons_called, 5);
         BOOST_REQUIRE_EQUAL(calls.ccons_called, 0);
         BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
         BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
-    } 
+    }
 
     fill(5, fifo1);
 
@@ -643,4 +643,18 @@ BOOST_AUTO_TEST_CASE(chunked_fifo_const_iterator) {
         reference.pop_front();
         BOOST_REQUIRE(std::equal(fifo.cbegin(), fifo.cend(), reference.cbegin(), reference.cend()));
     }
+}
+
+BOOST_AUTO_TEST_CASE(chunked_fifo_no_free_chunks_retained) {
+    chunked_fifo<int, 1, 0> fifo;
+    fifo.push_back(42);
+    BOOST_REQUIRE_EQUAL(fifo.nfree_chunks(), 0);
+    fifo.pop_front();
+    BOOST_REQUIRE_EQUAL(fifo.nfree_chunks(), 0);
+
+    chunked_fifo<int, 1, 1> fifo_1;
+    fifo_1.push_back(42);
+    BOOST_REQUIRE_EQUAL(fifo_1.nfree_chunks(), 0);
+    fifo_1.pop_front();
+    BOOST_REQUIRE_EQUAL(fifo_1.nfree_chunks(), 1);
 }

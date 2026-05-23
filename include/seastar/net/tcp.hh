@@ -26,11 +26,12 @@
 #include <functional>
 #include <deque>
 #include <chrono>
+#include <cstring>
 #include <random>
 #include <span>
 #include <stdexcept>
 #include <system_error>
-#include <gnutls/crypto.h>
+#include <seastar/core/internal/md5.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/semaphore.hh>
@@ -832,7 +833,7 @@ auto tcp<InetTraits>::connect(socket_address sa) -> connection {
     auto dst_ip = ipv4_address(sa);
     auto dst_port = net::ntoh(sa.u.in.sin_port);
 
-    if (smp::count > 1) {
+    if (this_smp_shard_count() > 1) {
         do {
             id = connid{src_ip, dst_ip, _port_dist(_e), dst_port};
         } while (_inet._inet.netif()->hash2cpu(id.hash(_inet._inet.netif()->rss_key())) != this_shard_id()
@@ -2069,19 +2070,16 @@ tcp_seq tcp<InetTraits>::tcb::get_isn() {
     //   ISN = M + F(localip, localport, remoteip, remoteport, secretkey)
     //   M is the 4 microsecond timer
     using namespace std::chrono;
-    uint32_t hash[4];
-    hash[0] = _local_ip.ip;
-    hash[1] = _foreign_ip.ip;
-    hash[2] = (_local_port << 16) + _foreign_port;
-    gnutls_hash_hd_t md5_hash_handle;
-    // GnuTLS digests do not init at all, so this should never fail.
-    gnutls_hash_init(&md5_hash_handle, GNUTLS_DIG_MD5);
-    gnutls_hash(md5_hash_handle, hash, 3 * sizeof(hash[0]));
-    gnutls_hash(md5_hash_handle, _isn_secret.key, sizeof(_isn_secret.key));
-    // reuse "hash" for the output of digest
-    SEASTAR_ASSERT(sizeof(hash) == gnutls_hash_get_len(GNUTLS_DIG_MD5));
-    gnutls_hash_deinit(md5_hash_handle, hash);
-    auto seq = hash[0];
+    uint32_t conn_info[3];
+    conn_info[0] = _local_ip.ip;
+    conn_info[1] = _foreign_ip.ip;
+    conn_info[2] = (_local_port << 16) + _foreign_port;
+    auto md5 = internal::crypto::make_md5_hasher();
+    md5.update(conn_info, sizeof(conn_info));
+    md5.update(_isn_secret.key, sizeof(_isn_secret.key));
+    auto digest = md5.finalize();
+    uint32_t seq;
+    std::memcpy(&seq, digest.data.data(), sizeof(seq));
     auto m = duration_cast<microseconds>(clock_type::now().time_since_epoch());
     seq += m.count() / 4;
     return make_seq(seq);

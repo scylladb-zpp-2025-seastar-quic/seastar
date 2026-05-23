@@ -20,9 +20,6 @@
  */
 
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <chrono>
 #include <unordered_set>
@@ -32,16 +29,12 @@ module;
 #include <sys/stat.h>
 #include <yaml-cpp/yaml.h>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/disk_params.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/smp_options.hh>
 #include <seastar/util/conversions.hh>
 
-#endif
 
 using namespace std::chrono_literals;
 
@@ -86,7 +79,11 @@ extern logger seastar_logger;
 namespace internal {
 
 void disk_config_params::parse_config(const smp_options& smp_opts, const reactor_options& reactor_opts) {
-    seastar_logger.debug("smp::count: {}", smp::count);
+    // FIXME: parse_config() is called from smp::configure() before _this_smp
+    // is set, so the shard count is not available via this_smp(). The old code
+    // read smp::count which was already set at this point, but that global is
+    // being removed. For now this debug log just prints 0.
+    seastar_logger.debug("shard_count: {}", 0);
     _latency_goal = std::chrono::duration_cast<std::chrono::duration<double>>(latency_goal_opt(reactor_opts) * 1ms);
     seastar_logger.debug("latency_goal: {}", latency_goal().count());
     _flow_ratio_backpressure_threshold = reactor_opts.io_flow_ratio_threshold.get_value();

@@ -30,7 +30,7 @@ include(CMakeParseArguments)
 set (Boost_NO_BOOST_CMAKE ON)
 
 # for including the fix of https://github.com/boostorg/test/pull/252
-set (_seastar_boost_version 1.73.0)
+set (_seastar_boost_version 1.79.0)
 
 # This is the minimum version of Boost we need the CMake-bundled `FindBoost.cmake` to know about.
 find_package (Boost ${_seastar_boost_version})
@@ -88,7 +88,8 @@ macro (seastar_find_dependencies)
   endif()
   seastar_find_dep (fmt 8.1.1 REQUIRED)
   seastar_find_dep (lz4 1.7.3 REQUIRED)
-  seastar_find_dep (GnuTLS 3.3.26 REQUIRED)
+  seastar_find_dep (GnuTLS 3.7.4)
+  seastar_find_dep (OpenSSL 3.0)
   if (Seastar_IO_URING)
     seastar_find_dep (LibUring 2.0 REQUIRED)
   endif()

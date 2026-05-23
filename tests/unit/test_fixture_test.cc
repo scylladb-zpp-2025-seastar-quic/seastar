@@ -22,6 +22,7 @@
 
 #include <boost/test/execution_monitor.hpp>
 
+#include <seastar/core/sleep.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/test_fixture.hh>
 
@@ -65,6 +66,8 @@ struct SyncTestFixture {
     }
 };
 
+using namespace std::chrono_literals;
+
 SEASTAR_FIXTURE_TEST_CASE(test_single_test_fixture_void_ret, SyncTestFixture) {
     BOOST_REQUIRE(inited);
     return make_ready_future<>();
@@ -72,15 +75,38 @@ SEASTAR_FIXTURE_TEST_CASE(test_single_test_fixture_void_ret, SyncTestFixture) {
 
 SEASTAR_FIXTURE_THREAD_TEST_CASE(test_single_thread_test_fixture_void_ret, SyncTestFixture) {
     BOOST_REQUIRE(inited);
+    seastar::sleep(1ms).get();
 }
 
-// having these thread local subtly verifies that the fixture 
+struct ThreadTestFixture {
+    bool inited = false;
+    bool destroyed = false;
+
+    ~ThreadTestFixture() {
+        BOOST_REQUIRE(destroyed);
+    }
+    void setup() {
+        seastar::sleep(1ms).get();
+        inited = true;
+    }
+    void teardown() {
+        seastar::sleep(1ms).get();
+        destroyed = true;
+    }
+};
+
+SEASTAR_FIXTURE_THREAD_TEST_CASE(test_single_thread_test_fixture_thread_fixt, ThreadTestFixture) {
+    BOOST_REQUIRE(inited);
+    seastar::sleep(1ms).get();
+}
+
+// having these thread local subtly verifies that the fixture
 // is run on the proper shard.
 static thread_local int num_shared_test_fixts_setup = 0;
 static thread_local int num_shared_test_fixts_teardown = 0;
 static thread_local std::string shared_test_fixts_string;
 
-struct SharedTestFixture { 
+struct SharedTestFixture {
     SharedTestFixture()
     {}
     SharedTestFixture(const std::string& s)
@@ -98,7 +124,7 @@ struct SharedTestFixture {
     }
 };
 
-BOOST_AUTO_TEST_SUITE(shared_fixtures, 
+BOOST_AUTO_TEST_SUITE(shared_fixtures,
     *async_fixture<SharedTestFixture>()
     *async_fixture<SharedTestFixture>("los lobos")
     *async_fixture(

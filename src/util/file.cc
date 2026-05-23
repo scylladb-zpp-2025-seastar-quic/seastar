@@ -20,9 +20,6 @@
  * Copyright 2020 ScyllaDB
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <cstdint>
 #include <list>
@@ -34,14 +31,10 @@ module;
 #include <coroutine>
 #include <sys/statvfs.h>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/util/file.hh>
-#endif
 
 namespace seastar {
 
@@ -111,8 +104,8 @@ future<> remove_file(std::string_view pathname) noexcept {
     return engine().remove_file(pathname);
 }
 
-future<> rename_file(std::string_view old_pathname, std::string_view new_pathname) noexcept {
-    return engine().rename_file(old_pathname, new_pathname);
+future<> rename_file(std::string_view old_pathname, std::string_view new_pathname, rename_flags flags) noexcept {
+    return engine().rename_file(old_pathname, new_pathname, flags);
 }
 
 future<fs_type> file_system_at(std::string_view name) noexcept {

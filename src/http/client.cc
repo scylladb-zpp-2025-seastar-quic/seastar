@@ -19,21 +19,14 @@
  * Copyright (C) 2022 Scylladb, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <cassert>
 #include <concepts>
-#include <gnutls/gnutls.h>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <utility>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/loop.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/reactor.hh>
@@ -45,14 +38,13 @@ module seastar;
 #include <seastar/util/defer.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/util/string_utils.hh>
-#endif
 
 namespace seastar {
 logger http_log("http");
 namespace http {
 namespace internal {
 
-client_ref::client_ref(http::experimental::client* c) noexcept : _c(c) {
+client_ref::client_ref(http::client* c) noexcept : _c(c) {
     _c->_nr_connections++;
 }
 
@@ -64,8 +56,6 @@ client_ref::~client_ref() {
 }
 
 }
-
-namespace experimental {
 
 connection::connection(connected_socket&& fd, internal::client_ref cr)
         : _fd(std::move(fd))
@@ -252,7 +242,9 @@ future<client::connection_ptr> client::get_connection(abort_source* as) {
 
     if (_nr_connections >= _max_connections) {
         auto sub = as ? as->subscribe([this] () noexcept { _wait_con.broadcast(); }) : std::nullopt;
+        _requests_queued++;
         return _wait_con.wait().then([this, as, sub = std::move(sub)] {
+            _requests_queued--;
             if (as != nullptr && as->abort_requested()) {
                 return make_exception_future<client::connection_ptr>(as->abort_requested_exception_ptr());
             }
@@ -260,6 +252,7 @@ future<client::connection_ptr> client::get_connection(abort_source* as) {
         });
     }
 
+    _requests_queued.checkpoint();
     return make_connection(as);
 }
 
@@ -468,6 +461,5 @@ future<> client::close() {
     });
 }
 
-} // experimental namespace
 } // http namespace
 } // seastar namespace

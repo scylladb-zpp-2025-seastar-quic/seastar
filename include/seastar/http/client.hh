@@ -28,6 +28,7 @@
 #include <seastar/http/retry_strategy.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/util/integrated-length.hh>
 
 namespace bi = boost::intrusive;
 
@@ -38,24 +39,22 @@ namespace tls { class certificate_credentials; }
 
 namespace http {
 
-namespace experimental { class client; }
+class client;
 struct request;
 struct reply;
 
 namespace internal {
 
 class client_ref {
-    http::experimental::client* _c;
+    http::client* _c;
 public:
-    client_ref(http::experimental::client* c) noexcept;
+    client_ref(http::client* c) noexcept;
     ~client_ref();
     client_ref(client_ref&& o) noexcept : _c(std::exchange(o._c, nullptr)) {}
     client_ref(const client_ref&) = delete;
 };
 
 }
-
-namespace experimental {
 
 /**
  * \brief Class connection represents an HTTP connection over a given transport
@@ -162,6 +161,7 @@ private:
     unsigned long _total_new_connections = 0;
     std::unique_ptr<retry_strategy> _retry_strategy;
     condition_variable _wait_con;
+    util::integrated_length<unsigned, lowres_clock, std::chrono::microseconds> _requests_queued;
     connections_list_t _pool;
 
     using connection_ptr = seastar::shared_ptr<connection>;
@@ -361,9 +361,21 @@ public:
     unsigned long total_new_connections_nr() const noexcept {
         return _total_new_connections;
     }
-};
 
-} // experimental namespace
+    /**
+     * \brief Returns the integrated_length<> for the number of requests waiting for connection
+     *
+     * The caller may choose to
+     * - export the immediate .value() as GAUGE metrics or
+     * - export the .integral() value as COUNTER metrics
+     *
+     * The latter option is preferred, when rate()-d it provides an average over scrape time
+     * value of the queue length.
+     */
+    const auto& integrated_requests_queued() const noexcept {
+        return _requests_queued;
+    }
+};
 
 } // http namespace
 

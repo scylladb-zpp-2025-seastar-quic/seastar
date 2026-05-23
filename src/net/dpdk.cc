@@ -20,9 +20,6 @@
  */
 #ifdef SEASTAR_HAVE_DPDK
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <cinttypes>
 #include <atomic>
@@ -44,9 +41,6 @@ module;
 
 #include <boost/preprocessor.hpp>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/posix.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/net/virtio-interface.hh>
@@ -69,7 +63,6 @@ module seastar;
 #include <seastar/net/toeplitz.hh>
 #include <seastar/net/native-stack.hh>
 #include "core/vla.hh"
-#endif
 
 #if RTE_VERSION <= RTE_VERSION_NUM(2,0,0,16)
 
@@ -1516,7 +1509,7 @@ int dpdk_device::init_port_start()
     // Set RSS mode: enable RSS if seastar is configured with more than 1 CPU.
     // Even if port has a single queue we still want the RSS feature to be
     // available in order to make HW calculate RSS hash for us.
-    if (smp::count > 1) {
+    if (this_smp_shard_count() > 1) {
         if (_dev_info.hash_key_size == 40) {
             _rss_key = default_rsskey_40bytes;
         } else if (_dev_info.hash_key_size == 52) {
@@ -2291,22 +2284,15 @@ std::unique_ptr<net::device> create_dpdk_net_device(
 std::unique_ptr<net::device> create_dpdk_net_device(
                                     const hw_config& hw_cfg)
 {
-    return create_dpdk_net_device(*hw_cfg.port_index, smp::count, hw_cfg.lro, hw_cfg.hw_fc);
+    return create_dpdk_net_device(*hw_cfg.port_index, this_smp_shard_count(), hw_cfg.lro, hw_cfg.hw_fc);
 }
 
 }
 
 #else
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/net/dpdk.hh>
-#endif
 
 #endif // SEASTAR_HAVE_DPDK
 

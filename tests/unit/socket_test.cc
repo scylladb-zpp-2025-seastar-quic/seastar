@@ -39,6 +39,7 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/posix-stack.hh>
+#include <stdexcept>
 
 #include <optional>
 #include <tuple>
@@ -96,24 +97,17 @@ SEASTAR_TEST_CASE(socket_skip_test) {
         lo.reuse_address = true;
         server_socket ss = seastar::listen(ipv4_addr("127.0.0.1", 1234), lo);
 
-        abort_source as;
-        auto client = async([&as] {
+        auto client = async([] {
             connected_socket socket = connect(ipv4_addr("127.0.0.1", 1234)).get();
             socket.output().write("abc").get();
             socket.shutdown_output();
-            try {
-                sleep_abortable(std::chrono::seconds(10), as).get();
-            } catch (const sleep_aborted&) {
-                // expected
-                return;
-            }
-            SEASTAR_ASSERT(!"Skipping data from socket is likely stuck");
         });
 
         accept_result accepted = ss.accept().get();
         input_stream<char> input = accepted.connection.input();
-        input.skip(16).get();
-        as.request_abort();
+        // The client sends 3 bytes and shuts down, so skipping 16 bytes
+        // hits EOF and must throw.
+        BOOST_REQUIRE_THROW(input.skip(16).get(), std::runtime_error);
         client.get();
     });
 }
@@ -274,12 +268,14 @@ SEASTAR_THREAD_TEST_CASE(socket_accept_abort_test) {
     ipv4_addr addr("127.0.0.1", 3174);
     server_socket ss = seastar::listen(addr, listen_options{ .reuse_address = true });
     bool too_late = false;
-    auto f = ss.accept().then([] (auto ar) {
-        BOOST_FAIL("Accept didn't resolve into exception");
-    }).handle_exception_type([&too_late] (std::system_error e) {
-        BOOST_REQUIRE(!too_late);
-        BOOST_REQUIRE_EQUAL(e.code(), std::error_code(ECONNABORTED, std::system_category()));
-        return make_ready_future<>();
+    auto f = async([&] {
+        try {
+            ss.accept().get();
+            BOOST_FAIL("Accept didn't resolve into exception");
+        } catch (const std::system_error& e) {
+            BOOST_REQUIRE(!too_late);
+            BOOST_REQUIRE_EQUAL(e.code(), std::error_code(ECONNABORTED, std::system_category()));
+        }
     });
 
     auto abort = sleep(std::chrono::milliseconds(500)).then([&ss] {
@@ -419,7 +415,7 @@ test_load_balancing_algorithm_port(socket_address listen_addr, bool proxy_protoc
     };
     auto server = sharded<shard_number_server>();
     server.start(listen_addr, lo).get();
-    auto smp_count = smp::count;
+    auto smp_count = this_smp_shard_count();
     promise<> client_done;
     auto client = std::async(std::launch::async, [&] {
         auto r = client_results{};

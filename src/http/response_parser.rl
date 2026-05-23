@@ -21,10 +21,8 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
 #include <memory>
 #include <unordered_map>
-#endif
 
 #include <seastar/core/ragel.hh>
 #include <seastar/http/reply.hh>
@@ -37,6 +35,9 @@ namespace seastar {
 %%{
 
 access _fsm_;
+# alphtype + getkey: workaround for #3413
+alphtype unsigned char;
+getkey ((unsigned char)(*p));
 
 action mark {
     g.mark_start(p);
@@ -174,7 +175,7 @@ public:
             size_t available = static_cast<size_t>(pe - p);
             size_t context_len = std::min(available, 32ul);
             sstring encountered(p, context_len);
-            _error_message = sstring("Parsing error at offset ") + std::to_string(offset) + ": encountered \"" + encountered +
+            _error_message = sstring("Parsing error at offset ") + to_sstring(offset) + ": encountered \"" + encountered +
                                          "\". Expected valid HTTP response header format (e.g., a complete start line with HTTP version, three-digit status code, header "
                                          "fields, and a terminating CRLF).";
         } else {

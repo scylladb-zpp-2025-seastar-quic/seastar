@@ -2,11 +2,14 @@
  * Copyright 2021 ScyllaDB
  */
 
+#include <seastar/core/future.hh>
 #include <seastar/websocket/server.hh>
+#include <seastar/websocket/client.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/http/response_parser.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/memory-data-source.hh>
 #include "loopback_socket.hh"
 
 using namespace seastar;
@@ -182,21 +185,6 @@ SEASTAR_TEST_CASE(test_websocket_handler_registration_no_subprotocol) {
 }
 
 // Simple wrapper to help create a testable input_stream.
-class test_source_impl : public data_source_impl {
-    std::vector<temporary_buffer<char>> _bufs{};
-    size_t _idx = 0;
-public:
-    void push_back(std::string s) {
-        auto buf = temporary_buffer<char>::copy_of(s);
-        _bufs.emplace_back(std::move(buf));
-    }
-    virtual future<temporary_buffer<char>> get() override {
-        if (_idx < _bufs.size()) {
-            return make_ready_future<temporary_buffer<char>>(_bufs[_idx++].share());
-        }
-        return make_ready_future<temporary_buffer<char>>(temporary_buffer<char>{});
-    }
-};
 
 SEASTAR_TEST_CASE(test_websocket_parser_split) {
     return seastar::async([] {
@@ -215,16 +203,16 @@ SEASTAR_TEST_CASE(test_websocket_parser_split) {
         for (unsigned split_i = 0; split_i < ws_frames.size() - 1; ++split_i) {
             websocket::websocket_parser parser;
 
-            auto source = std::make_unique<test_source_impl>();
+            auto bufs = std::vector<temporary_buffer<char>>{};
 
             if (split_i == 0) {
-                source->push_back(ws_frames);
+                bufs.push_back(temporary_buffer<char>::copy_of(ws_frames));
             } else {
-                source->push_back(ws_frames.substr(0, split_i));
-                source->push_back(ws_frames.substr(split_i));
+                bufs.push_back(temporary_buffer<char>::copy_of(ws_frames.substr(0, split_i)));
+                bufs.push_back(temporary_buffer<char>::copy_of(ws_frames.substr(split_i)));
             }
 
-            input_stream<char> in{data_source{std::move(source)}};
+            input_stream<char> in = util::as_input_stream(std::move(bufs));
 
             std::vector<sstring> results;
 
@@ -250,4 +238,65 @@ SEASTAR_TEST_CASE(test_websocket_parser_split) {
             BOOST_REQUIRE_EQUAL(results, expected);
         }
     });
+}
+
+SEASTAR_TEST_CASE(test_websocket_client_server) {
+    loopback_connection_factory factory;
+    loopback_socket_impl lsi(factory);
+
+    // Setup server side
+    websocket::server ws;
+    ws.register_handler("echo", [] (input_stream<char>& in,
+                    output_stream<char>& out) -> future<> {
+        while (true) {
+            auto f = co_await in.read();
+            if (f.empty()) {
+                break;
+            }
+
+            co_await out.write(std::move(f));
+            co_await out.flush();
+        }
+    });
+
+    auto acceptor = factory.get_server_socket().accept();
+    auto connector = lsi.connect(socket_address(), socket_address());
+
+    // Server side
+    connected_socket server_sock = (co_await std::move(acceptor)).connection;
+    websocket::server_connection server_conn(ws, std::move(server_sock));
+    auto serve = server_conn.process();
+
+    // Client side
+    connected_socket client_sock = co_await std::move(connector);
+
+    sstring received_data;
+    promise<> client_done;
+
+    websocket::client_connection client_conn(std::move(client_sock), "/", "localhost",
+        "echo",
+        [&received_data, &client_done] (input_stream<char>& in, output_stream<char>& out) -> future<> {
+            co_await out.write("hello");
+            co_await out.flush();
+
+            auto buf = co_await in.read();
+            received_data = sstring(buf.get(), buf.size());
+
+            co_await out.close();
+            client_done.set_value();
+        });
+
+    co_await client_conn.handshake();
+    auto client_process = client_conn.process().handle_exception(
+        [] (std::exception_ptr) {});
+
+    co_await client_done.get_future();
+
+    BOOST_REQUIRE_EQUAL(received_data, "hello");
+
+    // Shut down cleanly: close client first (sends CLOSE frame), then server
+    co_await client_conn.close();
+    co_await std::move(client_process);
+    co_await server_conn.close();
+    co_await std::move(serve);
 }

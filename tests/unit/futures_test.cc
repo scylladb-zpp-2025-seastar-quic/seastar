@@ -21,10 +21,12 @@
 
 #include <boost/test/tools/old/interface.hpp>
 #include <cstddef>
+#include <expected>
 #include <forward_list>
 #include <iterator>
 #include <ranges>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 #include <seastar/testing/test_case.hh>
@@ -58,6 +60,7 @@
 #include <seastar/core/internal/api-level.hh>
 #include <unistd.h>
 
+#include "conversion_test_types.hh"
 #include "expected_exception.hh"
 
 using namespace seastar;
@@ -170,6 +173,7 @@ SEASTAR_TEST_CASE(test_reference) {
     return make_ready_future<>();
 }
 
+#if SEASTAR_API_LEVEL < 10
 SEASTAR_TEST_CASE(test_set_future_state_with_tuple) {
     future_state<std::tuple<int>> s1;
     promise<int> p1;
@@ -179,6 +183,198 @@ SEASTAR_TEST_CASE(test_set_future_state_with_tuple) {
 
     return make_ready_future<>();
 }
+
+SEASTAR_TEST_CASE(test_make_ready_future_tuple) {
+    // Under v<10, make_ready_future<T>(std::tuple<T>(...)) unpacks the tuple
+    // into T. The tuple special-case is removed in v10 — the emplace path used
+    // there direct-initializes T from the args, which rejects a tuple arg.
+    auto f = make_ready_future<int>(std::tuple(42));
+    BOOST_REQUIRE_EQUAL(f.get(), 42);
+    return make_ready_future<>();
+}
+#endif
+
+#if SEASTAR_API_LEVEL >= 10
+
+namespace {
+std::vector<int> conversion_test_static_vector;
+}
+
+SEASTAR_TEST_CASE(test_set_value_conversions) {
+    // implicit conversion used, explicit ctor ruled out
+    {
+        promise<tests::explisyt> p;
+        auto f = p.get_future();
+        p.set_value(tests::implicit{});
+        std::ignore = f.get();
+    }
+    // implicit ctor used, explicit conversion ruled out
+    {
+        promise<tests::implicit> p;
+        auto f = p.get_future();
+        p.set_value(tests::explisyt{});
+        std::ignore = f.get();
+    }
+    // brace-init-list: empty vector
+    {
+        promise<std::vector<std::string>> p;
+        auto f = p.get_future();
+        p.set_value({});
+        BOOST_REQUIRE_EQUAL(f.get(), (std::vector<std::string>{}));
+    }
+    // brace-init-list: initializer_list<string> ctor
+    {
+        promise<std::vector<std::string>> p;
+        auto f = p.get_future();
+        p.set_value({"foo", "foo"});
+        std::vector<std::string> foo_x2{"foo", "foo"};
+        BOOST_REQUIRE_EQUAL(f.get(), foo_x2);
+    }
+    // brace-init-list: (count, value) ctor
+    {
+        promise<std::vector<std::string>> p;
+        auto f = p.get_future();
+        p.set_value({3, "foo"});
+        std::vector<std::string> foo_x3{"foo", "foo", "foo"};
+        BOOST_REQUIRE_EQUAL(f.get(), foo_x3);
+    }
+    // reference preserved
+    {
+        promise<std::vector<int>&> p;
+        auto f = p.get_future();
+        p.set_value(conversion_test_static_vector);
+        BOOST_REQUIRE_EQUAL(&f.get(), &conversion_test_static_vector);
+    }
+    return make_ready_future<>();
+}
+
+#ifdef __cpp_lib_expected
+SEASTAR_TEST_CASE(test_set_value_brace_init_expected_void) {
+    promise<std::expected<void, std::string>> p;
+    auto f = p.get_future();
+    p.set_value({});
+    BOOST_REQUIRE(f.get().has_value());
+    return make_ready_future<>();
+}
+#endif
+
+SEASTAR_TEST_CASE(test_set_value_thrower_on_copy) {
+    promise<tests::thrower_on_copy> p;
+    auto f = p.get_future();
+    p.set_value(tests::thrower_on_copy{});
+    std::ignore = f.get();
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_set_value_copy_counter) {
+    // const lvalue → 1 copy
+    {
+        promise<tests::copy_move_counter> p;
+        auto f = p.get_future();
+        const tests::copy_move_counter cc;
+        p.set_value(cc);
+        std::ignore = f.get();
+        BOOST_CHECK_EQUAL(cc.shared->copies, 1);
+        BOOST_CHECK_EQUAL(cc.shared->moves, 0);
+    }
+    // non-const lvalue → 1 copy
+    {
+        promise<tests::copy_move_counter> p;
+        auto f = p.get_future();
+        tests::copy_move_counter cc;
+        p.set_value(cc);
+        std::ignore = f.get();
+        BOOST_CHECK_EQUAL(cc.shared->copies, 1);
+        BOOST_CHECK_EQUAL(cc.shared->moves, 0);
+    }
+    // rvalue (equivalent to prvalue — same category) → 1 move
+    {
+        promise<tests::copy_move_counter> p;
+        auto f = p.get_future();
+        tests::copy_move_counter cc;
+        p.set_value(std::move(cc));
+        std::ignore = f.get();
+        BOOST_CHECK_EQUAL(cc.shared->copies, 0);
+        BOOST_CHECK_EQUAL(cc.shared->moves, 1);
+    }
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_set_value_move_counter) {
+    // rvalue (only possibility for move-only) → 1 move
+    promise<tests::move_counter> p;
+    auto f = p.get_future();
+    tests::move_counter mc;
+    p.set_value(std::move(mc));
+    std::ignore = f.get();
+    BOOST_CHECK_EQUAL(mc.shared->moves, 1);
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_make_ready_future_conversions) {
+    // emplace path: (count, value) ctor
+    {
+        auto f = make_ready_future<std::vector<std::string>>(3, "foo");
+        std::vector<std::string> foo_x3{"foo", "foo", "foo"};
+        BOOST_REQUIRE_EQUAL(f.get(), foo_x3);
+    }
+    // reference preserved
+    {
+        auto f = make_ready_future<std::vector<int>&>(conversion_test_static_vector);
+        BOOST_REQUIRE_EQUAL(&f.get(), &conversion_test_static_vector);
+    }
+    // Emplace uses direct-initialization, so explicit converting ctors are
+    // accepted — differs from co_return and promise::set_value, which gate on
+    // std::is_convertible. explisyt(implicit&&) throws.
+    {
+        auto f = make_ready_future<tests::explisyt>(tests::implicit{});
+        BOOST_REQUIRE_THROW(f.get(), int);
+    }
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_make_ready_future_copy_counter) {
+    // type-deduced form with rvalue → 1 move (single-arg overload wins)
+    {
+        tests::copy_move_counter cc;
+        auto f = make_ready_future(std::move(cc));
+        std::ignore = f.get();
+        BOOST_CHECK_EQUAL(cc.shared->copies, 0);
+        BOOST_CHECK_EQUAL(cc.shared->moves, 1);
+    }
+    // explicit-T emplace form with const lvalue → 1 copy (single-arg
+    // overload's T&& cannot bind to const lvalue, so emplace overload wins)
+    {
+        const tests::copy_move_counter cc;
+        auto f = make_ready_future<tests::copy_move_counter>(cc);
+        std::ignore = f.get();
+        BOOST_CHECK_EQUAL(cc.shared->copies, 1);
+        BOOST_CHECK_EQUAL(cc.shared->moves, 0);
+    }
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_make_ready_future_move_counter) {
+    // type-deduced form with rvalue → 1 move (single-arg overload wins)
+    {
+        tests::move_counter mc;
+        auto f = make_ready_future(std::move(mc));
+        std::ignore = f.get();
+        BOOST_CHECK_EQUAL(mc.shared->moves, 1);
+    }
+    // no-arg emplace: the single-arg T&& overload needs one argument, so the
+    // variadic overload wins and default-constructs move_counter in place
+    // (0 moves). f.get() then extracts via exactly 1 move, so the total count
+    // observable via the extracted value is 1.
+    {
+        auto f = make_ready_future<tests::move_counter>();
+        auto mc = f.get();
+        BOOST_CHECK_EQUAL(mc.shared->moves, 1);
+    }
+    return make_ready_future<>();
+}
+
+#endif  // SEASTAR_API_LEVEL >= 10
 
 SEASTAR_THREAD_TEST_CASE(test_set_value_make_exception_in_copy) {
     struct throw_in_copy {
@@ -1379,6 +1575,39 @@ SEASTAR_TEST_CASE(test_futurize_from_tuple) {
     return make_ready_future<>();
 }
 
+SEASTAR_TEST_CASE(test_futurize_from_tuple_const_ref) {
+    // Regression test for `from_tuple(const value_type&)` conflicting with
+    // `from_tuple(value_type&&)`.
+    //
+    // In addition, when returning an lvalue reference, the type should not
+    // be moved with `std::move` somewhere deep in the implementation.
+    //
+    // The point of declaring move and copy operations is to assert that
+    // even if an object is movable and copyable, it is not moved or copied
+    // when returned as an lvalue reference from a `then` callback.
+    struct unmovable_object {
+        int v;
+        explicit unmovable_object(int v) : v(v) {}
+        unmovable_object(const unmovable_object&) { BOOST_FAIL("unmovable_object should not be copied"); }
+        unmovable_object& operator=(const unmovable_object&) { BOOST_FAIL("unmovable_object should not be copied"); return *this; }
+        unmovable_object(unmovable_object&&) { BOOST_FAIL("unmovable_object should not be moved"); }
+        unmovable_object& operator=(unmovable_object&&) { BOOST_FAIL("unmovable_object should not be moved"); return *this; }
+        ~unmovable_object() { BOOST_REQUIRE_EQUAL(v, 5); }
+    };
+    unmovable_object n{5};
+
+    // Ensure the support through `make_ready_future` as well.
+    BOOST_REQUIRE_EQUAL(make_ready_future<unmovable_object&>(n).get().v, 5);
+
+    auto f = make_ready_future<>();
+    f = std::move(f).then([&]() -> unmovable_object& { return n; }).then([](unmovable_object& x) { BOOST_REQUIRE_EQUAL(x.v, 5); });
+    f = std::move(f).then([&]() -> const unmovable_object& { return n; }).then([](const unmovable_object& x) { BOOST_REQUIRE_EQUAL(x.v, 5); });
+    // Without the annotation, it would be pass-by-value or moved
+    f = std::move(f).then([]() { int x = 1; return x; }).then([](int x) { BOOST_REQUIRE_EQUAL(x, 1); });
+    f = std::move(f).then([x = n.v] { return x; }).then([](int x) { BOOST_REQUIRE_EQUAL(x, 5); });
+    co_await std::move(f);
+}
+
 SEASTAR_TEST_CASE(test_repeat_until_value) {
     return do_with(int(), [] (int& counter) {
         return repeat_until_value([&counter] () -> future<std::optional<int>> {
@@ -2258,12 +2487,12 @@ SEASTAR_THREAD_TEST_CASE(test_manual_clock_advance) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_ready_future_across_shards) {
-    if (smp::count == 1) {
+    if (this_smp_shard_count() == 1) {
         seastar_logger.info("test_ready_future_across_shards requires at least 2 shards");
         return;
     }
 
-    auto other_shard = (this_shard_id() + 1) % smp::count;
+    auto other_shard = (this_shard_id() + 1) % this_smp_shard_count();
     auto f1 = make_ready_future<int>(42);
     smp::submit_to(other_shard, [f1 = std::move(f1)] () mutable {
         BOOST_REQUIRE_EQUAL(f1.get(), 42);
@@ -2623,13 +2852,13 @@ SEASTAR_THREAD_TEST_CASE(test_lifetimes_and_copies_finally_void) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_foreign_promise_set_value) {
-    if (smp::count == 1) {
+    if (this_smp_shard_count() == 1) {
         seastar_logger.info("test_foreign_promise_set_value requires at least 2 shards");
         return;
     }
 
     promise<int> pr;
-    auto other_shard = (this_shard_id() + 1) % smp::count;
+    auto other_shard = (this_shard_id() + 1) % this_smp_shard_count();
 
     auto getter = pr.get_future();
 
@@ -2640,6 +2869,23 @@ SEASTAR_THREAD_TEST_CASE(test_foreign_promise_set_value) {
     setter.get();
 
     BOOST_REQUIRE_EQUAL(getter.get(), other_shard);
+}
+
+namespace test_bool_class_constexpr_ns {
+using bc = bool_class<struct tag>;
+static_assert(static_cast<bool>(bc(true)));
+static_assert(!static_cast<bool>(bc(false)));
+static_assert(static_cast<bool>(bc(true) && bc(true)));
+static_assert(!static_cast<bool>(bc(true) && bc(false)));
+static_assert(static_cast<bool>(bc(true) || bc(false)));
+static_assert(static_cast<bool>(!bc(false)));
+static_assert(bc(true) == bc(true));
+static_assert(bc(true) != bc(false));
+#if __cpp_lib_three_way_comparison
+static_assert((bc(true) <=> bc(false)) > 0);
+static_assert((bc(false) <=> bc(true)) < 0);
+static_assert((bc(true) <=> bc(true)) == 0);
+#endif
 }
 
 #if __cpp_lib_three_way_comparison

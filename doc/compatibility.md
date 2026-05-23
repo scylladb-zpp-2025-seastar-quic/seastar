@@ -78,6 +78,10 @@ versions of the API. For example.
      and become a move-only type
    - Seastar_API_LEVEL=9 defines the data_sink_impl::put(span<temporary_buffer>)
      as the new and only method to be implemented
+   - Seastar_API_LEVEL=10 makes co_return and promise.set_value() semantics
+     closer to those of plain C++ return regarding how they convert
+     expressions used as their arguments to the declared type.
+
 
 Applications can use an old API_LEVEL during a transition
 period, fix their code, and move to the new API_LEVEL.
@@ -112,15 +116,15 @@ API Level History
 
 |Level|Introduced |Mandatory|Description                                   |
 |:---:|:---------:|:-------:| -------------------------------------------- |
-| 2   |  2019-07  | 2020-04 | Non-variadic futures in socket::accept()     |
-| 3   |  2020-05  | 2023-03 | make_file_data_sink() closes file and returns a future<>  |
-| 4   |  2020-06  | 2023-03 | Non-variadic futures in when_all_succeed()   |
-| 5   |  2020-08  | 2023-03 | future::get() returns std::monostate() instead of void |
-| 6   |  2020-09  | 2023-03 | future<T> instead of future<T...>            |
-| 7   |  2023-05  | 2024-09 | unified CPU/IO scheduling groups             |
-| 8   |  2025-08  |         | noncopyable function in json_return_type     |
-| 9   |  2025-08  |         | data_sink_impl new API                       |
-
+|  2  |  2019-07  | 2020-04 | Non-variadic futures in socket::accept()     |
+|  3  |  2020-05  | 2023-03 | make_file_data_sink() closes file and returns a future<>  |
+|  4  |  2020-06  | 2023-03 | Non-variadic futures in when_all_succeed()   |
+|  5  |  2020-08  | 2023-03 | future::get() returns std::monostate() instead of void |
+|  6  |  2020-09  | 2023-03 | future<T> instead of future<T...>            |
+|  7  |  2023-05  | 2024-09 | unified CPU/IO scheduling groups             |
+|  8  |  2025-08  |         | noncopyable function in json_return_type     |
+|  9  |  2025-08  |         | data_sink_impl new API                       |
+| 10  |  2026-04  |         | co_return and set_value strict type semantics |
 
 Note: The "mandatory" column indicates when backwards compatibility
 support for the API preceding the new level was removed.

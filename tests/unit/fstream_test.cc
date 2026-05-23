@@ -367,7 +367,10 @@ SEASTAR_TEST_CASE(file_handle_test) {
             buf[i] = i;
         }
         f.dma_write(0, buf, 4096).get();
-        auto bad = std::vector<unsigned>(smp::count); // std::vector<bool> is special and unsuitable because it uses bitfields
+        auto bad = std::vector<unsigned>(this_smp_shard_count()); // std::vector<bool> is special and unsuitable because it uses bitfields
+        close_f.close_now();
+        f = open_file_dma(filename, open_flags::ro).get();
+        close_f = deferred_close(f);
         smp::invoke_on_all([fh = f.dup(), &bad] {
             return seastar::async([fh, &bad] {
                 auto f = fh.to_file();

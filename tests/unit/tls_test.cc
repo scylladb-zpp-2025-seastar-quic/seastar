@@ -42,6 +42,7 @@
 #include <seastar/net/inet_address.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/util/defer.hh>
 
 #include <boost/dll.hpp>
@@ -49,9 +50,8 @@
 #include "loopback_socket.hh"
 #include "tmpdir.hh"
 
-#include <gnutls/gnutls.h>
-
 #if 0
+#include <gnutls/gnutls.h>
 
 static void enable_gnutls_logging() {
     gnutls_global_set_log_level(99);
@@ -71,6 +71,10 @@ using enable_if_with_networking = boost::unit_test::enable_if<SEASTAR_TESTING_WI
 using enable_if_without_networking = boost::unit_test::enable_if<!SEASTAR_TESTING_WITH_NETWORKING>;
 
 using namespace seastar;
+
+static bool using_gnutls() {
+    return std::string_view(tls::backend_name()) == "gnutls";
+}
 
 static future<> connect_to_ssl_addr(::shared_ptr<tls::certificate_credentials> certs, socket_address addr, const sstring& name = {}) {
     return repeat_until_value([=]() mutable {
@@ -171,6 +175,10 @@ SEASTAR_TEST_CASE(test_x509_client_with_builder_system_trust_multiple,
 
 SEASTAR_TEST_CASE(test_x509_client_with_system_trust_and_priority_strings,
                   *enable_if_with_networking()) {
+    if (!using_gnutls()) {
+        // GnuTLS priority strings are not applicable to OpenSSL
+        return make_ready_future<>();
+    }
     static std::vector<sstring> prios( {
         "NORMAL:+ARCFOUR-128", // means normal ciphers plus ARCFOUR-128.
         "SECURE128:-VERS-SSL3.0:+COMP-DEFLATE", // means that only secure ciphers are enabled, SSL3.0 is disabled, and libz compression enabled.
@@ -192,6 +200,10 @@ SEASTAR_TEST_CASE(test_x509_client_with_system_trust_and_priority_strings,
 
 SEASTAR_TEST_CASE(test_x509_client_with_system_trust_and_priority_strings_fail,
                   *enable_if_with_networking()) {
+    if (!using_gnutls()) {
+        // GnuTLS priority strings are not applicable to OpenSSL
+        return make_ready_future<>();
+    }
     static std::vector<sstring> prios( { "NONE",
         "NONE:+CURVE-SECP256R1"
     });
@@ -268,10 +280,10 @@ SEASTAR_TEST_CASE(test_alpn_client_server) {
 class https_server {
     const sstring _cert;
     const std::string _addr = "127.0.0.1";
-    experimental::process _process;
+    process _process;
     uint16_t _port;
 
-    static experimental::process spawn(const std::string& addr, const sstring& key, const sstring& cert) {
+    static process spawn(const std::string& addr, const sstring& key, const sstring& cert) {
         auto httpd = boost::dll::program_location().parent_path() / "https-server.py";
         const std::vector<sstring> argv{
           "httpd",
@@ -279,13 +291,13 @@ class https_server {
           "--key", key,
           "--cert", cert,
         };
-        return experimental::spawn_process(httpd.string(), {.argv = argv}).get();
+        return spawn_process(httpd.string(), {.argv = argv}).get();
     }
 
     // https-server.py picks an available port and listens on it. when it is
     // ready to serve, it prints out the listening port. without hardwiring to
     // a fixed port, we are able to run multiple tests in parallel.
-    static uint16_t read_port(experimental::process& process) {
+    static uint16_t read_port(process& process) {
         using consumption_result_type = typename input_stream<char>::consumption_result_type;
         using stop_consuming_type = typename consumption_result_type::stop_consuming_type;
         using tmp_buf = stop_consuming_type::tmp_buf;
@@ -358,6 +370,10 @@ SEASTAR_THREAD_TEST_CASE(test_x509_client_with_builder_multiple) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_x509_client_with_priority_strings) {
+    if (!using_gnutls()) {
+        // GnuTLS priority strings are not applicable to OpenSSL
+        return;
+    }
     static std::vector<sstring> prios( {
         "NORMAL:+ARCFOUR-128", // means normal ciphers plus ARCFOUR-128.
         "SECURE128:-VERS-SSL3.0:+COMP-DEFLATE", // means that only secure ciphers are enabled, SSL3.0 is disabled, and libz compression enabled.
@@ -380,6 +396,10 @@ SEASTAR_THREAD_TEST_CASE(test_x509_client_with_priority_strings) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_x509_client_with_priority_strings_fail) {
+    if (!using_gnutls()) {
+        // GnuTLS priority strings are not applicable to OpenSSL
+        return;
+    }
     static std::vector<sstring> prios( { "NONE",
         "NONE:+CURVE-SECP256R1"
     });
@@ -713,7 +733,6 @@ SEASTAR_TEST_CASE(test_simple_x509_client_server_again) {
     return run_echo_test(message, 20, certfile("catest.pem"), "test.scylladb.org");
 }
 
-#if GNUTLS_VERSION_NUMBER >= 0x030600
 // Test #769 - do not set dh_params in server certs - let gnutls negotiate.
 SEASTAR_TEST_CASE(test_simple_server_default_dhparams) {
     return run_echo_test(message, 20, certfile("catest.pem"), "test.scylladb.org",
@@ -721,7 +740,6 @@ SEASTAR_TEST_CASE(test_simple_server_default_dhparams) {
         {}, {}, true, /* use_dh_params */ false
     );
 }
-#endif
 
 SEASTAR_TEST_CASE(test_x509_client_server_cert_validation_fail) {
     // Load a real trust authority here, which our certs are _not_ signed with.
@@ -1559,10 +1577,16 @@ SEASTAR_THREAD_TEST_CASE(test_peer_certificate_chain_handling) {
             return contents;
         };
 
-        auto ders = {read_file(certfile("test.crt.der"))};
+        auto expected_leaf = read_file(certfile("test.crt.der"));
 
-        BOOST_REQUIRE(std::ranges::equal(scrts, ders));
-        BOOST_REQUIRE(std::ranges::equal(ccrts, ders));
+        // The chain must contain at least the peer's leaf certificate.
+        // OpenSSL may also include additional chain certs (e.g. CA)
+        // via auto-chain, while GnuTLS only sends what was explicitly
+        // provided in the key file.
+        BOOST_REQUIRE(!scrts.empty());
+        BOOST_REQUIRE(scrts.front() == expected_leaf);
+        BOOST_REQUIRE(!ccrts.empty());
+        BOOST_REQUIRE(ccrts.front() == expected_leaf);
     }
 }
 
@@ -2073,7 +2097,7 @@ SEASTAR_THREAD_TEST_CASE(test_send_recv_alloc_limits) {
             auto fout = write(sout);
             auto fin = read(cin);
 
-            auto h = (i > 0 && (i & 0xff) == 0) 
+            auto h = (i > 0 && (i & 0xff) == 0)
                 ? BOOST_TEST_MESSAGE("Forcing re-handshake"), tls::force_rehandshake(s.connection)
                 : make_ready_future<>()
                 ;
@@ -2162,4 +2186,63 @@ SEASTAR_THREAD_TEST_CASE(test_session_close_with_unread_data) {
     });
 
     seastar::when_all(std::move(c), std::move(s)).discard_result().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_send_two_large) {
+    // send two 20MB buffers over a tls socket pair
+    // which gives additoiinal coverage since it
+    // triggers cases inside openssl/gnutls which occur
+    // when the underlying output buffer cannot fully
+    // absorb the write, and also the case of > 1 buffer
+    // flushed at once.
+
+    auto p = tls_socketpair();
+
+    constexpr size_t buf_size = 20 * 1024 * 1024;
+    constexpr size_t total_size = 2 * buf_size;
+
+    std::default_random_engine random_engine(42);
+    auto dist = std::uniform_int_distribution<char>();
+
+    auto expected_data = temporary_buffer<char>(total_size);
+    std::generate(expected_data.get_write(), expected_data.get_write() + total_size,
+                  [&] { return dist(random_engine); });
+
+    auto sender = seastar::async([s = std::move(p.second), data = expected_data.share()] () mutable {
+        auto out = s.output();
+
+        // Create two temporary buffers from the expected data
+        auto buf1 = temporary_buffer<char>(buf_size);
+        std::copy_n(data.get(), buf_size, buf1.get_write());
+
+        auto buf2 = temporary_buffer<char>(buf_size);
+        std::copy_n(data.get() + buf_size, buf_size, buf2.get_write());
+
+        out.write(buf1.get(), buf1.size()).get();
+        out.write(buf2.get(), buf2.size()).get();
+        out.flush().get();
+
+        out.close().get();
+        s.shutdown_input();
+    });
+
+    auto receiver = seastar::async([c = std::move(p.first), expected = expected_data.share(), total_size] () mutable {
+        auto in = c.input();
+        size_t bytes_received = 0;
+        temporary_buffer<char> received_data(total_size);
+
+        while (!in.eof()) {
+            auto buf = in.read().get();
+            std::copy_n(buf.get(), buf.size(), received_data.get_write() + bytes_received);
+            bytes_received += buf.size();
+        }
+
+        BOOST_CHECK_EQUAL(bytes_received, total_size);
+        BOOST_CHECK(std::equal(expected.get(), expected.get() + total_size, received_data.get()));
+
+        in.close().get();
+        c.shutdown_output();
+    });
+
+    seastar::when_all(std::move(sender), std::move(receiver)).discard_result().get();
 }

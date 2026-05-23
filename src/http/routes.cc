@@ -19,18 +19,11 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#include <exception>
-#include <memory>
-module seastar;
-#else
 #include <seastar/http/routes.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/http/request.hh>
 #include <seastar/http/exception.hh>
 #include <seastar/http/json_path.hh>
-#endif
 
 namespace seastar {
 
@@ -82,8 +75,7 @@ std::unique_ptr<http::reply> routes::exception_reply(std::exception_ptr eptr) {
         }
         std::rethrow_exception(eptr);
     } catch (const redirect_exception& _e) {
-       rep.reset(new http::reply());
-       rep->add_header("Location", _e.url).set_status(_e.status());
+      *rep = _e.to_reply();
     } catch (const base_exception& e) {
         rep->set_status(e.status(), internal::to_json(e));
     } catch (...) {
@@ -91,7 +83,7 @@ std::unique_ptr<http::reply> routes::exception_reply(std::exception_ptr eptr) {
                 internal::to_json(std::current_exception()));
     }
 
-    rep->done("json");
+    rep->set_content_type("json");
     return rep;
 }
 
@@ -103,12 +95,16 @@ future<std::unique_ptr<http::reply> > routes::handle(const sstring& path, std::u
             handler->verify_mandatory_params(*req);
             auto r =  handler->handle(path, std::move(req), std::move(rep));
             return r.handle_exception(_general_handler);
+        } catch (const redirect_exception& _e) {
+            // rep may have been moved into handler->handle(), so create a fresh one
+            rep = std::make_unique<http::reply>(_e.to_reply());
+            rep->set_content_type("json");
         } catch (...) {
             rep = exception_reply(std::current_exception());
         }
     } else {
         rep.reset(new http::reply());
-        rep->set_status(http::reply::status_type::not_found, internal::to_json(not_found_exception("Not found"))).done(
+        rep->set_status(http::reply::status_type::not_found, internal::to_json(not_found_exception("Not found"))).set_content_type(
                 "json");
     }
     return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));

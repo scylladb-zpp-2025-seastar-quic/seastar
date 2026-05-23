@@ -23,11 +23,13 @@
 #include <numeric>
 #include <ranges>
 #include <any>
+#include <expected>
 
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/coroutine/all.hh>
@@ -42,6 +44,8 @@
 #include <seastar/util/defer.hh>
 #include <seastar/util/later.hh>
 
+#include "conversion_test_types.hh"
+
 using seastar::broken_promise;
 using seastar::circular_buffer;
 using seastar::create_scheduling_group;
@@ -55,11 +59,14 @@ using seastar::promise;
 using seastar::scheduling_group;
 using seastar::semaphore;
 using seastar::semaphore_timed_out;
+using seastar::sstring;
 using seastar::sleep;
 using seastar::yield;
 
 namespace coroutine = seastar::coroutine;
 namespace testing = seastar::testing;
+
+using namespace seastar::tests;
 
 using namespace std::chrono_literals;
 
@@ -945,4 +952,129 @@ SEASTAR_TEST_CASE(test_try_future) {
     co_await run_try_future_test<false>(return_int, 128);
     co_await run_try_future_test<true>(return_ex_int, std::nullopt);
     co_await run_try_future_test<false>(return_ex_int, std::nullopt);
+}
+
+#if SEASTAR_API_LEVEL < 10
+future<int> co_return_tup_int_rv() {
+    co_return std::tuple(42);
+}
+
+future<int> co_return_tup_int_clv() {
+    const std::tuple t(42);
+    co_return t;
+}
+
+SEASTAR_TEST_CASE(test_std_expected_void_specialization) {
+    BOOST_REQUIRE_EQUAL(co_await co_return_tup_int_rv(), 42);
+    BOOST_REQUIRE_EQUAL(co_await co_return_tup_int_clv(), 42);
+}
+
+#else
+#ifdef __cpp_lib_expected
+
+future<std::expected<void, std::string>> void_return_expected() {
+    co_return {};
+}
+
+SEASTAR_TEST_CASE(test_std_expected_void_specialization) {
+    auto result = co_await void_return_expected();
+    BOOST_REQUIRE(result.has_value());
+}
+
+#endif
+
+// implicit conversion used, explicit ctor ruled out
+future<explisyt> i2e() {
+    co_return implicit();
+};
+
+// implicit ctor used, explicit conversion ruled out
+future<implicit> e2i() {
+    co_return explisyt();
+};
+
+future<std::vector<std::string>> co_return_vector(int cnt) {
+    switch (cnt) {
+    case 0:
+        co_return {};
+    case 2:
+        co_return {"foo", "foo"};
+    case 3:
+        co_return {3, "foo"};
+    default:
+        throw std::runtime_error("bad option");
+    }
+}
+
+static std::vector<int> static_vector;
+
+future<std::vector<int> &> co_return_reference() {
+    co_return static_vector;
+}
+
+SEASTAR_TEST_CASE(test_co_return_conversions) {
+    std::ignore = co_await i2e();
+    std::ignore = co_await e2i();
+    BOOST_REQUIRE_EQUAL(co_await co_return_vector(0), (std::vector<std::string>{}));
+    // gcc 13.3 will ICE if we inline the expected values here
+    std::vector<std::string> foo_x2{"foo", "foo"};
+    BOOST_REQUIRE_EQUAL(co_await co_return_vector(2), foo_x2);
+    std::vector<std::string> foo_x3{"foo", "foo", "foo"};
+    BOOST_REQUIRE_EQUAL(co_await co_return_vector(3), foo_x3);
+    BOOST_REQUIRE_EQUAL(&co_await co_return_reference(), &static_vector);
+}
+
+future<thrower_on_copy> co_return_thrower_on_copy() {
+    co_return {};
+}
+
+SEASTAR_TEST_CASE(test_co_return_thrower_on_copy) {
+    std::ignore = co_await co_return_thrower_on_copy();
+}
+
+#endif
+
+future<copy_move_counter> co_return_copy_counter_const_lv(const copy_move_counter& cc) {
+    co_return cc;
+}
+
+SEASTAR_TEST_CASE(test_co_return_copy_counter) {
+    {
+        copy_move_counter cc;
+        std::ignore = co_return_copy_counter_const_lv(cc);
+        BOOST_CHECK_EQUAL(cc.shared->copies, 1);
+        BOOST_CHECK_EQUAL(cc.shared->moves, 0);
+    }
+    {
+        copy_move_counter cc;
+        std::ignore = co_await co_return_copy_counter_const_lv(cc);
+        BOOST_CHECK_EQUAL(cc.shared->copies, 1);
+        BOOST_CHECK_EQUAL(cc.shared->moves, copy_move_counter::co_await_moves);
+    }
+}
+
+// mc is an rvalue-reference parameter — per [class.copy.elision], an implicitly
+// movable entity — so `co_return mc;` performs an implicit move, exercising the
+// strict-co_return lvalue-treated-as-rvalue path for move-only types.
+future<move_counter> co_return_move_counter_lv(move_counter&& mc) {
+    co_return mc;
+}
+
+future<move_counter> co_return_move_counter_rv(move_counter&& mc) {
+    co_return std::move(mc);
+}
+
+SEASTAR_TEST_CASE(test_co_return_move_counter) {
+    for (const auto fnptr: {co_return_move_counter_lv, co_return_move_counter_rv}) {
+        {
+            move_counter mc;
+            std::ignore = (*fnptr)(std::move(mc));
+            BOOST_CHECK_EQUAL(mc.shared->moves, 1);
+        }
+        {
+            move_counter mc;
+            std::ignore = co_await (*fnptr)(std::move(mc));
+            BOOST_CHECK_EQUAL(mc.shared->moves, 1 + copy_move_counter::co_await_moves);
+        }
+    }
 }

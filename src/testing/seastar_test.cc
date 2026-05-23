@@ -20,12 +20,10 @@
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
 
-#include <thread>
 #include <iostream>
 
 #include <boost/test/execution_monitor.hpp>
 #include <boost/exception/diagnostic_information.hpp>
-#include <boost/core/type_name.hpp>
 
 #include <seastar/testing/entry_point.hh>
 #include <seastar/testing/seastar_test.hh>
@@ -39,9 +37,6 @@
 namespace seastar {
 
 namespace testing {
-
-exchanger_base::exchanger_base() { }
-exchanger_base::~exchanger_base() { }
 
 // #3165 - build a message for a possibly nested exception chain.
 static boost::execution_exception::location

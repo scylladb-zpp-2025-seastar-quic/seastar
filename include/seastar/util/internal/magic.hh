@@ -61,6 +61,10 @@ namespace seastar {
 #define HFS_SUPER_MAGIC 0x4244
 #endif
 
+#ifndef HUGETLBFS_MAGIC
+#define HUGETLBFS_MAGIC 0x958458f6
+#endif
+
 namespace internal {
 
 class fs_magic {
@@ -74,6 +78,7 @@ public:
     static constexpr unsigned long fuse = FUSE_SUPER_MAGIC;
     static constexpr unsigned long btrfs = BTRFS_SUPER_MAGIC;
     static constexpr unsigned long hfs = HFS_SUPER_MAGIC;
+    static constexpr unsigned long hugetlbfs = HUGETLBFS_MAGIC;
 };
 
 } // internal namespace

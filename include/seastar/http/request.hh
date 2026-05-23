@@ -46,7 +46,7 @@ namespace seastar {
 
 namespace http {
 
-namespace experimental { class connection; }
+class connection;
 
 /**
  * A request received from a client.
@@ -416,7 +416,7 @@ public:
     future<> write_request_headers(output_stream<char>& out) const;
 private:
     void add_query_param(std::string_view param);
-    friend class experimental::connection;
+    friend class connection;
 };
 
 namespace internal {
@@ -434,3 +434,23 @@ using request [[deprecated("Use http::request instead")]] = http::request;
 }
 
 }
+
+template <>
+struct fmt::formatter<seastar::http::request> {
+    template <typename ParseContext>
+    constexpr auto parse(ParseContext& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const seastar::http::request& rq, FormatContext& ctx) const {
+        auto out = fmt::format_to(ctx.out(), "{} {}", rq._method, rq._url);
+        for (const auto& h : rq._headers) {
+            out = fmt::format_to(out, " {}:{}", h.first, h.second);
+        }
+        if (!rq.body_writer) {
+            const auto& body = seastar::http::internal::deprecated_content(rq);
+            if (!body.empty()) {
+                out = fmt::format_to(out, " {}", body);
+            }
+        }
+        return out;
+    }
+};

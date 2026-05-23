@@ -27,6 +27,8 @@
 #include <seastar/testing/test_runner.hh>
 
 #include <seastar/core/reactor.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/condition-variable.hh>
@@ -53,8 +55,10 @@
 using namespace seastar;
 namespace fs = std::filesystem;
 
+constexpr open_flags default_create_open_flags = open_flags::rw | open_flags::create;
+
 SEASTAR_TEST_CASE(open_flags_test) {
-    open_flags flags = open_flags::rw | open_flags::create  | open_flags::exclusive;
+    open_flags flags = default_create_open_flags | open_flags::exclusive;
     BOOST_REQUIRE(std::underlying_type_t<open_flags>(flags) ==
                   (std::underlying_type_t<open_flags>(open_flags::rw) |
                    std::underlying_type_t<open_flags>(open_flags::create) |
@@ -77,7 +81,7 @@ SEASTAR_TEST_CASE(access_flags_test) {
 SEASTAR_TEST_CASE(file_exists_test) {
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         sstring filename = (t.get_path() / "testfile.tmp").native();
-        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get();
+        auto f = open_file_dma(filename, default_create_open_flags).get();
         f.close().get();
         auto exists = file_exists(filename).get();
         BOOST_REQUIRE(exists);
@@ -90,7 +94,7 @@ SEASTAR_TEST_CASE(file_exists_test) {
 SEASTAR_TEST_CASE(handle_bad_alloc_test) {
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         sstring filename = (t.get_path() / "testfile.tmp").native();
-        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get();
+        auto f = open_file_dma(filename, default_create_open_flags).get();
         f.close().get();
         bool exists = false;
         memory::with_allocation_failures([&] {
@@ -103,10 +107,72 @@ SEASTAR_TEST_CASE(handle_bad_alloc_test) {
 SEASTAR_TEST_CASE(file_access_test) {
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         sstring filename = (t.get_path() / "testfile.tmp").native();
-        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get();
+        auto f = open_file_dma(filename, default_create_open_flags).get();
         f.close().get();
         auto is_accessible = file_accessible(filename, access_flags::read | access_flags::write).get();
         BOOST_REQUIRE(is_accessible);
+    });
+}
+
+// Test that a file handle can be transferred to another shard, and
+// that a file obtained from the handle is the same one, as it was
+// when the file was opened.
+SEASTAR_TEST_CASE(file_ro_dup_test) {
+    if (seastar::this_smp_shard_count() < 2) {
+        fmt::print("This test needs at least 2 shards to run\n");
+        return make_ready_future<>();
+    }
+    return tmp_dir::do_with([] (tmp_dir& t) -> future<> {
+        struct file_open_info {
+            seastar::file_handle handle;
+            struct stat st;
+        };
+        auto fi = co_await smp::submit_to(0, [&t] () -> future<file_open_info> {
+            sstring filename = (t.get_path() / "testfile.tmp").native();
+            auto f = co_await open_file_dma(filename, open_flags::ro | open_flags::create);
+            auto st = co_await f.stat();
+            auto fh = f.dup();
+            co_await f.close();
+            co_return file_open_info{ std::move(fh), st };
+        });
+        co_await smp::submit_to(1, [fi = std::move(fi)] () mutable -> future<> {
+            auto f = std::move(fi.handle).to_file();
+            auto st = co_await f.stat();
+            BOOST_REQUIRE_EQUAL(st.st_dev, fi.st.st_dev);
+            BOOST_REQUIRE_EQUAL(st.st_ino, fi.st.st_ino);
+        });
+    });
+}
+
+// Test that non-read-only files do not generate file-handle, but throw
+SEASTAR_TEST_CASE(file_rw_dup_test) {
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        sstring filename = (t.get_path() / "testfile.tmp").native();
+        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get();
+        BOOST_REQUIRE_THROW(f.dup(), std::runtime_error);
+    });
+}
+
+SEASTAR_TEST_CASE(file_mmap_test) {
+    return tmp_dir::do_with([] (tmp_dir& t) -> future<> {
+        sstring filename = (t.get_path() / "testfile.tmp").native();
+        auto f = co_await open_file_dma(filename, open_flags::rw | open_flags::create);
+        co_await f.truncate(4096);
+        auto map = co_await f.mmap(4096, mmap_prot::read | mmap_prot::write, mmap_private::no, 0);
+        BOOST_CHECK_EQUAL(map.size(), 4096);
+        // Write null-terminated string to the map.
+        std::string_view str = "Hello, mmap!";
+        std::memcpy(map.get(), str.data(), str.size() + 1);
+        std::string_view map_str{reinterpret_cast<const char*>(map.get()), str.size()};
+        BOOST_CHECK_EQUAL(map_str, str);
+        co_await map.flush();
+        co_await map.unmap();
+        // Read the string back through the file, using dma_read.
+        auto buf = allocate_aligned_buffer<char>(4096, 4096);
+        co_await f.dma_read(0, buf.get(), 4096);
+        std::string_view buf_str{buf.get(), str.size()};
+        BOOST_CHECK_EQUAL(buf_str, str);
+        co_await f.close();
     });
 }
 
@@ -122,7 +188,7 @@ SEASTAR_TEST_CASE(test1) {
   return tmp_dir::do_with([] (tmp_dir& t) {
     static constexpr auto max = 10000;
     sstring filename = (t.get_path() / "testfile.tmp").native();
-    return open_file_dma(filename, open_flags::rw | open_flags::create).then([filename] (file f) {
+    return open_file_dma(filename, default_create_open_flags).then([filename] (file f) {
         auto ft = new file_test{std::move(f)};
         for (size_t i = 0; i < max; ++i) {
             // Don't wait for future, use semaphore to signal when done instead.
@@ -169,7 +235,7 @@ SEASTAR_TEST_CASE(parallel_write_fsync) {
             auto written = uint64_t(0);
             auto fsynced_at = uint64_t(0);
 
-            file f = open_file_dma(fname, open_flags::rw | open_flags::create | open_flags::truncate).get();
+            file f = open_file_dma(fname, default_create_open_flags | open_flags::truncate).get();
             auto close_f = deferred_close(f);
             // Avoid filesystem problems with size-extending operations
             f.truncate(sz).get();
@@ -1151,6 +1217,7 @@ public:
     virtual future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, io_intent* i) noexcept override { abort(); }
     virtual future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, io_intent* i) noexcept override { abort(); }
     virtual future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* i) noexcept override { abort(); }
+    virtual std::unique_ptr<seastar::file_handle_impl> dup() override { abort(); }
 
     virtual future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, io_intent* i) noexcept override {
         fmt::print("  IO {}:{}\n", pos, len);
@@ -1170,7 +1237,7 @@ public:
     }
 
     test_posix_file_impl(const temporary_buffer<char>& d)
-        : posix_file_impl(0, {}, nullptr, 0, block_size, block_size, block_size, block_size, true)
+        : posix_file_impl(0, {}, nullptr, 0, block_size, block_size, block_size, block_size, nowait_mode::yes, true, true)
         , _data(d)
     {}
 };
@@ -1218,4 +1285,25 @@ SEASTAR_THREAD_TEST_CASE(test_posix_file_dma_read_bulk) {
             }
         }
     }
+}
+
+SEASTAR_TEST_CASE(test_rename) {
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        sstring filename1 = (t.get_path() / "testfile1.tmp").native();
+        sstring filename2 = (t.get_path() / "testfile2.tmp").native();
+        sstring filename3 = (t.get_path() / "testfile3.tmp").native();
+        auto f = open_file_dma(filename1, default_create_open_flags).get();
+        f.close().get();
+        f = open_file_dma(filename3, default_create_open_flags).get();
+        f.close().get();
+        rename_file(filename1, filename2).get();
+        BOOST_REQUIRE(file_exists(filename2).get());
+        BOOST_REQUIRE(!file_exists(filename1).get());
+        BOOST_REQUIRE_THROW(rename_file(filename3, filename2, rename_flags::noreplace).get(), std::system_error);
+        BOOST_REQUIRE(file_exists(filename3).get());
+        rename_file(filename3, filename1, rename_flags::noreplace).get();
+        BOOST_REQUIRE(file_exists(filename1).get());
+        BOOST_REQUIRE(file_exists(filename2).get());
+        BOOST_REQUIRE(!file_exists(filename3).get());
+    });
 }

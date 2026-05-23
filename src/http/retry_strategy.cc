@@ -6,29 +6,22 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <chrono>
 #include <coroutine>
-#include <gnutls/gnutls.h>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/http/exception.hh>
 #include <seastar/http/retry_strategy.hh>
+#include <seastar/net/tls.hh>
 #include <seastar/util/short_streams.hh>
 
-#endif
 
 using namespace std::chrono_literals;
 
 namespace seastar {
 extern logger http_log;
 
-namespace http::experimental {
+namespace http {
 logger rs_logger("default_http_retry_strategy");
 
 static bool is_retryable_exception(std::exception_ptr ex) {
@@ -37,7 +30,7 @@ static bool is_retryable_exception(std::exception_ptr ex) {
             std::rethrow_exception(ex);
         } catch (const std::system_error& sys_err) {
             auto code = sys_err.code().value();
-            if (code == EPIPE || code == ECONNABORTED || code == ECONNRESET || code == GNUTLS_E_PREMATURE_TERMINATION) {
+            if (code == EPIPE || code == ECONNABORTED || code == ECONNRESET || code == tls::ERROR_PREMATURE_TERMINATION) {
                 return true;
             }
             try {

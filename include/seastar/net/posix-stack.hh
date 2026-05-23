@@ -61,7 +61,7 @@ class conntrack {
     class load_balancer {
         std::vector<unsigned> _cpu_load;
     public:
-        load_balancer() : _cpu_load(size_t(smp::count), 0) {}
+        load_balancer() : _cpu_load(size_t(this_smp_shard_count()), 0) {}
         void closed_cpu(shard_id cpu) {
             _cpu_load[cpu]--;
         }
@@ -230,9 +230,9 @@ public:
 };
 
 class posix_network_stack : public network_stack {
-private:
-    const bool _reuseport;
 protected:
+    const bool _reuseport;
+    const bool _sock_need_nonblock;
     std::pmr::polymorphic_allocator<char>* _allocator;
 public:
     explicit posix_network_stack(const program_options::option_group& opts, std::pmr::polymorphic_allocator<char>* allocator=memory::malloc_allocator);
@@ -252,8 +252,6 @@ public:
 };
 
 class posix_ap_network_stack : public posix_network_stack {
-private:
-    const bool _reuseport;
 public:
     posix_ap_network_stack(const program_options::option_group& opts, std::pmr::polymorphic_allocator<char>* allocator=memory::malloc_allocator);
     virtual server_socket listen(socket_address sa, listen_options opts) override;

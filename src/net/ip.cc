@@ -20,20 +20,11 @@
  *
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#include <chrono>
-#include <string>
-#include <boost/asio/ip/address_v4.hpp>
-#include <fmt/core.h>
-module seastar;
-#else
 #include <seastar/net/ip.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/net/toeplitz.hh>
 #include <seastar/core/metrics.hh>
-#endif
 
 namespace seastar {
 
@@ -194,7 +185,7 @@ ipv4::handle_received_packet(packet p, ethernet_address from) {
             auto cpu_id = this_shard_id();
             auto l4 = _l4[h.ip_proto];
             if (l4) {
-                if (smp::count == 1) {
+                if (this_smp_shard_count() == 1) {
                     l4->received(std::move(ip_data), h.src_ip, h.dst_ip);
                 } else {
                     size_t l4_offset = 0;

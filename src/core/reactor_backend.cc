@@ -18,9 +18,6 @@
 /*
  * Copyright 2019 ScyllaDB
  */
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <atomic>
 #include <chrono>
@@ -41,9 +38,6 @@ module;
 #include <liburing.h>
 #endif
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include "core/reactor_backend.hh"
 #include "core/thread_pool.hh"
 #include "core/syscall_result.hh"
@@ -55,7 +49,6 @@ module seastar;
 #include <seastar/core/smp.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/read_first_line.hh>
-#endif
 
 namespace seastar {
 
@@ -72,6 +65,13 @@ public:
     }
     future<> get_future() {
         return _pr.get_future();
+    }
+    // Re-arm for reuse after the previous future has been consumed.
+    // Directly replaces _pr with a fresh promise, avoiding the overhead of
+    // constructing a temporary pollable_fd_state_completion (which would
+    // also initialise the vtable pointer unnecessarily).
+    void reset() {
+        _pr = promise<>();
     }
 };
 
@@ -115,6 +115,9 @@ aio_storage_context::iocb_pool::iocb_pool() {
     for (unsigned i = 0; i != max_aio; ++i) {
         _free_iocbs.push(&_all_iocbs[i]);
     }
+#ifdef SEASTAR_IOCB_POOL_DEBUG
+    _iocb_allocated.reset();
+#endif
 }
 
 aio_storage_context::aio_storage_context(reactor& r)
@@ -130,10 +133,43 @@ aio_storage_context::~aio_storage_context() {
     internal::io_destroy(_io_context);
 }
 
+void aio_storage_context::reap_pending_retries() {
+    // Drain pending retries and complete them with -ECANCELED.
+    for (auto iocb : _pending_aio_retry) {
+        _iocb_pool.put_one(iocb);
+        auto desc = get_user_data<kernel_completion>(*iocb);
+        desc->complete_with(-ECANCELED);
+    }
+    _pending_aio_retry.clear();
+
+    // _aio_retries is empty in the normal call path: this function only runs
+    // after the retry loop's future has resolved, and that loop's predicate
+    // only returns true when both vectors are empty. The drain below is
+    // defensive — if a future change to schedule_retry() leaves entries
+    // here, we still avoid leaking iocbs.
+    for (auto iocb : _aio_retries) {
+        _iocb_pool.put_one(iocb);
+        auto desc = get_user_data<kernel_completion>(*iocb);
+        desc->complete_with(-ECANCELED);
+    }
+    _aio_retries.clear();
+}
+
 future<> aio_storage_context::stop() noexcept {
+    // Set _stopping first so any reap_completions() and schedule_retry()
+    // calls that race with the drain below see the right state.
+    _stopping = true;
+
+    // Drain items in io_sink (operations without allocated iocbs yet).
+    _r._io_sink.drain([] (const internal::io_request& req, io_completion* desc) -> bool {
+        desc->complete_with(-ECANCELED);
+        return true;
+    });
+
     return std::exchange(_pending_aio_retry_fut, make_ready_future<>()).finally([this] {
         return do_until([this] { return !_iocb_pool.outstanding(); }, [this] {
-            reap_completions(false);
+            reap_completions();
+            reap_pending_retries();
             return make_ready_future<>();
         });
     });
@@ -144,12 +180,29 @@ internal::linux_abi::iocb&
 aio_storage_context::iocb_pool::get_one() {
     auto io = _free_iocbs.top();
     _free_iocbs.pop();
+#ifdef SEASTAR_IOCB_POOL_DEBUG
+    auto index = io - _all_iocbs.data();
+    SEASTAR_ASSERT(index < max_aio);
+    SEASTAR_ASSERT(!_iocb_allocated[index] && "Double allocation of iocb");
+    _iocb_allocated[index] = true;
+#endif
     return *io;
 }
 
 inline
 void
 aio_storage_context::iocb_pool::put_one(internal::linux_abi::iocb* io) {
+#ifdef SEASTAR_IOCB_POOL_DEBUG
+    auto index = io - _all_iocbs.data();
+    SEASTAR_ASSERT(index < max_aio && "iocb pointer out of range");
+    if (!_iocb_allocated[index]) {
+        seastar_logger.error("Double-free detected: iocb at index {} (ptr={}) is being returned but was not allocated",
+                           index, fmt::ptr(io));
+        std::abort();
+    }
+    _iocb_allocated[index] = false;
+    SEASTAR_ASSERT(_free_iocbs.size() < max_aio && "Double-free: iocb pool already full");
+#endif
     _free_iocbs.push(io);
 }
 
@@ -243,7 +296,7 @@ aio_storage_context::submit_work() {
         did_work = true;
     }
 
-    if (need_to_retry() && !retry_in_progress()) {
+    if (need_to_retry()) {
         schedule_retry();
     }
 
@@ -251,6 +304,15 @@ aio_storage_context::submit_work() {
 }
 
 void aio_storage_context::schedule_retry() {
+    // Don't start a new retry loop if either:
+    //   (a) one is already in flight  (!_pending_aio_retry_fut.available()),
+    //   (b) we're shutting down       (_stopping) — stop() will drain the
+    //       queues itself; starting a second loop here would race with
+    //       stop()'s drain on the same iocb pool (the original double-free).
+    if (!_pending_aio_retry_fut.available() || _stopping) {
+        return;
+    }
+
     // loop until both _pending_aio_retry and _aio_retries are empty.
     // While retrying _aio_retries, new retries may be queued onto _pending_aio_retry.
     _pending_aio_retry_fut = do_until([this] {
@@ -296,6 +358,11 @@ void aio_storage_context::schedule_retry() {
 
 bool aio_storage_context::reap_completions(bool allow_retry)
 {
+    // During shutdown, complete EAGAIN iocbs immediately instead of
+    // queuing them for retry — schedule_retry() is gated on _stopping.
+    if (_stopping) {
+        allow_retry = false;
+    }
     struct timespec timeout = {0, 0};
     auto n = io_getevents(_io_context, 1, max_aio, _ev_buffer, &timeout, _r._cfg.force_io_getevents_syscall);
     if (n == -1 && errno == EINTR) {
@@ -519,7 +586,8 @@ void reactor_backend_aio::signal_received(int signo, siginfo_t* siginfo, void* i
 }
 
 reactor_backend_aio::reactor_backend_aio(reactor& r)
-    : _r(r)
+    : reactor_backend(uses_blocking_io::no, supports_aio_fdatasync::yes)
+    , _r(r)
     , _hrtimer_timerfd(make_timerfd())
     , _storage_context(_r)
     , _preempting_io(_r, _r._task_quota_timer, _hrtimer_timerfd)
@@ -535,6 +603,10 @@ reactor_backend_aio::reactor_backend_aio(reactor& r)
     sigset_t mask = make_sigset_mask(hrtimer_signal());
     auto e = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
     SEASTAR_ASSERT(e == 0);
+}
+
+std::string_view reactor_backend_aio::get_backend_name() const {
+    return "linux-aio";
 }
 
 bool reactor_backend_aio::reap_kernel_completions() {
@@ -617,7 +689,7 @@ future<> reactor_backend_aio::poll(pollable_fd_state& fd, int events) {
         auto* iocb = pfd->get_iocb(events);
         auto* desc = pfd->get_desc(events);
         *iocb = make_poll_iocb(fd.fd.get(), events);
-        *desc = pollable_fd_state_completion{};
+        desc->reset();
         set_user_data(*iocb, desc);
         _polling_io.queue(iocb);
         return pfd->get_completion_future(events);
@@ -684,6 +756,11 @@ reactor_backend_aio::sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_
     return _r.do_sendmsg(fd, iovs, len);
 }
 
+future<size_t>
+reactor_backend_aio::writev(pollable_fd_state& fd, std::span<iovec> iovs) {
+    return _r.do_writev(fd, iovs);
+}
+
 future<temporary_buffer<char>>
 reactor_backend_aio::recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba) {
     return _r.do_recv_some(fd, ba);
@@ -720,7 +797,8 @@ reactor_backend_aio::make_pollable_fd_state(file_desc fd, pollable_fd::speculati
 }
 
 reactor_backend_epoll::reactor_backend_epoll(reactor& r)
-        : _r(r)
+        : reactor_backend(uses_blocking_io::no, supports_aio_fdatasync::yes)
+        , _r(r)
         , _steady_clock_timer_reactor_thread(file_desc::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK|TFD_CLOEXEC))
         , _steady_clock_timer_timer_thread(file_desc::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK|TFD_CLOEXEC))
         , _epollfd(file_desc::epoll_create(EPOLL_CLOEXEC))
@@ -761,7 +839,7 @@ reactor_backend_epoll::task_quota_timer_thread_fn() {
         _r.request_preemption();
     }
 
-    while (!_r._dying.load(std::memory_order_relaxed)) {
+    while (!_dying.load(std::memory_order_relaxed)) {
         // Wait for either the task quota timer, or the high resolution timer, or both,
         // to expire.
         struct pollfd pfds[2] = {};
@@ -790,6 +868,10 @@ reactor_backend_epoll::task_quota_timer_thread_fn() {
 
 reactor_backend_epoll::~reactor_backend_epoll() = default;
 
+std::string_view reactor_backend_epoll::get_backend_name() const {
+    return "epoll";
+}
+
 void reactor_backend_epoll::start_tick() {
     _task_quota_timer_thread = std::thread(&reactor_backend_epoll::task_quota_timer_thread_fn, this);
 
@@ -802,7 +884,7 @@ void reactor_backend_epoll::start_tick() {
 }
 
 void reactor_backend_epoll::stop_tick() {
-    _r._dying.store(true, std::memory_order_relaxed);
+    _dying.store(true, std::memory_order_relaxed);
     _r._task_quota_timer.timerfd_settime(0, seastar::posix::to_relative_itimerspec(1ns, 1ms)); // Make the timer fire soon
     _task_quota_timer_thread.join();
 }
@@ -873,7 +955,7 @@ reactor_backend_epoll::wait_and_process(int timeout, const sigset_t* active_sigm
             evt.events = pfd->events_requested;
         }
         auto events = evt.events & (EPOLLIN | EPOLLOUT | EPOLLRDHUP);
-        auto events_to_remove = has_error ? pfd->events_requested : events & ~pfd->events_requested;
+        auto events_to_remove = events & ~pfd->events_requested;
         complete_epoll_event(*pfd, events, EPOLLRDHUP);
         if (pfd->events_rw) {
             // accept() signals normal completions via EPOLLIN, but errors (due to shutdown())
@@ -891,6 +973,13 @@ reactor_backend_epoll::wait_and_process(int timeout, const sigset_t* active_sigm
             evt.events = pfd->events_epoll;
             auto op = evt.events ? EPOLL_CTL_MOD : EPOLL_CTL_DEL;
             ::epoll_ctl(_epollfd.get(), op, pfd->fd.get(), &evt);
+        } else if (has_error) {
+            // In the error case, all requested events are cleared (as we handle
+            // all requested events on error), so unconditionally delete the fd
+            // from epoll, which avoids edge conditions where we otherwise might
+            // get stuck spinning.
+            pfd->events_epoll = 0;
+            ::epoll_ctl(_epollfd.get(), EPOLL_CTL_DEL, pfd->fd.get(), nullptr);
         }
     }
     return nr;
@@ -916,7 +1005,7 @@ public:
     {}
     future<> get_completion_future(int event) {
         auto desc = get_desc(event);
-        *desc = pollable_fd_state_completion{};
+        desc->reset();
         return desc->get_future();
     }
 
@@ -1068,6 +1157,11 @@ reactor_backend_epoll::send(pollable_fd_state& fd, const void* buffer, size_t le
 future<size_t>
 reactor_backend_epoll::sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) {
     return _r.do_sendmsg(fd, iovs, len);
+}
+
+future<size_t>
+reactor_backend_epoll::writev(pollable_fd_state& fd, std::span<iovec> iovs) {
+    return _r.do_writev(fd, iovs);
 }
 
 future<temporary_buffer<char>>
@@ -1308,9 +1402,11 @@ private:
         auto sqe = get_sqe();
         ::io_uring_prep_poll_add(sqe, fd.fd.get(), events);
         auto ufd = static_cast<uring_pollable_fd_state*>(&fd);
-        ::io_uring_sqe_set_data(sqe, static_cast<kernel_completion*>(ufd->get_desc(events)));
+        auto* desc = ufd->get_desc(events);
+        desc->reset();
+        ::io_uring_sqe_set_data(sqe, static_cast<kernel_completion*>(desc));
         _has_pending_submissions = true;
-        return ufd->get_completion_future(events);
+        return desc->get_future();
     }
 
     void submit_io_request(const internal::io_request& req, io_completion* completion) {
@@ -1431,7 +1527,8 @@ private:
     }
 public:
     explicit reactor_backend_uring(reactor& r)
-            : _r(r)
+            : reactor_backend(uses_blocking_io::yes, supports_aio_fdatasync::yes)
+            , _r(r)
             , _uring(try_create_uring(s_queue_len, true).value())
             , _hrtimer_timerfd(make_timerfd())
             , _preempt_io_context(_r, _r._task_quota_timer, _hrtimer_timerfd)
@@ -1444,6 +1541,9 @@ public:
     }
     ~reactor_backend_uring() {
         ::io_uring_queue_exit(&_uring);
+    }
+    virtual std::string_view get_backend_name() const override {
+        return "io_uring";
     }
     virtual bool reap_kernel_completions() override {
         return do_process_kernel_completions();
@@ -1526,7 +1626,7 @@ public:
             void complete(size_t fd) noexcept final {
                 _listenfd.speculate_epoll(EPOLLIN);
                 pollable_fd pfd(file_desc::from_fd(fd), pollable_fd::speculation(EPOLLOUT));
-                _result.set_value(std::move(pfd), std::move(_sa));
+                _result.emplace_value(std::move(pfd), std::move(_sa));
                 delete this;
             }
             void set_exception(std::exception_ptr eptr) noexcept final {
@@ -1747,6 +1847,10 @@ public:
         return submit_request(std::move(desc), std::move(req));
     }
 
+    virtual future<size_t> writev(pollable_fd_state& fd, std::span<iovec> iovs) override {
+        return _r.do_writev(fd, iovs);
+    }
+
 #if SEASTAR_API_LEVEL < 9
     virtual future<size_t> send(pollable_fd_state& fd, const void* buffer, size_t len) override {
         if (fd.take_speculation(EPOLLOUT)) {
@@ -1840,10 +1944,6 @@ public:
         return submit_request(std::move(desc), std::move(req));
     }
 
-    virtual bool do_blocking_io() const override {
-        return true;
-    }
-
     virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) override {
         _r._signals.action(signo, siginfo, ignore);
     }
@@ -1904,7 +2004,12 @@ bool reactor_backend_selector::has_enough_aio_nr() {
      * So this method calculates:
      *  Available AIO on the system - (request AIO per-cpu * ncpus)
      */
-    if (aio_max_nr - aio_nr < reactor::max_aio * smp::count) {
+    // FIXME: available() is called during app_template construction, before
+    // smp::configure() runs, so the shard count is not yet known. The old code
+    // read smp::count which was 0 at this point, making this check a no-op.
+    // Pass 0 to preserve that (broken) behavior until the initialization order
+    // is fixed.
+    if (aio_max_nr - aio_nr < reactor::max_aio * 0) {
         return false;
     }
     return true;

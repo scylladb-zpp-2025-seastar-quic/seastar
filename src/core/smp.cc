@@ -18,9 +18,6 @@
 /*
  * Copyright 2019 ScyllaDB
  */
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <boost/range/algorithm/find_if.hpp>
 #include <atomic>
@@ -30,9 +27,6 @@ module;
 #include <unistd.h>
 #include <fcntl.h>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/smp.hh>
 #include <seastar/core/alien.hh>
 #include <seastar/core/resource.hh>
@@ -43,7 +37,6 @@ module seastar;
 #include <seastar/core/posix.hh>
 #include <seastar/core/align.hh>
 #include "prefault.hh"
-#endif
 
 namespace seastar {
 
@@ -87,19 +80,19 @@ static_assert(std::is_nothrow_copy_constructible_v<smp_submit_to_options>);
 static_assert(std::is_nothrow_move_constructible_v<smp_submit_to_options>);
 
 future<smp_service_group> create_smp_service_group(smp_service_group_config ssgc) noexcept {
-    ssgc.max_nonlocal_requests = std::max(ssgc.max_nonlocal_requests, smp::count - 1);
+    ssgc.max_nonlocal_requests = std::max(ssgc.max_nonlocal_requests, this_smp_shard_count() - 1);
     return smp::submit_to(0, [ssgc] {
         return with_semaphore(smp_service_group_management_sem, 1, [ssgc] {
             auto it = boost::range::find_if(smp_service_groups, [&] (smp_service_group_impl& ssgi) { return ssgi.clients.empty(); });
             size_t id = it - smp_service_groups.begin();
-            return parallel_for_each(smp::all_cpus(), [ssgc, id] (unsigned cpu) {
+            return parallel_for_each(this_smp_all_shards(), [ssgc, id] (unsigned cpu) {
               return smp::submit_to(cpu, [ssgc, id, cpu] {
                 if (id >= smp_service_groups.size()) {
                     smp_service_groups.resize(id + 1); // may throw
                 }
-                smp_service_groups[id].clients.reserve(smp::count); // may throw
-                auto per_client = smp::count > 1 ? ssgc.max_nonlocal_requests / (smp::count - 1) : 0u;
-                for (unsigned i = 0; i != smp::count; ++i) {
+                smp_service_groups[id].clients.reserve(this_smp_shard_count()); // may throw
+                auto per_client = this_smp_shard_count() > 1 ? ssgc.max_nonlocal_requests / (this_smp_shard_count() - 1) : 0u;
+                for (unsigned i = 0; i != this_smp_shard_count(); ++i) {
                     smp_service_groups[id].clients.emplace_back(per_client, make_service_group_semaphore_exception_factory(id, i, cpu, ssgc.group_name));
                 }
               });
@@ -155,8 +148,8 @@ void init_default_smp_service_group(shard_id cpu) {
     smp_service_groups.clear();
     smp_service_groups.emplace_back();
     auto& ssg0 = smp_service_groups.back();
-    ssg0.clients.reserve(smp::count);
-    for (unsigned i = 0; i != smp::count; ++i) {
+    ssg0.clients.reserve(this_smp_shard_count());
+    for (unsigned i = 0; i != this_smp_shard_count(); ++i) {
         ssg0.clients.emplace_back(smp_service_group_semaphore::max_counter(), make_service_group_semaphore_exception_factory(0, i, cpu, {"default"}));
     }
 }

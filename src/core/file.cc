@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <coroutine>
 #include <deque>
 #include <functional>
@@ -73,6 +74,7 @@
 #include <seastar/core/io_queue.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
 #include "core/file-impl.hh"
 #include "core/syscall_result.hh"
 #include "core/thread_pool.hh"
@@ -86,6 +88,20 @@ struct alignments {
     unsigned disk_read;
     unsigned disk_write;
     unsigned disk_overwrite;
+
+    // The kernel/FS ABIs that produce these values (BLKSSZGET, XFS_IOC_DIOINFO,
+    // statx dio_*_align, posix_memalign) all guarantee power-of-two alignments,
+    // and seastar's own I/O paths consume them via `x & (align - 1)` masking
+    // (e.g. computing the unaligned prefix of a read offset), which would
+    // silently produce wrong offsets for a non-power-of-two value.
+    // Returns *this for convenience.
+    const alignments& validated() const {
+        SEASTAR_ASSERT(std::has_single_bit(memory));
+        SEASTAR_ASSERT(std::has_single_bit(disk_read));
+        SEASTAR_ASSERT(std::has_single_bit(disk_write));
+        SEASTAR_ASSERT(std::has_single_bit(disk_overwrite));
+        return *this;
+    }
 };
 
 // Minimum memory alignment required by posix_memalign
@@ -100,7 +116,7 @@ struct fs_info {
     bool append_challenged;
     unsigned append_concurrency;
     bool fsync_is_exclusive;
-    bool nowait_works;
+    nowait_mode nowait_works;
     std::optional<alignments> align;
 };
 
@@ -134,6 +150,8 @@ file_handle::to_file() && {
 
 posix_file_impl::posix_file_impl(int fd, open_flags f, file_open_options options, dev_t device_id, const internal::fs_info& fsi)
         : _nowait_works(fsi.nowait_works)
+        , _durable(options.durable)
+        , _aio_fdatasync(engine().have_aio_fdatasync())
         , _device_id(device_id)
         , _io_queue(engine().get_io_queue(_device_id))
         , _open_flags(f)
@@ -165,14 +183,19 @@ void posix_file_impl::configure_io_lengths() noexcept {
     _write_max_length = std::min<size_t>(_write_max_length, limits.max_write);
 }
 
+template <typename FileImpl>
 std::unique_ptr<seastar::file_handle_impl>
-posix_file_impl::dup() {
+posix_file_impl::do_dup() {
+    if ((_open_flags & open_flags_mode_mask) != open_flags::ro) {
+        throw std::runtime_error("File is not read-only");
+    }
+
     if (!_refcount) {
         _refcount = new std::atomic<unsigned>(1u);
     }
-    auto ret = std::make_unique<posix_file_handle_impl>(_fd, _open_flags, _refcount, _device_id,
+    auto ret = std::make_unique<posix_file_handle_impl<FileImpl>>(_fd, _open_flags, _refcount, _device_id,
             _memory_dma_alignment, _disk_read_dma_alignment, _disk_write_dma_alignment, _disk_overwrite_dma_alignment,
-            _nowait_works);
+            _nowait_works, _durable, _aio_fdatasync);
     _refcount->fetch_add(1, std::memory_order_relaxed);
     return ret;
 }
@@ -182,9 +205,11 @@ posix_file_impl::posix_file_impl(int fd, open_flags f, std::atomic<unsigned>* re
         uint32_t disk_read_dma_alignment,
         uint32_t disk_write_dma_alignment,
         uint32_t disk_overwrite_dma_alignment,
-        bool nowait_works)
+        nowait_mode nowait_works, bool durable, bool aio_fdatasync)
         : _refcount(refcount)
         , _nowait_works(nowait_works)
+        , _durable(durable)
+        , _aio_fdatasync(aio_fdatasync)
         , _device_id(device_id)
         , _io_queue(engine().get_io_queue(_device_id))
         , _open_flags(f)
@@ -198,12 +223,60 @@ posix_file_impl::posix_file_impl(int fd, open_flags f, std::atomic<unsigned>* re
 
 future<>
 posix_file_impl::flush() noexcept {
-    if ((_open_flags & open_flags::dsync) != open_flags{}) {
+    if (!_durable || ((_open_flags & open_flags::dsync) != open_flags{})) {
         // If the file is opened with open_flags::dsync, all writes are already
         // fdatasync-ed to the disk, so we don't need to fdatasync again.
         return make_ready_future<>();
     }
-    return engine().fdatasync(_fd);
+
+    reactor::io_stats::local().fsyncs++;
+    return fdatasync(_aio_fdatasync, _fd, _io_queue.sink());
+}
+
+future<>
+reactor::fdatasync(int fd) noexcept {
+    if (_cfg.bypass_fsync) {
+        return make_ready_future<>();
+    }
+    _io_stats.fsyncs++;
+    return posix_file_impl::fdatasync(_cfg.have_aio_fsync, fd, _io_sink);
+}
+
+future<> posix_file_impl::fdatasync(bool with_aio, int fd, internal::io_sink& sink) {
+    if (with_aio) {
+        // Does not go through the I/O queue, but has to be deleted
+        struct fsync_io_desc final : public io_completion {
+            promise<> _pr;
+        public:
+            virtual void complete(size_t res) noexcept override {
+                _pr.set_value();
+                delete this;
+            }
+
+            virtual void set_exception(std::exception_ptr eptr) noexcept override {
+                _pr.set_exception(std::move(eptr));
+                delete this;
+            }
+
+            future<> get_future() {
+                return _pr.get_future();
+            }
+        };
+
+        auto desc = new fsync_io_desc;
+        auto fut = desc->get_future();
+        auto req = internal::io_request::make_fdatasync(fd);
+        sink.submit(desc, std::move(req));
+        co_await std::move(fut);
+        co_return;
+    }
+    syscall_result<int> sr = co_await engine()._thread_pool->submit<syscall_result<int>>(
+            internal::thread_pool_submit_reason::file_operation, [fd] {
+        return wrap_syscall<int>(::fdatasync(fd));
+    });
+    if (sr.failed()) {
+        co_await coroutine::return_exception_ptr(sr.make_system_error_ptr());
+    }
 }
 
 future<struct stat>
@@ -214,7 +287,9 @@ posix_file_impl::stat() noexcept {
         auto ret = ::fstat(fd, &st);
         return wrap_syscall(ret, st);
     });
-    ret.throw_if_error();
+    if (ret.failed()) {
+        co_return coroutine::exception(ret.make_system_error_ptr());
+    }
     co_return ret.extra;
 }
 
@@ -226,7 +301,9 @@ posix_file_impl::statat(std::string_view name, int flags) noexcept {
         auto ret = ::fstatat(fd, name.data(), &st, flags);
         return wrap_syscall(ret, st);
     });
-    ret.throw_if_error();
+    if (ret.failed()) {
+        co_return coroutine::exception(ret.make_system_error_ptr());
+    }
     co_return ret.extra;
 }
 
@@ -236,7 +313,9 @@ posix_file_impl::truncate(uint64_t length) noexcept {
             internal::thread_pool_submit_reason::file_operation, [this, length] {
         return wrap_syscall<int>(::ftruncate(_fd, length));
     });
-    sr.throw_if_error();
+    if (sr.failed()) {
+        co_await coroutine::return_exception_ptr(sr.make_system_error_ptr());
+    }
 }
 
 future<int>
@@ -245,7 +324,9 @@ posix_file_impl::ioctl(uint64_t cmd, void* argp) noexcept {
             internal::thread_pool_submit_reason::file_operation, [this, cmd, argp] () mutable {
         return wrap_syscall<int>(::ioctl(_fd, cmd, argp));
     });
-    sr.throw_if_error();
+    if (sr.failed()) {
+        co_return coroutine::exception(sr.make_system_error_ptr());
+    }
     // Some ioctls require to return a positive integer back.
     co_return sr.result;
 }
@@ -266,7 +347,9 @@ posix_file_impl::fcntl(int op, uintptr_t arg) noexcept {
             internal::thread_pool_submit_reason::file_operation, [this, op, arg] () mutable {
         return wrap_syscall<int>(::fcntl(_fd, op, arg));
     });
-    sr.throw_if_error();
+    if (sr.failed()) {
+        co_return coroutine::exception(sr.make_system_error_ptr());
+    }
     // Some fcntls require to return a positive integer back.
     co_return sr.result;
 }
@@ -288,7 +371,9 @@ posix_file_impl::discard(uint64_t offset, uint64_t length) noexcept {
         return wrap_syscall<int>(::fallocate(_fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,
             offset, length));
     });
-    sr.throw_if_error();
+    if (sr.failed()) {
+        co_await coroutine::return_exception_ptr(sr.make_system_error_ptr());
+    }
 }
 
 future<>
@@ -308,10 +393,25 @@ posix_file_impl::allocate(uint64_t position, uint64_t length) noexcept {
         }
         return wrap_syscall<int>(ret);
     });
-    sr.throw_if_error();
+    if (sr.failed()) {
+        co_await coroutine::return_exception_ptr(sr.make_system_error_ptr());
+    }
 #else
     return make_ready_future<>();
 #endif
+}
+
+future<file_mapping>
+posix_file_impl::mmap(size_t length, mmap_prot prot, mmap_private priv, size_t offset) noexcept {
+    auto sr = co_await engine()._thread_pool->submit<syscall_result<void*>>(
+            internal::thread_pool_submit_reason::file_operation, [fd = _fd, length, prot, priv, offset] {
+        int flags = bool(priv) ? MAP_PRIVATE : MAP_SHARED;
+        return wrap_syscall<void*>(::mmap(nullptr, length, static_cast<int>(prot), flags, fd, offset));
+    });
+    if (sr.failed()) {
+        co_return coroutine::exception(sr.make_system_error_ptr());
+    }
+    co_return file_mapping{sr.result, length};
 }
 
 future<uint64_t>
@@ -338,7 +438,7 @@ posix_file_impl::close() noexcept {
     delete _refcount;
     _refcount = nullptr;
     auto closed = make_ready_future<syscall_result<int>>(0, 0);
-    if ((_open_flags & open_flags::ro) != open_flags{}) {
+    if ((_open_flags & open_flags_mode_mask) == open_flags::ro) {
         closed = futurize_invoke([fd] () noexcept {
             return wrap_syscall<int>(::close(fd));
         });
@@ -372,7 +472,9 @@ blockdev_file_impl::size() noexcept {
         int ret = ::ioctl(_fd, BLKGETSIZE64, &size);
         return wrap_syscall(ret, size);
     });
-    ret.throw_if_error();
+    if (ret.failed()) {
+        co_return coroutine::exception(ret.make_system_error_ptr());
+    }
     co_return ret.extra;
 }
 
@@ -413,7 +515,9 @@ future<size_t> posix_file_impl::read_directory(int fd, char* buffer, size_t buff
         auto ret = ::syscall(__NR_getdents64, fd, reinterpret_cast<linux_dirent64*>(buffer), buffer_size);
         return wrap_syscall(ret);
     });
-    ret.throw_if_error();
+    if (ret.failed()) {
+        co_return coroutine::exception(ret.make_system_error_ptr());
+    }
     co_return ret.result;
 }
 
@@ -500,27 +604,27 @@ posix_file_impl::list_directory(std::function<future<> (directory_entry de)> nex
 
 future<size_t>
 posix_file_impl::do_write_dma(uint64_t pos, const void* buffer, size_t len, io_intent* intent) noexcept {
-    auto req = internal::io_request::make_write(_fd, pos, buffer, len, _nowait_works);
+    auto req = internal::io_request::make_write(_fd, pos, buffer, len, _nowait_works == nowait_mode::yes);
     return _io_queue.submit_io_write(len, std::move(req), intent);
 }
 
 future<size_t>
 posix_file_impl::do_write_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) noexcept {
     auto len = internal::sanitize_iovecs(iov, _disk_write_dma_alignment);
-    auto req = internal::io_request::make_writev(_fd, pos, iov, _nowait_works);
+    auto req = internal::io_request::make_writev(_fd, pos, iov, _nowait_works == nowait_mode::yes);
     return _io_queue.submit_io_write(len, std::move(req), intent, std::move(iov));
 }
 
 future<size_t>
 posix_file_impl::do_read_dma(uint64_t pos, void* buffer, size_t len, io_intent* intent) noexcept {
-    auto req = internal::io_request::make_read(_fd, pos, buffer, len, _nowait_works);
+    auto req = internal::io_request::make_read(_fd, pos, buffer, len, _nowait_works == nowait_mode::yes || _nowait_works == nowait_mode::read_only);
     return _io_queue.submit_io_read(len, std::move(req), intent);
 }
 
 future<size_t>
 posix_file_impl::do_read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) noexcept {
     auto len = internal::sanitize_iovecs(iov, _disk_read_dma_alignment);
-    auto req = internal::io_request::make_readv(_fd, pos, iov, _nowait_works);
+    auto req = internal::io_request::make_readv(_fd, pos, iov, _nowait_works == nowait_mode::yes || _nowait_works == nowait_mode::read_only);
     return _io_queue.submit_io_read(len, std::move(req), intent, std::move(iov));
 }
 
@@ -542,6 +646,11 @@ posix_file_real_impl::read_dma(uint64_t pos, void* buffer, size_t len, io_intent
 future<size_t>
 posix_file_real_impl::read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) noexcept {
     return posix_file_impl::do_read_dma(pos, std::move(iov), intent);
+}
+
+std::unique_ptr<seastar::file_handle_impl>
+posix_file_real_impl::dup() {
+    return posix_file_impl::do_dup<posix_file_real_impl>();
 }
 
 future<temporary_buffer<uint8_t>>
@@ -640,6 +749,37 @@ static bool blockdev_nowait_works(dev_t device_id) {
     return blockdev_gen_nowait_works;
 }
 
+static nowait_mode filesystem_nowait_mode(bool fs_capable, std::optional<bool> cfg_override) {
+    if (!fs_capable) {
+        return nowait_mode::no;
+    }
+    if (cfg_override.has_value()) {
+        return *cfg_override ? nowait_mode::yes : nowait_mode::no;
+    }
+
+    // First, the nowait became useable in 4.13, see
+    // https://lore.kernel.org/linux-xfs/20210117213401.GB78941@dread.disaster.area/
+    // and seastar commit 487d04ee (file, reactor: reinstate RWF_NOWAIT support)
+    //
+    // Then it was (un)intentionally broken by Linux-6.0 commit 66fa3ced (fs: Add
+    // async write file modification handling) so that lots of writes hit the need
+    // to update cmtimes for an inode and returned EAGAIN seeing the nowait flag.
+    // The change effectively allowed only read-only nowait AIO
+    //
+    // In Linux-7.0 lazytime mode cmtime update was patched to work nicely with the
+    // nowait flag, see 77ef2c3f (re-enable IOCB_NOWAIT writes to files v6)
+
+    if (internal::kernel_uname().whitelisted({"7.0"})) {
+        return nowait_mode::yes;
+    } else if (internal::kernel_uname().whitelisted({"6.0"})) {
+        return nowait_mode::read_only; // seastar issue #2974
+    } else if (internal::kernel_uname().whitelisted({"4.13"})) {
+        return nowait_mode::yes;
+    } else {
+        return nowait_mode::no;
+    }
+}
+
 future<>
 blockdev_file_impl::truncate(uint64_t length) noexcept {
     return make_ready_future<>();
@@ -652,7 +792,9 @@ blockdev_file_impl::discard(uint64_t offset, uint64_t length) noexcept {
         uint64_t range[2] { offset, length };
         return wrap_syscall<int>(::ioctl(_fd, BLKDISCARD, &range));
     });
-    sr.throw_if_error();
+    if (sr.failed()) {
+        co_await coroutine::return_exception_ptr(sr.make_system_error_ptr());
+    }
 }
 
 future<>
@@ -679,6 +821,11 @@ blockdev_file_impl::read_dma(uint64_t pos, void* buffer, size_t len, io_intent* 
 future<size_t>
 blockdev_file_impl::read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) noexcept {
     return posix_file_impl::do_read_dma(pos, std::move(iov), intent);
+}
+
+std::unique_ptr<seastar::file_handle_impl>
+blockdev_file_impl::dup() {
+    return posix_file_impl::do_dup<blockdev_file_impl>();
 }
 
 append_challenged_posix_file_impl::append_challenged_posix_file_impl(int fd, open_flags f, file_open_options options, const internal::fs_info& fsi, dev_t device_id)
@@ -978,6 +1125,12 @@ append_challenged_posix_file_impl::size() noexcept {
     return make_ready_future<size_t>(_logical_size);
 }
 
+std::unique_ptr<seastar::file_handle_impl>
+append_challenged_posix_file_impl::dup() {
+    throw std::runtime_error("File is not read-only");
+    return nullptr;
+}
+
 future<>
 append_challenged_posix_file_impl::close() noexcept {
     // Caller should have drained all pending I/O
@@ -995,30 +1148,67 @@ append_challenged_posix_file_impl::close() noexcept {
     });
 }
 
-posix_file_handle_impl::~posix_file_handle_impl() {
+template <typename FileImpl>
+posix_file_handle_impl<FileImpl>::~posix_file_handle_impl() {
     if (_refcount && _refcount->fetch_add(-1, std::memory_order_relaxed) == 1) {
         ::close(_fd);
         delete _refcount;
     }
 }
 
+template <typename FileImpl>
 std::unique_ptr<seastar::file_handle_impl>
-posix_file_handle_impl::clone() const {
-    auto ret = std::make_unique<posix_file_handle_impl>(_fd, _open_flags, _refcount, _device_id,
-            _memory_dma_alignment, _disk_read_dma_alignment, _disk_write_dma_alignment, _disk_overwrite_dma_alignment, _nowait_works);
+posix_file_handle_impl<FileImpl>::clone() const {
+    auto ret = std::make_unique<posix_file_handle_impl<FileImpl>>(_fd, _open_flags, _refcount, _device_id,
+            _memory_dma_alignment, _disk_read_dma_alignment, _disk_write_dma_alignment, _disk_overwrite_dma_alignment, _nowait_works, _durable, _aio_fdatasync);
     if (_refcount) {
         _refcount->fetch_add(1, std::memory_order_relaxed);
     }
     return ret;
 }
 
+template <typename FileImpl>
 shared_ptr<file_impl>
-posix_file_handle_impl::to_file() && {
-    auto ret = ::seastar::make_shared<posix_file_real_impl>(_fd, _open_flags, _refcount, _device_id,
-            _memory_dma_alignment, _disk_read_dma_alignment, _disk_write_dma_alignment, _disk_overwrite_dma_alignment, _nowait_works);
+posix_file_handle_impl<FileImpl>::to_file() && {
+    auto ret = ::seastar::make_shared<FileImpl>(_fd, _open_flags, _refcount, _device_id,
+            _memory_dma_alignment, _disk_read_dma_alignment, _disk_write_dma_alignment, _disk_overwrite_dma_alignment, _nowait_works, _durable, _aio_fdatasync);
     _fd = -1;
     _refcount = nullptr;
     return ret;
+}
+
+file_mapping::~file_mapping() noexcept {
+    if (_addr || _length) {
+        seastar_logger.warn("file_mapping destroyed without unmap(); falling back to blocking ::munmap (reactor stall), contact support");
+        ::munmap(_addr, _length);
+    }
+}
+
+future<> file_mapping::unmap() noexcept {
+    void* addr = std::exchange(_addr, nullptr);
+    size_t length = std::exchange(_length, 0);
+    if (!addr) {
+        seastar_logger.warn("double unmap() detected, contact support");
+        co_return;
+    }
+
+    auto sr = co_await engine()._thread_pool->submit<syscall_result<int>>(
+            internal::thread_pool_submit_reason::file_operation, [addr, length] {
+        return wrap_syscall<int>(::munmap(addr, length));
+    });
+    if (sr.failed()) {
+        co_await coroutine::return_exception_ptr(sr.make_system_error_ptr());
+    }
+}
+
+future<> file_mapping::flush() noexcept {
+    auto sr = co_await engine()._thread_pool->submit<syscall_result<int>>(
+            internal::thread_pool_submit_reason::file_operation, [addr = _addr, length = _length] {
+        return wrap_syscall<int>(::msync(addr, length, MS_SYNC));
+    });
+    if (sr.failed()) {
+        co_await coroutine::return_exception_ptr(sr.make_system_error_ptr());
+    }
 }
 
 // Some kernels can append to xfs filesystems, some cannot; determine
@@ -1093,7 +1283,7 @@ internal::alignments filesystem_alignments(
     // Initialize with generic defaults for all filesystems
     internal::alignments align = {
         .memory = std::max(device_info.memory_alignment.value_or(4096), internal::min_memory_alignment),
-        .disk_read = 512,  // Linux O_DIRECT minimum
+        .disk_read = block_size,  // Linux O_DIRECT safe choice, might be reduced later
         .disk_write = block_size,
         .disk_overwrite = block_size,
     };
@@ -1119,7 +1309,7 @@ internal::alignments filesystem_alignments(
         align.disk_overwrite = std::max<unsigned>(align.disk_overwrite, *device_info.physical_block_size);
     }
 
-    return align;
+    return align.validated();
 }
 
 // Query block device alignment properties using ioctl and statx
@@ -1155,12 +1345,12 @@ blkdev_alignments(int fd, dev_t device_id) {
     //
     // The Linux kernel only enforces logical_block_size alignment for O_DIRECT (see block/fops.c:blkdev_dio_invalid).
     // Using physical_block_size avoids RMW at the hardware level.
-    return {
+    return internal::alignments{
         .memory = std::max(static_cast<unsigned>(device_info.memory_alignment.value_or(physical_block_size)), internal::min_memory_alignment),
         .disk_read = static_cast<unsigned>(logical_block_size),  // For reads: use logical_block_size (no performance penalty for reading 512-byte blocks from 4K sector disks)
         .disk_write = static_cast<unsigned>(physical_block_size),
         .disk_overwrite = static_cast<unsigned>(physical_block_size),
-    };
+    }.validated();
 }
 
 } // anonymous namespace
@@ -1172,7 +1362,7 @@ make_file_impl(int fd, file_open_options options, int flags, struct stat st) noe
             auto align = blkdev_alignments(fd, st.st_rdev);
             internal::fs_info fsi;
             fsi.block_size = align.disk_read; // use logical_block_size for block_size
-            fsi.nowait_works = blockdev_nowait_works(st.st_rdev);
+            fsi.nowait_works = blockdev_nowait_works(st.st_rdev) ? nowait_mode::yes : nowait_mode::no;
             fsi.align = align;
             return make_ready_future<shared_ptr<file_impl>>(make_shared<blockdev_file_impl>(fd, open_flags(flags), options, fsi, st.st_rdev));
         } catch (...) {
@@ -1185,7 +1375,7 @@ make_file_impl(int fd, file_open_options options, int flags, struct stat st) noe
         // query it here. Just provide something reasonable.
         internal::fs_info fsi;
         fsi.block_size = 4096;
-        fsi.nowait_works = false;
+        fsi.nowait_works = nowait_mode::no;
         return make_ready_future<shared_ptr<file_impl>>(make_shared<posix_file_real_impl>(fd, open_flags(flags), options, fsi, st.st_dev));
     }
 
@@ -1197,46 +1387,47 @@ make_file_impl(int fd, file_open_options options, int flags, struct stat st) noe
         return engine().fstatfs(fd).then([fd, options = std::move(options), flags, st = std::move(st)] (struct statfs sfs) {
             internal::fs_info fsi;
             fsi.block_size = sfs.f_bsize;
+            bool fs_nowait_works = false;
             switch (sfs.f_type) {
             case internal::fs_magic::xfs:
                 fsi.append_challenged = true;
                 static auto xc = xfs_concurrency_from_kernel_version();
                 fsi.append_concurrency = xc;
                 fsi.fsync_is_exclusive = true;
-                fsi.nowait_works = internal::kernel_uname().whitelisted({"4.13"});
+                fs_nowait_works = internal::kernel_uname().whitelisted({"4.13"});
                 break;
             case internal::fs_magic::nfs:
                 fsi.append_challenged = false;
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = false;
-                fsi.nowait_works = internal::kernel_uname().whitelisted({"4.13"});
+                fs_nowait_works = internal::kernel_uname().whitelisted({"4.13"});
                 break;
             case internal::fs_magic::ext4:
                 fsi.append_challenged = true;
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = false;
-                fsi.nowait_works = internal::kernel_uname().whitelisted({"5.5"});
+                fs_nowait_works = internal::kernel_uname().whitelisted({"5.5"});
                 break;
             case internal::fs_magic::btrfs:
                 fsi.append_challenged = true;
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = true;
-                fsi.nowait_works = internal::kernel_uname().whitelisted({"5.9"});
+                fs_nowait_works = internal::kernel_uname().whitelisted({"5.9"});
                 break;
             case internal::fs_magic::tmpfs:
             case internal::fs_magic::fuse:
+            case internal::fs_magic::hugetlbfs:
                 fsi.append_challenged = false;
                 fsi.append_concurrency = 999;
                 fsi.fsync_is_exclusive = false;
-                fsi.nowait_works = false;
                 break;
             default:
                 fsi.append_challenged = true;
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = true;
-                fsi.nowait_works = false;
             }
-            fsi.nowait_works &= engine()._cfg.aio_nowait_works;
+
+            fsi.nowait_works = filesystem_nowait_mode(fs_nowait_works, engine()._cfg.aio_nowait_works);
             fsi.align = filesystem_alignments(fd, st.st_dev, fsi.block_size, sfs.f_type);
             s_fstype.insert(std::make_pair(st.st_dev, std::move(fsi)));
             return make_file_impl(fd, std::move(options), flags, std::move(st));
@@ -1347,6 +1538,10 @@ future<> file::allocate(uint64_t position, uint64_t length) noexcept {
   } catch (...) {
     return current_exception_as_future();
   }
+}
+
+future<file_mapping> file::mmap(size_t length, mmap_prot prot, mmap_private priv, size_t offset) noexcept {
+    return _file_impl->mmap(length, prot, priv, offset);
 }
 
 future<> file::truncate(uint64_t length) noexcept {
@@ -1498,6 +1693,10 @@ future<struct stat> file_impl::statat(std::string_view name, int flags) {
     return make_exception_future<struct stat>(std::runtime_error("this file type does not support statat"));
 }
 
+future<file_mapping> file_impl::mmap(size_t length, mmap_prot prot, mmap_private priv, size_t offset) noexcept {
+    return make_exception_future<file_mapping>(std::runtime_error("this file type does not support mmap"));
+}
+
 future<file> open_file_dma(std::string_view name, open_flags flags) noexcept {
     return engine().open_file_dma(name, flags, file_open_options());
 }
@@ -1519,7 +1718,7 @@ make_append_challenged_posix_file(file_desc& fd, unsigned concurrency, bool fsyn
         .append_challenged = true,
         .append_concurrency = concurrency,
         .fsync_is_exclusive = fsync_is_exclusive,
-        .nowait_works = true,
+        .nowait_works = nowait_mode::yes,
         .align = std::nullopt,
     };
     // device number can be any value, reactor would just pick "fallback" queue

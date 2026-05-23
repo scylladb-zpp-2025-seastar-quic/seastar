@@ -21,9 +21,14 @@
 
 #pragma once
 
+#include <cstdio>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <linux/fs.h>
 #include <type_traits>
+
+#include <seastar/util/bool_class.hh>
 
 namespace seastar {
 
@@ -44,7 +49,7 @@ enum class open_flags {
     dsync = O_DSYNC,
 };
 
-inline open_flags operator|(open_flags a, open_flags b) {
+inline constexpr open_flags operator|(open_flags a, open_flags b) {
     return open_flags(std::underlying_type_t<open_flags>(a) | std::underlying_type_t<open_flags>(b));
 }
 
@@ -52,13 +57,19 @@ inline void operator|=(open_flags& a, open_flags b) {
     a = (a | b);
 }
 
-inline open_flags operator&(open_flags a, open_flags b) {
+inline constexpr open_flags operator&(open_flags a, open_flags b) {
     return open_flags(std::underlying_type_t<open_flags>(a) & std::underlying_type_t<open_flags>(b));
 }
 
 inline void operator&=(open_flags& a, open_flags b) {
     a = (a & b);
 }
+
+// The mask that should be used to extract only open-mode from the flags
+constexpr open_flags open_flags_mode_mask = open_flags(3);
+static_assert((open_flags_mode_mask & open_flags::ro) == open_flags::ro);
+static_assert((open_flags_mode_mask & open_flags::rw) == open_flags::rw);
+static_assert((open_flags_mode_mask & open_flags::wo) == open_flags::wo);
 
 /// Enumeration describing the type of a directory entry being listed.
 ///
@@ -102,6 +113,7 @@ enum class fs_type {
     btrfs,
     hfs,
     tmpfs,
+    hugetlbfs,
 };
 
 // Access flags for files/directories
@@ -115,11 +127,11 @@ enum class access_flags {
     lookup = execute,
 };
 
-inline access_flags operator|(access_flags a, access_flags b) {
+inline constexpr access_flags operator|(access_flags a, access_flags b) {
     return access_flags(std::underlying_type_t<access_flags>(a) | std::underlying_type_t<access_flags>(b));
 }
 
-inline access_flags operator&(access_flags a, access_flags b) {
+inline constexpr access_flags operator&(access_flags a, access_flags b) {
     return access_flags(std::underlying_type_t<access_flags>(a) & std::underlying_type_t<access_flags>(b));
 }
 
@@ -152,6 +164,62 @@ inline constexpr file_permissions operator|(file_permissions a, file_permissions
 
 inline constexpr file_permissions operator&(file_permissions a, file_permissions b) {
     return file_permissions(std::underlying_type_t<file_permissions>(a) & std::underlying_type_t<file_permissions>(b));
+}
+
+/// \brief Memory protection flags for mmap.
+///
+/// \see file::mmap()
+enum class mmap_prot {
+    none = PROT_NONE,
+    read = PROT_READ,
+    write = PROT_WRITE,
+    execute = PROT_EXEC,
+};
+
+inline constexpr mmap_prot operator|(mmap_prot a, mmap_prot b) {
+    return mmap_prot(std::underlying_type_t<mmap_prot>(a) | std::underlying_type_t<mmap_prot>(b));
+}
+
+inline void operator|=(mmap_prot& a, mmap_prot b) {
+    a = (a | b);
+}
+
+inline constexpr mmap_prot operator&(mmap_prot a, mmap_prot b) {
+    return mmap_prot(std::underlying_type_t<mmap_prot>(a) & std::underlying_type_t<mmap_prot>(b));
+}
+
+inline void operator&=(mmap_prot& a, mmap_prot b) {
+    a = (a & b);
+}
+
+/// \brief Visibility flag for mmap (`MAP_PRIVATE` when true, `MAP_SHARED` when false).
+///
+/// \see file::mmap()
+using mmap_private = bool_class<struct mmap_private_tag>;
+
+/// Flags for the rename_file() operation.
+///
+/// \see rename_file()
+enum class rename_flags {
+    none = 0,
+    /// Don't overwrite the target if it already exists; instead, fail with EEXIST.
+    noreplace = RENAME_NOREPLACE,
+    /// Atomically exchange the source and destination paths.
+    ///
+    /// See RENAME_EXCHANGE
+    exchange = RENAME_EXCHANGE,
+    /// Create a whiteout at the source (for overlayfs/union mounts).
+    ///
+    /// See RENAME_WHITEOUT
+    whiteout = RENAME_WHITEOUT,
+};
+
+inline constexpr rename_flags operator|(rename_flags a, rename_flags b) {
+    return rename_flags(std::underlying_type_t<rename_flags>(a) | std::underlying_type_t<rename_flags>(b));
+}
+
+inline constexpr rename_flags operator&(rename_flags a, rename_flags b) {
+    return rename_flags(std::underlying_type_t<rename_flags>(a) & std::underlying_type_t<rename_flags>(b));
 }
 
 /// @}

@@ -499,9 +499,11 @@ SEASTAR_TEST_CASE(test_rpc_remote_verb_error) {
     rpc_test_config cfg;
     return rpc_test_env<>::do_with_thread(cfg, [] (rpc_test_env<>& env) {
         test_rpc_proto::client c1(env.proto(), {}, env.make_socket(), ipv4_addr());
-        env.register_handler(1, []() { throw std::runtime_error("error"); }).get();
+        env.register_handler(1, []() { throw std::runtime_error("test_error"); }).get();
         auto f = env.proto().make_client<void ()>(1);
-        BOOST_REQUIRE_THROW(f(c1).get(), rpc::remote_verb_error);
+        BOOST_REQUIRE_EXCEPTION(f(c1).get(), rpc::remote_verb_error, [](const rpc::remote_verb_error& e) {
+            return std::string_view(e.what()) == "std::runtime_error: test_error";
+        });
         c1.stop().get();
     });
 }
@@ -792,7 +794,11 @@ SEASTAR_TEST_CASE(test_rpc_scheduling) {
     });
 }
 
-SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
+// Helper for connection-based scheduling tests with a synchronous
+// isolate_connection callback.
+// When test_compat is true, also tests that a client without an isolation
+// cookie falls back to the handler's static scheduling group (sg1).
+static void do_test_rpc_scheduling_connection_based(bool test_compat) {
     auto sg1 = create_scheduling_group("sg1", 100).get();
     auto sg1_kill = defer([&] () noexcept { destroy_scheduling_group(sg1).get(); });
     auto sg2 = create_scheduling_group("sg2", 100).get();
@@ -811,215 +817,155 @@ SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
     };
     rpc_test_config cfg;
     cfg.resource_limits = limits;
-    rpc_test_env<>::do_with_thread(cfg, [sg1, sg2] (rpc_test_env<>& env) {
+    rpc_test_env<>::do_with_thread(cfg, [sg1, sg2, test_compat] (rpc_test_env<>& env) {
         rpc::client_options co1;
         co1.isolation_cookie = "sg1";
         test_rpc_proto::client c1(env.proto(), co1, env.make_socket(), ipv4_addr());
         rpc::client_options co2;
         co2.isolation_cookie = "sg2";
         test_rpc_proto::client c2(env.proto(), co2, env.make_socket(), ipv4_addr());
-        env.register_handler(1, [] {
-            return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
-        }).get();
+        if (test_compat) {
+            // A server that uses sg1 if the client is old (no isolation cookie)
+            env.register_handler(1, sg1, [] () {
+                return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
+            }).get();
+        } else {
+            env.register_handler(1, [] {
+                return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
+            }).get();
+        }
         auto call_sg_id = env.proto().make_client<unsigned ()>(1);
         unsigned id;
         id = call_sg_id(c1).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
         id = call_sg_id(c2).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
+        if (test_compat) {
+            // An old client, that doesn't have an isolation cookie
+            rpc::client_options co3;
+            test_rpc_proto::client c3(env.proto(), co3, env.make_socket(), ipv4_addr());
+            id = call_sg_id(c3).get();
+            BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
+            c3.stop().get();
+        }
         c1.stop().get();
         c2.stop().get();
     }).get();
 }
 
+SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
+    do_test_rpc_scheduling_connection_based(false);
+}
+
 SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_compatibility) {
-    auto sg1 = create_scheduling_group("sg1", 100).get();
-    auto sg1_kill = defer([&] () noexcept { destroy_scheduling_group(sg1).get(); });
-    auto sg2 = create_scheduling_group("sg2", 100).get();
-    auto sg2_kill = defer([&] () noexcept { destroy_scheduling_group(sg2).get(); });
-    rpc::resource_limits limits;
-    limits.isolate_connection = [sg1, sg2] (sstring cookie) {
-        auto sg = current_scheduling_group();
-        if (cookie == "sg1") {
-            sg = sg1;
-        } else if (cookie == "sg2") {
-            sg = sg2;
+    do_test_rpc_scheduling_connection_based(true);
+}
+
+// Helper for connection-based scheduling tests with an asynchronous
+// isolate_connection callback (scheduling groups are created lazily on
+// first connection).
+// When test_compat is true, also tests that a client without an isolation
+// cookie falls back to the handler's static scheduling group (sg3), which
+// must be created upfront since sg1/sg2 don't exist at handler registration
+// time.
+static void do_test_rpc_scheduling_connection_based_async(bool test_compat) {
+    scheduling_group sg1 = default_scheduling_group();
+    scheduling_group sg2 = default_scheduling_group();
+    scheduling_group sg3 = test_compat
+        ? create_scheduling_group("sg3", 100).get()
+        : default_scheduling_group();
+    auto sg1_kill = defer([&] () noexcept {
+        if (sg1 != default_scheduling_group())  {
+            destroy_scheduling_group(sg1).get();
         }
-        rpc::isolation_config cfg;
-        cfg.sched_group = sg;
-        return cfg;
+    });
+    auto sg2_kill = defer([&] () noexcept {
+        if (sg2 != default_scheduling_group()) {
+            destroy_scheduling_group(sg2).get();
+        }
+    });
+    auto sg3_kill = defer([&] () noexcept {
+        if (sg3 != default_scheduling_group()) {
+            destroy_scheduling_group(sg3).get();
+        }
+    });
+    rpc::resource_limits limits;
+    limits.isolate_connection = [&sg1, &sg2] (sstring cookie) {
+        future<seastar::scheduling_group> get_scheduling_group = make_ready_future<>().then([&sg1, &sg2, cookie] {
+            if (cookie == "sg1") {
+                if (sg1 == default_scheduling_group()) {
+                    return create_scheduling_group("sg1", 100).then([&sg1] (seastar::scheduling_group sg) {
+                        sg1 = sg;
+                        return sg;
+                    });
+                } else {
+                    return make_ready_future<seastar::scheduling_group>(sg1);
+                }
+            } else if (cookie == "sg2") {
+                if (sg2 == default_scheduling_group()) {
+                    return create_scheduling_group("sg2", 100).then([&sg2] (seastar::scheduling_group sg) {
+                        sg2 = sg;
+                        return sg;
+                    });
+                } else {
+                    return make_ready_future<seastar::scheduling_group>(sg2);
+                }
+            }
+            return make_ready_future<seastar::scheduling_group>(current_scheduling_group());
+        });
+
+        return get_scheduling_group.then([] (scheduling_group sg) {
+            rpc::isolation_config cfg;
+            cfg.sched_group = sg;
+            return cfg;
+        });
     };
     rpc_test_config cfg;
     cfg.resource_limits = limits;
-    rpc_test_env<>::do_with_thread(cfg, [sg1, sg2] (rpc_test_env<>& env) {
+    rpc_test_env<>::do_with_thread(cfg, [&sg1, &sg2, &sg3, test_compat] (rpc_test_env<>& env) {
         rpc::client_options co1;
         co1.isolation_cookie = "sg1";
         test_rpc_proto::client c1(env.proto(), co1, env.make_socket(), ipv4_addr());
         rpc::client_options co2;
         co2.isolation_cookie = "sg2";
         test_rpc_proto::client c2(env.proto(), co2, env.make_socket(), ipv4_addr());
-        // An old client, that doesn't have an isolation cookie
-        rpc::client_options co3;
-        test_rpc_proto::client c3(env.proto(), co3, env.make_socket(), ipv4_addr());
-        // A server that uses sg1 if the client is old
-        env.register_handler(1, sg1, [] () {
-            return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
-        }).get();
+        if (test_compat) {
+            // A server that uses sg3 if the client is old (no isolation cookie).
+            // sg3 is needed because sg1/sg2 are created lazily and don't exist
+            // at handler registration time.
+            env.register_handler(1, sg3, [] () {
+                return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
+            }).get();
+        } else {
+            env.register_handler(1, [] {
+                return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
+            }).get();
+        }
         auto call_sg_id = env.proto().make_client<unsigned ()>(1);
         unsigned id;
         id = call_sg_id(c1).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
         id = call_sg_id(c2).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
-        id = call_sg_id(c3).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
+        if (test_compat) {
+            // An old client, that doesn't have an isolation cookie
+            rpc::client_options co3;
+            test_rpc_proto::client c3(env.proto(), co3, env.make_socket(), ipv4_addr());
+            id = call_sg_id(c3).get();
+            BOOST_REQUIRE(id == internal::scheduling_group_index(sg3));
+            c3.stop().get();
+        }
         c1.stop().get();
         c2.stop().get();
-        c3.stop().get();
     }).get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_async) {
-    scheduling_group sg1 = default_scheduling_group();
-    scheduling_group sg2 = default_scheduling_group();
-    auto sg1_kill = defer([&] () noexcept {
-        if (sg1 != default_scheduling_group())  {
-            destroy_scheduling_group(sg1).get();
-        }
-    });
-    auto sg2_kill = defer([&] () noexcept {
-        if (sg2 != default_scheduling_group()) {
-            destroy_scheduling_group(sg2).get();
-        }
-    });
-    rpc::resource_limits limits;
-    limits.isolate_connection = [&sg1, &sg2] (sstring cookie) {
-        future<seastar::scheduling_group> get_scheduling_group = make_ready_future<>().then([&sg1, &sg2, cookie] {
-            if (cookie == "sg1") {
-                if (sg1 == default_scheduling_group()) {
-                    return create_scheduling_group("sg1", 100).then([&sg1] (seastar::scheduling_group sg) {
-                        sg1 = sg;
-                        return sg;
-                    });
-                } else {
-                    return make_ready_future<seastar::scheduling_group>(sg1);
-                }
-            } else if (cookie == "sg2") {
-                if (sg2 == default_scheduling_group()) {
-                    return create_scheduling_group("sg2", 100).then([&sg2] (seastar::scheduling_group sg) {
-                        sg2 = sg;
-                        return sg;
-                    });
-                } else {
-                    return make_ready_future<seastar::scheduling_group>(sg2);
-                }
-            }
-            return make_ready_future<seastar::scheduling_group>(current_scheduling_group());
-        });
-
-        return get_scheduling_group.then([] (scheduling_group sg) {
-            rpc::isolation_config cfg;
-            cfg.sched_group = sg;
-            return cfg;
-        });
-    };
-    rpc_test_config cfg;
-    cfg.resource_limits = limits;
-    rpc_test_env<>::do_with_thread(cfg, [&sg1, &sg2] (rpc_test_env<>& env) {
-        rpc::client_options co1;
-        co1.isolation_cookie = "sg1";
-        test_rpc_proto::client c1(env.proto(), co1, env.make_socket(), ipv4_addr());
-        rpc::client_options co2;
-        co2.isolation_cookie = "sg2";
-        test_rpc_proto::client c2(env.proto(), co2, env.make_socket(), ipv4_addr());
-        env.register_handler(1, [] {
-            return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
-        }).get();
-        auto call_sg_id = env.proto().make_client<unsigned ()>(1);
-        unsigned id;
-        id = call_sg_id(c1).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
-        id = call_sg_id(c2).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
-        c1.stop().get();
-        c2.stop().get();
-    }).get();
+    do_test_rpc_scheduling_connection_based_async(false);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_compatibility_async) {
-    scheduling_group sg1 = default_scheduling_group();
-    scheduling_group sg2 = default_scheduling_group();
-    scheduling_group sg3 = create_scheduling_group("sg3", 100).get();
-    auto sg1_kill = defer([&] () noexcept {
-        if (sg1 != default_scheduling_group())  {
-            destroy_scheduling_group(sg1).get();
-        }
-    });
-    auto sg2_kill = defer([&] () noexcept {
-        if (sg2 != default_scheduling_group()) {
-            destroy_scheduling_group(sg2).get();
-        }
-    });
-    auto sg3_kill = defer([&] () noexcept { destroy_scheduling_group(sg3).get(); });
-    rpc::resource_limits limits;
-    limits.isolate_connection = [&sg1, &sg2] (sstring cookie) {
-        future<seastar::scheduling_group> get_scheduling_group = make_ready_future<>().then([&sg1, &sg2, cookie] {
-            if (cookie == "sg1") {
-                if (sg1 == default_scheduling_group()) {
-                    return create_scheduling_group("sg1", 100).then([&sg1] (seastar::scheduling_group sg) {
-                        sg1 = sg;
-                        return sg;
-                    });
-                } else {
-                    return make_ready_future<seastar::scheduling_group>(sg1);
-                }
-            } else if (cookie == "sg2") {
-                if (sg2 == default_scheduling_group()) {
-                    return create_scheduling_group("sg2", 100).then([&sg2] (seastar::scheduling_group sg) {
-                        sg2 = sg;
-                        return sg;
-                    });
-                } else {
-                    return make_ready_future<seastar::scheduling_group>(sg2);
-                }
-            }
-            return make_ready_future<seastar::scheduling_group>(current_scheduling_group());
-        });
-
-        return get_scheduling_group.then([] (scheduling_group sg) {
-            rpc::isolation_config cfg;
-            cfg.sched_group = sg;
-            return cfg;
-        });
-    };
-    rpc_test_config cfg;
-    cfg.resource_limits = limits;
-    rpc_test_env<>::do_with_thread(cfg, [&sg1, &sg2, &sg3] (rpc_test_env<>& env) {
-        rpc::client_options co1;
-        co1.isolation_cookie = "sg1";
-        test_rpc_proto::client c1(env.proto(), co1, env.make_socket(), ipv4_addr());
-        rpc::client_options co2;
-        co2.isolation_cookie = "sg2";
-        test_rpc_proto::client c2(env.proto(), co2, env.make_socket(), ipv4_addr());
-        // An old client, that doesn't have an isolation cookie
-        rpc::client_options co3;
-        test_rpc_proto::client c3(env.proto(), co3, env.make_socket(), ipv4_addr());
-        // A server that uses sg3 if the client is old
-        env.register_handler(1, sg3, [] () {
-            return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
-        }).get();
-        auto call_sg_id = env.proto().make_client<unsigned ()>(1);
-        unsigned id;
-        id = call_sg_id(c1).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
-        id = call_sg_id(c2).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
-        id = call_sg_id(c3).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg3));
-        c1.stop().get();
-        c2.stop().get();
-        c3.stop().get();
-    }).get();
+    do_test_rpc_scheduling_connection_based_async(true);
 }
 
 void test_compressor(std::function<std::unique_ptr<seastar::rpc::compressor>()> compressor_factory) {
@@ -1287,14 +1233,11 @@ SEASTAR_THREAD_TEST_CASE(test_lz4_fragmented_compressor) {
     test_compressor([] { return std::make_unique<rpc::lz4_fragmented_compressor>(); });
 }
 
-// Test reproducing issue #671: If timeout is time_point::max(), translating
-// it to relative timeout in the sender and then back in the receiver, when
-// these calculations happen across a millisecond boundary, overflowed the
-// integer and mislead the receiver to think the requested timeout was
-// negative, and cause it drop its response, so the RPC call never completed.
-SEASTAR_TEST_CASE(test_max_absolute_timeout) {
-    // The typical failure of this test is a hang. So we use semaphore to
-    // stop the test either when it succeeds, or after a long enough hang.
+// Helper for tests reproducing max-timeout overflow bugs. The typical failure
+// mode is a hang, so a semaphore watchdog is used to bound the test duration.
+// Registers a simple a+b handler and invokes `body` with the env and client,
+// leaving the timeout type and call pattern to the caller.
+static future<> test_max_timeout(std::function<void(rpc_test_env<>&, test_rpc_proto::client&)> body) {
     auto success = make_lw_shared<bool>(false);
     auto done = make_lw_shared<semaphore>(0);
     auto abrt = make_lw_shared<abort_source>();
@@ -1303,10 +1246,28 @@ SEASTAR_TEST_CASE(test_max_absolute_timeout) {
     }).handle_exception([] (std::exception_ptr) {});
     rpc::client_options co;
     co.send_timeout_data = 1;
-    (void)rpc_test_env<>::do_with_thread(rpc_test_config(), co, [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
+    (void)rpc_test_env<>::do_with_thread(rpc_test_config(), co, [body] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
         env.register_handler(1, [](int a, int b) {
             return make_ready_future<int>(a+b);
         }).get();
+        body(env, c1);
+    }).then([success, done, abrt] {
+        *success = true;
+        abrt->request_abort();
+        done->signal();
+    });
+    return done->wait().then([done, success] {
+        BOOST_REQUIRE(*success);
+    });
+}
+
+// Test reproducing issue #671: If timeout is time_point::max(), translating
+// it to relative timeout in the sender and then back in the receiver, when
+// these calculations happen across a millisecond boundary, overflowed the
+// integer and mislead the receiver to think the requested timeout was
+// negative, and cause it drop its response, so the RPC call never completed.
+SEASTAR_TEST_CASE(test_max_absolute_timeout) {
+    return test_max_timeout([] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
         auto sum = env.proto().make_client<int (int, int)>(1);
         // The bug only reproduces if the calculation done on the sender
         // and receiver sides, happened across a millisecond boundary.
@@ -1319,13 +1280,6 @@ SEASTAR_TEST_CASE(test_max_absolute_timeout) {
             auto result = sum(c1, rpc::rpc_clock_type::time_point::max(), 2, 3).get();
             BOOST_REQUIRE_EQUAL(result, 2 + 3);
         }
-    }).then([success, done, abrt] {
-        *success = true;
-        abrt->request_abort();
-        done->signal();
-    });
-    return done->wait().then([done, success] {
-        BOOST_REQUIRE(*success);
     });
 }
 
@@ -1333,32 +1287,12 @@ SEASTAR_TEST_CASE(test_max_absolute_timeout) {
 // also works, and again doesn't cause the timeout wrapping around to the
 // past and causing dropped responses.
 SEASTAR_TEST_CASE(test_max_relative_timeout) {
-    // The typical failure of this test is a hang. So we use semaphore to
-    // stop the test either when it succeeds, or after a long enough hang.
-    auto success = make_lw_shared<bool>(false);
-    auto done = make_lw_shared<semaphore>(0);
-    auto abrt = make_lw_shared<abort_source>();
-    (void) seastar::sleep_abortable(std::chrono::seconds(3), *abrt).then([done, success] {
-        done->signal(1);
-    }).handle_exception([] (std::exception_ptr) {});
-    rpc::client_options co;
-    co.send_timeout_data = 1;
-    (void)rpc_test_env<>::do_with_thread(rpc_test_config(), co, [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
-        env.register_handler(1, [](int a, int b) {
-            return make_ready_future<int>(a+b);
-        }).get();
+    return test_max_timeout([] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
         auto sum = env.proto().make_client<int (int, int)>(1);
         // The following call used to always hang, when max()+now()
         // overflowed and appeared to be a negative timeout.
         auto result = sum(c1, rpc::rpc_clock_type::duration::max(), 2, 3).get();
         BOOST_REQUIRE_EQUAL(result, 2 + 3);
-    }).then([success, done, abrt] {
-        *success = true;
-        abrt->request_abort();
-        done->signal();
-    });
-    return done->wait().then([done, success] {
-        BOOST_REQUIRE(*success);
     });
 }
 
@@ -1374,33 +1308,6 @@ SEASTAR_TEST_CASE(test_rpc_tuple) {
     });
 }
 
-SEASTAR_TEST_CASE(test_rpc_nonvariadic_client_variadic_server) {
-    return rpc_test_env<>::do_with_thread(rpc_test_config(), [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
-        // Server is variadic
-        env.register_handler(1, [] () {
-            return make_ready_future<rpc::tuple<int, long>>(rpc::tuple(1, 0x7'0000'0000L));
-        }).get();
-        // Client is non-variadic
-        auto f1 = env.proto().make_client<future<rpc::tuple<int, long>> ()>(1);
-        auto result = f1(c1).get();
-        BOOST_REQUIRE_EQUAL(std::get<0>(result), 1);
-        BOOST_REQUIRE_EQUAL(std::get<1>(result), 0x7'0000'0000L);
-    });
-}
-
-SEASTAR_TEST_CASE(test_rpc_variadic_client_nonvariadic_server) {
-    return rpc_test_env<>::do_with_thread(rpc_test_config(), [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
-        // Server is nonvariadic
-        env.register_handler(1, [] () {
-            return make_ready_future<rpc::tuple<int, long>>(rpc::tuple<int, long>(1, 0x7'0000'0000L));
-        }).get();
-        // Client is variadic
-        auto f1 = env.proto().make_client<future<rpc::tuple<int, long>> ()>(1);
-        auto result = f1(c1).get();
-        BOOST_REQUIRE_EQUAL(std::get<0>(result), 1);
-        BOOST_REQUIRE_EQUAL(std::get<1>(result), 0x7'0000'0000L);
-    });
-}
 
 SEASTAR_TEST_CASE(test_handler_registration) {
     rpc_test_config cfg;

@@ -99,7 +99,9 @@ public:
     future<size_t> read_some(const std::vector<iovec>& iov);
     future<temporary_buffer<char>> read_some(internal::buffer_allocator* ba);
 #if SEASTAR_API_LEVEL >= 9
+    future<size_t> send_some(std::span<iovec> iovs);
     future<size_t> write_some(std::span<iovec> iovs);
+    future<> send_all(std::span<iovec> iovs);
     future<> write_all(std::span<iovec> iovs);
 #else
     future<size_t> write_some(net::packet& p);
@@ -132,13 +134,17 @@ private:
         ++fd->_refs;
     }
     friend void intrusive_ptr_release(pollable_fd_state* fd);
+    static pollable_fd_state_ptr make(file_desc, speculation);
 };
 
 class pollable_fd {
 public:
     using speculation = pollable_fd_state::speculation;
     pollable_fd() = default;
-    pollable_fd(file_desc fd, speculation speculate = speculation());
+    pollable_fd(file_desc fd, speculation speculate = speculation())
+        : _s(pollable_fd_state::make(std::move(fd), speculate))
+    {}
+
 public:
     future<size_t> read_some(char* buffer, size_t size) {
         return _s->read_some(buffer, size);
@@ -153,8 +159,14 @@ public:
         return _s->read_some(ba);
     }
 #if SEASTAR_API_LEVEL >= 9
+    future<size_t> send_some(std::span<iovec> iov) {
+        return _s->send_some(iov);
+    }
     future<size_t> write_some(std::span<iovec> iov) {
         return _s->write_some(iov);
+    }
+    future<> send_all(std::span<iovec> iov) {
+        return _s->send_all(iov);
     }
     future<> write_all(std::span<iovec> iov) {
         return _s->write_all(iov);
@@ -211,6 +223,7 @@ public:
         return _s->poll_rdhup();
     }
     int get_fd() const { return _s->fd.get(); }
+    void speculate_epoll(int events) { _s->speculate_epoll(events); }
 
 protected:
     void maybe_no_more_recv() { return _s->maybe_no_more_recv(); }

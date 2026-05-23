@@ -19,30 +19,31 @@
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <malloc.h>
 #include <string.h>
+#include <fcntl.h>
+#include <filesystem>
 #include <ratio>
 #include <optional>
 #include <utility>
 #include <seastar/util/assert.hh>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/fstream.hh>
 #include <seastar/core/align.hh>
 #include <seastar/core/circular_buffer.hh>
+#include <seastar/core/internal/pollable_fd.hh>
+#include <seastar/core/internal/buffer_allocator.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/io_intent.hh>
-#endif
+#include <seastar/coroutine/exception.hh>
+#include "core/syscall_result.hh"
+#include "core/thread_pool.hh"
+#include <seastar/util/internal/iovec_utils.hh>
 
 namespace seastar {
 
@@ -527,6 +528,109 @@ future<output_stream<char>> make_file_output_stream(file f, file_output_stream_o
     return make_file_data_sink(std::move(f), options).then([] (data_sink&& ds) {
         return output_stream<char>(std::move(ds));
     });
+}
+
+/*
+ * Pipe / stream-fd source and sink implementations.
+ *
+ * I/O is integrated with the reactor's event loop via pollable_fd.
+ * read_some() / write_some() register POLLIN/POLLOUT interest with epoll or
+ * io_uring and resume the calling fiber once the fd is ready, so no
+ * thread-pool thread is blocked waiting for data.  The fd must be in
+ * non-blocking mode (O_NONBLOCK): make_pipe() produces non-blocking fds
+ * naturally; path-based open sets O_NONBLOCK in the thread-pool lambda.
+ *
+ * Suitable for anonymous pipes, named FIFOs, character devices, PTYs, and
+ * any other fd that supports plain read(2)/write(2) but not seekable or
+ * O_DIRECT I/O.
+ */
+
+class pipe_data_source_impl : public data_source_impl, private internal::buffer_allocator {
+    pollable_fd _fd;
+    const size_t _buf_size;
+
+    temporary_buffer<char> allocate_buffer() override {
+        return temporary_buffer<char>(_buf_size);
+    }
+public:
+    pipe_data_source_impl(file_desc fd, size_t buf_size)
+            : _fd(std::move(fd)), _buf_size(buf_size) {}
+
+    future<temporary_buffer<char>> get() override {
+        // read_some waits for POLLIN via the reactor then does a non-blocking read.
+        // n == 0 on EOF: returns empty buffer, signalling end-of-stream.
+        return _fd.read_some(this);
+    }
+
+    future<> close() override {
+        _fd.close();
+        return make_ready_future<>();
+    }
+
+    // Used by the path-based factory to open the device asynchronously.
+    static future<file_desc> open(std::filesystem::path path, int flags) {
+        auto sr = co_await engine()._thread_pool->submit<syscall_result<int>>(
+                internal::thread_pool_submit_reason::file_operation, [path = std::move(path), flags] {
+            return wrap_syscall<int>(::open(path.c_str(), flags | O_CLOEXEC | O_NONBLOCK));
+        });
+        if (sr.failed()) {
+            co_return coroutine::exception(sr.make_system_error_ptr());
+        }
+        co_return file_desc::from_fd(sr.result);
+    }
+};
+
+class pipe_data_sink_impl : public data_sink_impl {
+    pollable_fd _fd;
+public:
+    pipe_data_sink_impl(file_desc fd)
+            : _fd(std::move(fd)) {}
+
+    future<> put(std::span<temporary_buffer<char>> bufs) override {
+        // Chain all buffer deleters and keep iov alive until write_all completes.
+        deleter del;
+        std::vector<iovec> iov;
+        iov.reserve(bufs.size());
+        for (auto& b : bufs) {
+            iov.push_back({const_cast<char*>(b.get()), b.size()});
+            deleter d = b.release();
+            d.append(std::move(del));
+            del = std::move(d);
+        }
+        // Build the span before moving iov into the finally lambda.  Moving a
+        // vector transfers ownership of its heap buffer without relocating it,
+        // so the span's pointer stays valid for the duration of write_all.
+        auto iovspan = std::span<iovec>(iov);
+        return _fd.write_all(iovspan).finally([del = std::move(del), iov = std::move(iov)] {});
+    }
+
+    future<> close() override {
+        _fd.close();
+        return make_ready_future<>();
+    }
+};
+
+input_stream<char> make_pipe_input_stream(file_desc fd, size_t buffer_size) {
+    return input_stream<char>(data_source(
+            std::make_unique<pipe_data_source_impl>(std::move(fd), buffer_size)));
+}
+
+output_stream<char> make_pipe_output_stream(file_desc fd, size_t buffer_size) {
+    output_stream_options opts;
+    opts.trim_to_size = false;
+    return output_stream<char>(data_sink(
+            std::make_unique<pipe_data_sink_impl>(std::move(fd))),
+            buffer_size, opts);
+}
+
+future<input_stream<char>> make_pipe_input_stream(std::filesystem::path path, size_t buffer_size) {
+    auto fd = co_await pipe_data_source_impl::open(std::move(path), O_RDONLY);
+    co_return make_pipe_input_stream(std::move(fd), buffer_size);
+}
+
+future<output_stream<char>> make_pipe_output_stream(std::filesystem::path path, size_t buffer_size) {
+    auto fd = co_await pipe_data_source_impl::open(std::move(path), O_WRONLY);
+    co_return make_pipe_output_stream(std::move(fd), buffer_size);
 }
 
 /*

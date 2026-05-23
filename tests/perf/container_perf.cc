@@ -233,3 +233,76 @@ PERF_TEST_F(container_perf, iter_small_boost_deque) {
     return iteration_bench<boost_deque_traits>(small_size);
 }
 
+template <size_t N>
+struct sized_elem {
+    char data[N];
+    sized_elem() { std::memset(data, 0, N); }
+    sized_elem(int i) { std::memset(data, static_cast<char>(i), N); }
+};
+
+template <typename Container>
+size_t push_pop_single_bench() {
+    using T = typename Container::value_type;
+    Container c;
+
+    perf_tests::start_measuring_time();
+    for (size_t i = 0; i < total_iters; i++) {
+        c.push_back(T(i));
+        perf_tests::do_not_optimize(c.front());
+        c.pop_front();
+    }
+    perf_tests::stop_measuring_time();
+
+    return total_iters;
+}
+
+// Push/pop benchmarks varying item size with chunk=1
+PERF_TEST_F(container_perf, push_pop_1b_chunk1_save1) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<1>, 1, 1>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_1b_chunk1_save0) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<1>, 1, 0>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_100b_chunk1_save1) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<100>, 1, 1>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_100b_chunk1_save0) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<100>, 1, 0>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_1000b_chunk1_save1) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<1000>, 1, 1>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_1000b_chunk1_save0) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<1000>, 1, 0>>();
+}
+
+// Push/pop benchmarks varying item size with chunk=128
+PERF_TEST_F(container_perf, push_pop_1b_chunk128_save1) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<1>, 128, 1>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_1b_chunk128_save0) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<1>, 128, 0>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_100b_chunk128_save1) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<100>, 128, 1>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_100b_chunk128_save0) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<100>, 128, 0>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_1000b_chunk128_save1) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<1000>, 128, 1>>();
+}
+
+PERF_TEST_F(container_perf, push_pop_1000b_chunk128_save0) {
+    return push_pop_single_bench<chunked_fifo<sized_elem<1000>, 128, 0>>();
+}
+

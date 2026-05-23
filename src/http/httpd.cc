@@ -19,9 +19,6 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <memory>
 #include <algorithm>
@@ -36,9 +33,6 @@ module;
 #include <unordered_map>
 #include <vector>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/sstring.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/circular_buffer.hh>
@@ -53,7 +47,6 @@ module seastar;
 #include <seastar/util/short_streams.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/string_utils.hh>
-#endif
 
 
 using namespace std::chrono_literals;
@@ -201,7 +194,6 @@ void connection::generate_error_reply_and_close(std::unique_ptr<http::request> r
     resp->set_version(req->_version);
     resp->set_status(status, msg);
     set_header_connection(*resp, false);
-    resp->done();
     _done = true;
     _replies.push(std::move(resp));
 }
@@ -254,7 +246,7 @@ future<> connection::read_one() {
                     auto continue_reply = std::make_unique<http::reply>();
                     set_headers(*continue_reply);
                     continue_reply->set_version(req->_version);
-                    continue_reply->set_status(http::reply::status_type::continue_).done();
+                    continue_reply->set_status(http::reply::status_type::continue_);
                     this->_replies.push(std::move(continue_reply));
                     return make_ready_future<std::unique_ptr<http::request>>(std::move(req));
                 });
@@ -334,14 +326,13 @@ future<> connection::respond() {
     });
 }
 
-future<> connection::write_body() {
-    return _write_buf.write(_resp->_content.data(),
-            _resp->_content.size());
-}
-
 void connection::set_headers(http::reply& resp) {
-    resp._headers["Server"] = "Seastar httpd";
-    resp._headers["Date"] = _server._date;
+    if (_server._server_header.has_value()) {
+        resp._headers["Server"] = *_server._server_header;
+    }
+    if (_server._generate_date_header) {
+        resp._headers["Date"] = _server._date;
+    }
 }
 
 future<bool> connection::generate_reply(std::unique_ptr<http::request> req) {
@@ -359,7 +350,7 @@ future<bool> connection::generate_reply(std::unique_ptr<http::request> req) {
     return _server._routes.handle(url, std::move(req), std::move(resp)).
     // Caller guarantees enough room
     then([this, keep_alive , version = std::move(version)](std::unique_ptr<http::reply> rep) {
-        rep->set_version(version).done();
+        rep->set_version(version);
         this->_replies.push(std::move(rep));
         return make_ready_future<bool>(!keep_alive);
     });
@@ -383,6 +374,31 @@ bool http_server::get_content_streaming() const {
 
 void http_server::set_content_streaming(bool b) {
     _content_streaming = b;
+}
+
+const std::optional<sstring>& http_server::get_server_header() const {
+    return _server_header;
+}
+
+void http_server::set_server_header(std::optional<sstring> value) {
+    _server_header = std::move(value);
+}
+
+bool http_server::get_generate_date_header() const {
+    return _generate_date_header;
+}
+
+void http_server::set_generate_date_header(bool b) {
+    if (b == _generate_date_header) {
+        return;
+    }
+    _generate_date_header = b;
+    if (b) {
+        _date = http_date();
+        _date_format_timer.arm_periodic(1s);
+    } else {
+        _date_format_timer.cancel();
+    }
 }
 
 future<> http_server::listen(socket_address addr, listen_options lo,
@@ -422,15 +438,31 @@ future<> http_server::stop() {
     return tasks_done;
 }
 
-// FIXME: This could return void
+// This is a named class member coroutine, so that 'this', 'which' and 'tls'
+// live safely in the coroutine frame, therefore `accept_loop()` can safely suspend
+// at `co_await do_accept_one()`.
+future<> http_server::accept_loop(int which, bool tls) {
+    while (!_task_gate.is_closed()) {
+        try {
+            co_await do_accept_one(which, tls);
+        } catch (const gate_closed_exception&) {
+            co_return;
+        } catch (const std::system_error& e) {
+            // We expect a ECONNABORTED when http_server::stop is called,
+            // no point in warning about that.
+            if (e.code().value() != ECONNABORTED) {
+                hlogger.error("accept failed: {}", e);
+            }
+        } catch (...) {
+            hlogger.error("accept failed: {}", std::current_exception());
+        }
+    }
+}
+
 future<> http_server::do_accepts(int which, bool tls) {
     (void)try_with_gate(_task_gate, [this, which, tls] {
-        return keep_doing([this, which, tls] {
-            return try_with_gate(_task_gate, [this, which, tls] {
-                return do_accept_one(which, tls);
-            });
-        }).handle_exception_type([](const gate_closed_exception& e) {});
-    }).handle_exception_type([](const gate_closed_exception& e) {});
+        return accept_loop(which, tls);
+    }).handle_exception_type([](const gate_closed_exception&) {});
     return make_ready_future<>();
 }
 
@@ -439,28 +471,19 @@ future<> http_server::do_accepts(int which){
 }
 
 future<> http_server::do_accept_one(int which, bool tls) {
-    return _listeners[which].accept().then([this, tls] (accept_result ar) mutable {
-        if (_keepalive_params) {
-            ar.connection.set_keepalive(true);
-            ar.connection.set_keepalive_parameters(_keepalive_params.value());
-        }
-        auto local_address = ar.connection.local_address();
-        auto conn = std::make_unique<connection>(*this, std::move(ar.connection),
-                std::move(ar.remote_address), std::move(local_address), tls);
-        (void)try_with_gate(_task_gate, [conn = std::move(conn)]() mutable {
-            return conn->process().handle_exception([conn = std::move(conn)] (std::exception_ptr ex) {
-                hlogger.error("request error: {}", ex);
-            });
-        }).handle_exception_type([] (const gate_closed_exception& e) {});
-    }).handle_exception_type([] (const std::system_error &e) {
-        // We expect a ECONNABORTED when http_server::stop is called,
-        // no point in warning about that.
-        if (e.code().value() != ECONNABORTED) {
-            hlogger.error("accept failed: {}", e);
-        }
-    }).handle_exception([] (std::exception_ptr ex) {
-        hlogger.error("accept failed: {}", ex);
-    });
+    auto ar = co_await _listeners[which].accept();
+    if (_keepalive_params) {
+        ar.connection.set_keepalive(true);
+        ar.connection.set_keepalive_parameters(_keepalive_params.value());
+    }
+    auto local_address = ar.connection.local_address();
+    auto conn = std::make_unique<connection>(*this, std::move(ar.connection),
+            std::move(ar.remote_address), std::move(local_address), tls);
+    (void)try_with_gate(_task_gate, [conn = std::move(conn)]() mutable {
+        return conn->process().handle_exception([conn = std::move(conn)] (std::exception_ptr ex) {
+            hlogger.error("request error: {}", ex);
+        });
+    }).handle_exception_type([] (const gate_closed_exception& e) {});
 }
 
 uint64_t http_server::total_connections() const {

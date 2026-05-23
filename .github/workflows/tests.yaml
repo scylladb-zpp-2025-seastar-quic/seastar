@@ -3,7 +3,10 @@ name: Test
 permissions:
   contents: read
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:  # Allows manual triggering
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -48,3 +51,12 @@ jobs:
       mode: debug
       enables: --enable-cxx-modules
       enable-ccache: false
+
+  fuzz_test:
+    name: "Fuzz Tests"
+    uses: ./.github/workflows/test.yaml
+    with:
+      compiler: clang++
+      standard: 23
+      mode: fuzz
+      test-args: "-- -R 'Seastar.fuzz.'"

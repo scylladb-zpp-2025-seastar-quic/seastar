@@ -21,6 +21,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <unordered_set>
 #include <map>
 #include <any>
@@ -67,6 +68,11 @@ namespace tls {
     class server_credentials;
     class certificate_credentials;
     class credentials_builder;
+    class credentials_impl;
+    class dh_params_impl;
+    // allow backend friends
+    class gnutls_provider_certificate_credentials_impl;
+    class openssl_session;
 
     /**
      * Diffie-Hellman parameters for
@@ -95,10 +101,10 @@ namespace tls {
         /** loads a key from file */
         static future<dh_params> from_file(const sstring&, x509_crt_format);
     private:
-        class impl;
         friend class server_credentials;
         friend class certificate_credentials;
-        std::unique_ptr<impl> _impl;
+        friend class gnutls_provider_certificate_credentials_impl;
+        std::unique_ptr<dh_params_impl> _impl;
     };
 
     class x509_cert {
@@ -110,6 +116,15 @@ namespace tls {
         x509_cert(shared_ptr<impl>);
         shared_ptr<impl> _impl;
     };
+
+    enum class tls_version {
+        tlsv1_0,
+        tlsv1_1,
+        tlsv1_2,
+        tlsv1_3
+    };
+
+    std::string_view format_as(tls_version);
 
     class abstract_credentials {
     protected:
@@ -222,15 +237,55 @@ namespace tls {
          */
         void set_enable_certificate_verification(bool enable);
 
+        /**
+         * Set the cipher string for TLS 1.2 and below.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         *
+         * See https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_cipher_list.html
+         */
+        void set_cipher_string(const sstring&);
+
+        /**
+         * Set the cipher suites for TLS 1.3.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         *
+         * See https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_ciphersuites.html
+         */
+        void set_ciphersuites(const sstring&);
+
+        /**
+         * Enable server cipher preference order during handshake.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         */
+        void enable_server_precedence();
+
+        /**
+         * Set the minimum TLS version for this connection.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         */
+        void set_minimum_tls_version(tls_version);
+
+        /**
+         * Set the maximum TLS version for this connection.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         */
+        void set_maximum_tls_version(tls_version);
+
+        /**
+         * Permit TLS renegotiation on TLS 1.2 and below.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         */
+        void enable_tls_renegotiation();
+
     private:
-        class impl;
         friend class session;
+        friend class openssl_session;
         friend class server_session;
         friend class server_credentials;
         friend class credentials_builder;
         template<typename Base>
         friend class reloadable_credentials;
-        shared_ptr<impl> _impl;
+        shared_ptr<credentials_impl> _impl;
     };
 
     /** Exception thrown on certificate validation error */
@@ -332,6 +387,14 @@ namespace tls {
          */
         void set_alpn_protocols(const std::vector<sstring>& protocols);
 
+        // OpenSSL-specific; stored but only applied when OpenSSL backend is active.
+        void set_cipher_string(const sstring&);
+        void set_ciphersuites(const sstring&);
+        void enable_server_precedence();
+        void set_minimum_tls_version(tls_version);
+        void set_maximum_tls_version(tls_version);
+        void enable_tls_renegotiation();
+
         void apply_to(certificate_credentials&) const;
 
         shared_ptr<certificate_credentials> build_certificate_credentials() const;
@@ -356,6 +419,12 @@ namespace tls {
         sstring _priority;
         std::vector<uint8_t> _session_resume_key;
         std::vector<sstring> _alpn_protocols;
+        sstring _cipher_string;
+        sstring _ciphersuites;
+        bool _enable_server_precedence = false;
+        bool _enable_tls_renegotiation = false;
+        std::optional<tls_version> _min_tls_version;
+        std::optional<tls_version> _max_tls_version;
     };
 
     using session_data = std::vector<uint8_t>;
@@ -634,29 +703,41 @@ namespace tls {
     const std::error_category& error_category();
 
     /**
+     * Returns the name of the active TLS backend (e.g. "gnutls", "openssl").
+     */
+    const char* backend_name();
+
+    /**
      * The more common error codes encountered in TLS.
      * Not an exhaustive list. Add exports as needed.
      */
-    extern const int ERROR_UNKNOWN_COMPRESSION_ALGORITHM;
-    extern const int ERROR_UNKNOWN_CIPHER_TYPE;
-    extern const int ERROR_INVALID_SESSION;
-    extern const int ERROR_UNEXPECTED_HANDSHAKE_PACKET;
-    extern const int ERROR_UNKNOWN_CIPHER_SUITE;
-    extern const int ERROR_UNKNOWN_ALGORITHM;
-    extern const int ERROR_UNSUPPORTED_SIGNATURE_ALGORITHM;
-    extern const int ERROR_SAFE_RENEGOTIATION_FAILED;
-    extern const int ERROR_UNSAFE_RENEGOTIATION_DENIED;
-    extern const int ERROR_UNKNOWN_SRP_USERNAME;
-    extern const int ERROR_PREMATURE_TERMINATION;
-    extern const int ERROR_PUSH;
-    extern const int ERROR_PULL;
-    extern const int ERROR_UNEXPECTED_PACKET;
-    extern const int ERROR_UNSUPPORTED_VERSION;
-    extern const int ERROR_NO_CIPHER_SUITES;
-    extern const int ERROR_DECRYPTION_FAILED;
-    extern const int ERROR_MAC_VERIFY_FAILED;
+    extern int ERROR_UNKNOWN_COMPRESSION_ALGORITHM;
+    extern int ERROR_UNKNOWN_CIPHER_TYPE;
+    extern int ERROR_INVALID_SESSION;
+    extern int ERROR_UNEXPECTED_HANDSHAKE_PACKET;
+    extern int ERROR_UNKNOWN_CIPHER_SUITE;
+    extern int ERROR_UNKNOWN_ALGORITHM;
+    extern int ERROR_UNSUPPORTED_SIGNATURE_ALGORITHM;
+    extern int ERROR_SAFE_RENEGOTIATION_FAILED;
+    extern int ERROR_UNSAFE_RENEGOTIATION_DENIED;
+    extern int ERROR_UNKNOWN_SRP_USERNAME;
+    extern int ERROR_PREMATURE_TERMINATION;
+    extern int ERROR_PUSH;
+    extern int ERROR_PULL;
+    extern int ERROR_UNEXPECTED_PACKET;
+    extern int ERROR_UNSUPPORTED_VERSION;
+    extern int ERROR_NO_CIPHER_SUITES;
+    extern int ERROR_DECRYPTION_FAILED;
+    extern int ERROR_MAC_VERIFY_FAILED;
 }
 }
+
+template <> struct fmt::formatter<seastar::tls::tls_version> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(seastar::tls::tls_version v, FormatContext& ctx) const {
+        return formatter<string_view>::format(format_as(v), ctx);
+    }
+};
 
 template <> struct fmt::formatter<seastar::tls::subject_alt_name_type> : fmt::formatter<string_view> {
     template <typename FormatContext>

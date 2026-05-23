@@ -33,6 +33,11 @@ on:
         type: string
         default: ''
         required: false
+      test-args:
+        description: 'additional arguments passed to test.py'
+        type: string
+        default: ''
+        required: false
 
 jobs:
   test:
@@ -86,7 +91,7 @@ jobs:
             CPP=g++-14
           fi
           if ${{ inputs.enable-ccache }}; then
-            MAYBE_CCACHE_OPT="--ccache"
+            MAYBE_CCACHE_OPT="--compiler-cache=ccache"
           fi
           ./configure.py                          \
             --c++-standard ${{ inputs.standard }} \
@@ -114,4 +119,4 @@ jobs:
 
       - name: Test
         if: ${{ ! contains(inputs.enables, 'cxx-modules') }}
-        run: ./test.py --mode=${{ inputs.mode }}
+        run: ./test.py --mode=${{ inputs.mode }} ${{ inputs.test-args }}

@@ -36,7 +36,7 @@
 #include <seastar/core/posix.hh>
 #include <seastar/core/sstring.hh>
 
-namespace seastar::experimental {
+namespace seastar {
 
 /// The optional parameters for spawning a subprocess
 ///
@@ -71,6 +71,8 @@ class process {
     static future<process> spawn(const std::filesystem::path& pathname);
 public:
     process(create_tag, pid_t pid, file_desc&& cin, file_desc&& cout, file_desc&& cerr);
+    /// Return the process ID of the child process
+    pid_t pid() const { return _pid; }
     /// Return an writable stream which provides input from the child process
     output_stream<char> cin();
     /// Return an writable stream which provides stdout output from the child process
@@ -103,4 +105,12 @@ private:
                                          spawn_parameters);
     friend future<process> spawn_process(const std::filesystem::path&);
 };
+
+namespace experimental {
+/// \deprecated Use \c seastar::process instead
+using seastar::process;
+/// \deprecated Use \c seastar::spawn_parameters instead
+using seastar::spawn_parameters;
+}
+
 }

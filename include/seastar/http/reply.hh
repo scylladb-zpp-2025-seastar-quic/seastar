@@ -31,6 +31,7 @@
 //
 #pragma once
 
+#include <optional>
 #include <unordered_map>
 #include <string_view>
 #include <seastar/core/sstring.hh>
@@ -157,7 +158,6 @@ struct reply {
     size_t left_content_length = std::numeric_limits<size_t>::max();
     bool _skip_body = false;
 
-    sstring _response_line;
     std::unordered_map<sstring, sstring> trailing_headers;
     std::unordered_map<sstring, sstring> chunk_extensions;
 
@@ -203,12 +203,21 @@ struct reply {
      * 2. If a "/" is missing in the given string, we look it up in a list of
      *    common file extensions listed in the http::mime_types map. For
      *    example "html" will be mapped to "text/html".
+     *
+     * std::nullopt and empty string are both no-ops (an empty media-type is
+     * invalid per RFC 9110).  To remove a previously set Content-Type use
+     * _headers.erase("Content-Type").  To force an empty value use
+     * add_header("Content-Type", "").
      */
-    reply& set_content_type(std::string_view content_type) {
-        if (content_type.find('/') == std::string_view::npos) {
-            content_type = http::mime_types::extension_to_type(content_type);
+    reply& set_content_type(std::optional<std::string_view> content_type) {
+        if (!content_type) {
+            return *this;
         }
-        _headers["Content-Type"] = sstring(content_type);
+        std::string_view ct = *content_type;
+        if (ct.find('/') == std::string_view::npos) {
+            ct = http::mime_types::extension_to_type(ct);
+        }
+        _headers["Content-Type"] = sstring(ct);
         return *this;
     }
 
@@ -230,15 +239,15 @@ struct reply {
         return *this;
     }
 
+    [[deprecated("Use set_content_type() or write_body() instead")]]
     reply& done(const sstring& content_type) {
-        return set_content_type(content_type).done();
+        return set_content_type(content_type);
     }
     /**
-     * Done should be called before using the reply.
-     * It would set the response line
+     * \deprecated done() is no longer required; remove the call.
      */
+    [[deprecated("done() is no longer required; remove the call")]]
     reply& done() {
-        _response_line = response_line();
         return *this;
     }
     sstring response_line() const;
@@ -250,7 +259,8 @@ struct reply {
      * with a function.
      *
      * \param content_type - is used to choose the content type of the body. Use the file extension
-     *  you would have used for such a content, (i.e. "txt", "html", "json", etc')
+     *  you would have used for such a content, (i.e. "txt", "html", "json", etc').
+     *  std::nullopt or an empty string skips setting Content-Type (see set_content_type()).
      * \param body_writer - a function that accept an output stream and use that stream to write the body.
      *   The function should take ownership of the stream while using it and must close the stream when it
      *   is done.
@@ -259,7 +269,7 @@ struct reply {
      *
      */
 
-    void write_body(const sstring& content_type, http::body_writer_type&& body_writer);
+    void write_body(std::optional<std::string_view> content_type, http::body_writer_type&& body_writer);
 
     /*!
      * \brief use and output stream to write the message body
@@ -269,7 +279,7 @@ struct reply {
      */
     template <typename W>
     requires std::is_invocable_r_v<future<>, W, output_stream<char>&>
-    void write_body(const sstring& content_type, W&& body_writer) {
+    void write_body(std::optional<std::string_view> content_type, W&& body_writer) {
         write_body(content_type, [body_writer = std::move(body_writer)] (output_stream<char>&& out) mutable -> future<> {
             return util::write_to_stream_and_close(std::move(out), std::move(body_writer));
         });
@@ -279,12 +289,13 @@ struct reply {
      * \brief Write a string as the reply
      *
      * \param content_type - is used to choose the content type of the body. Use the file extension
-     *  you would have used for such a content, (i.e. "txt", "html", "json", etc')
+     *  you would have used for such a content, (i.e. "txt", "html", "json", etc').
+     *  std::nullopt or an empty string skips setting Content-Type (see set_content_type()).
      * \param content - the message content.
      * This would set the the content and content type of the message along
      * with any additional information that is needed to send the message.
      */
-    void write_body(const sstring& content_type, sstring content);
+    void write_body(std::optional<std::string_view> content_type, sstring content);
 
     // RFC7231 Sec. 4.3.2
     // For HEAD replies collect everything from the handler, but don't write the body itself
@@ -298,6 +309,7 @@ struct reply {
 private:
     http::body_writer_type _body_writer;
     friend class httpd::routes;
+    friend struct ::fmt::formatter<reply>;
 };
 
 std::ostream& operator<<(std::ostream& os, reply::status_type st);
@@ -311,3 +323,20 @@ using reply [[deprecated("Use http::reply instead")]] = http::reply;
 }
 
 template <> struct fmt::formatter<seastar::http::reply::status_type> : fmt::ostream_formatter {};
+
+template <>
+struct fmt::formatter<seastar::http::reply> {
+    template <typename ParseContext>
+    constexpr auto parse(ParseContext& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const seastar::http::reply& rp, FormatContext& ctx) const {
+        auto out = fmt::format_to(ctx.out(), "{}", rp._status);
+        for (const auto& h : rp._headers) {
+            out = fmt::format_to(out, " {}:{}", h.first, h.second);
+        }
+        if (!rp._body_writer && !rp._content.empty()) {
+            out = fmt::format_to(out, " {}", rp._content);
+        }
+        return out;
+    }
+};

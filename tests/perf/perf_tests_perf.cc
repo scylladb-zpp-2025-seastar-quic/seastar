@@ -81,7 +81,7 @@ PERF_TEST(output_check, high_runtime_allocs) {
         auto* p = new int(i);
         perf_tests::do_not_optimize(p);
         delete p;
-    }   
+    }
 }
 
 PERF_TEST(output_check, highly_variable_runtime) {
@@ -94,7 +94,7 @@ PERF_TEST(output_check, highly_variable_runtime) {
         auto* p = new int(i);
         perf_tests::do_not_optimize(p);
         delete p;
-    }   
+    }
 }
 
 PERF_TEST_F(fixture, test_fixture_1) { perf_tests::do_not_optimize(sink); }
@@ -121,6 +121,18 @@ PERF_TEST(perf_tests, test_timer_overhead) {
         perf_tests::stop_measuring_time();
     }
     return TIMER_LOOPS;
+}
+
+// Test to verify overhead measurement - this test intentionally has high overhead
+// because it does almost no work between start/stop calls
+PERF_TEST(overhead_check, high_overhead_test) {
+    constexpr size_t LOOPS = 1000;
+    for (size_t i = 0; i < LOOPS; i++) {
+        perf_tests::start_measuring_time();
+        perf_tests::do_not_optimize(i);
+        perf_tests::stop_measuring_time();
+    }
+    return LOOPS;
 }
 
 // The following tests run in order check that pre-run hooks are executed properly.

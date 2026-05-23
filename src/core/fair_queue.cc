@@ -95,7 +95,8 @@ class fair_queue::priority_class_data final : public priority_entry {
     friend class fair_queue;
     capacity_t _pure_accumulated = 0;
     fair_queue_entry::container_list_t _queue;
-    bool _plugged = true;
+
+    bool plug() noexcept;
 
 public:
     explicit priority_class_data(uint32_t shares, priority_class_group_data* p) noexcept : priority_entry(shares, p) {}
@@ -156,25 +157,43 @@ void fair_queue::priority_class_group_data::push_from_idle(priority_entry& pc, c
     wakeup(cfg);
 }
 
-void fair_queue::plug_priority_class(priority_class_data& pc) noexcept {
-    SEASTAR_ASSERT(!pc._plugged);
-    pc._plugged = true;
-    if (!pc._queue.empty()) {
+bool fair_queue::priority_class_data::plug() noexcept {
+    SEASTAR_ASSERT(!_plugged);
+    _plugged = true;
+    return !_queue.empty();
+}
+
+bool fair_queue::priority_class_group_data::plug() noexcept {
+    SEASTAR_ASSERT(!_plugged);
+    _plugged = true;
+    return !_children.empty();
+}
+
+void fair_queue::plug_class(class_id cid) noexcept {
+    auto& pc = *_priority_classes[cid];
+    if (pc.plug()) {
         pc.wakeup(_config);
     }
 }
 
-void fair_queue::plug_class(class_id cid) noexcept {
-    plug_priority_class(*_priority_classes[cid]);
+void fair_queue::plug_class_group(unsigned index) noexcept {
+    auto& pg = *_priority_groups[index];
+    if (pg.plug()) {
+        pg.wakeup(_config);
+    }
 }
 
-void fair_queue::unplug_priority_class(priority_class_data& pc) noexcept {
-    SEASTAR_ASSERT(pc._plugged);
-    pc._plugged = false;
+void fair_queue::priority_entry::unplug() noexcept {
+    SEASTAR_ASSERT(_plugged);
+    _plugged = false;
 }
 
 void fair_queue::unplug_class(class_id cid) noexcept {
-    unplug_priority_class(*_priority_classes[cid]);
+    _priority_classes[cid]->unplug();
+}
+
+void fair_queue::unplug_class_group(unsigned group) noexcept {
+    _priority_groups[group]->unplug();
 }
 
 fair_queue::capacity_t fair_queue::accumulated(class_id cid) const noexcept {
@@ -243,9 +262,6 @@ void fair_queue::queue(class_id id, fair_queue_entry& ent) noexcept {
     _queued_capacity += ent.capacity();
 }
 
-void fair_queue::notify_request_finished(fair_queue_entry::capacity_t cap) noexcept {
-}
-
 void fair_queue::notify_request_cancelled(fair_queue_entry& ent) noexcept {
     _queued_capacity -= ent._capacity;
     ent._capacity = 0;
@@ -256,6 +272,10 @@ fair_queue_entry* fair_queue::top() {
 }
 
 fair_queue_entry* fair_queue::priority_class_group_data::top() {
+    if (!_plugged) {
+        return nullptr;
+    }
+
     while (!_children.empty()) {
         priority_entry& h = *_children.top();
         auto* ent = h.top();
@@ -274,7 +294,7 @@ fair_queue_entry* fair_queue::priority_class_group_data::top() {
 
 void fair_queue::pop_front() {
     auto [empty, req_cap] = _root.pop_front();
-    _queued_capacity += req_cap;
+    _queued_capacity -= req_cap;
 }
 
 std::pair<bool, fair_queue_entry::capacity_t> fair_queue::priority_class_group_data::pop_front() {

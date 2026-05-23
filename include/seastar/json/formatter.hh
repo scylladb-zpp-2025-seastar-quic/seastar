@@ -183,6 +183,18 @@ public:
     static sstring to_json(std::string_view str);
 
     /**
+     * return a json formatted string for types with a user-defined
+     * conversion to sstring but not directly to std::string_view.
+     * Without this, such types would require two user-defined conversions
+     * (T -> sstring -> string_view), which C++ doesn't allow implicitly.
+     */
+    template<typename T>
+    requires (std::convertible_to<const T&, sstring> && !std::convertible_to<const T&, std::string_view>)
+    static sstring to_json(const T& v) {
+        return to_json(std::string_view(sstring(v)));
+    }
+
+    /**
      * return a json formatted int
      * @param n the int to format
      * @return the given int in a json format
@@ -283,6 +295,16 @@ public:
      */
     static future<> write(output_stream<char>& s, std::string_view str) {
         return s.write(to_json(str));
+    }
+
+    /**
+     * write a json formatted string for types with a user-defined
+     * conversion to sstring but not directly to std::string_view.
+     */
+    template<typename T>
+    requires (std::convertible_to<const T&, sstring> && !std::convertible_to<const T&, std::string_view>)
+    static future<> write(output_stream<char>& s, const T& v) {
+        return write(s, std::string_view(sstring(v)));
     }
 
     /**

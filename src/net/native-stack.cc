@@ -19,9 +19,6 @@
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <chrono>
 #include <fstream>
@@ -38,9 +35,6 @@ module;
 #include <arpa/inet.h>
 #include <unistd.h>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/net/native-stack.hh>
 #include "net/native-stack-impl.hh"
 #include <seastar/net/net.hh>
@@ -54,7 +48,6 @@ module seastar;
 #include <seastar/net/dhcp.hh>
 #include <seastar/net/config.hh>
 #include <seastar/core/reactor.hh>
-#endif
 
 namespace seastar {
 
@@ -83,7 +76,7 @@ void create_native_net_device(const native_stack_options& opts) {
     if ( deprecated_config_used) {
 #ifdef SEASTAR_HAVE_DPDK
         if ( opts.dpdk_pmd) {
-             dev = create_dpdk_net_device(opts.dpdk_opts.dpdk_port_index.get_value(), smp::count,
+             dev = create_dpdk_net_device(opts.dpdk_opts.dpdk_port_index.get_value(), this_smp_shard_count(),
                 !(opts.lro && opts.lro.get_value() == "off"),
                 !(opts.dpdk_opts.hw_fc && opts.dpdk_opts.hw_fc.get_value() == "off"));
        } else
@@ -94,7 +87,7 @@ void create_native_net_device(const native_stack_options& opts) {
         auto device_configs = parse_config(net_config);
 
         if ( device_configs.size() > 1) {
-            std::runtime_error("only one network interface is supported");
+            throw std::runtime_error("only one network interface is supported");
         }
 
         for ( auto&& device_config : device_configs) {
@@ -106,7 +99,7 @@ void create_native_net_device(const native_stack_options& opts) {
 #endif
             {
                 (void)hw_config;
-                std::runtime_error("only DPDK supports new configuration format");
+                throw std::runtime_error("only DPDK supports new configuration format");
             }
         }
     }
@@ -116,13 +109,13 @@ void create_native_net_device(const native_stack_options& opts) {
     // set_local_queue on all shard in the background,
     // signal when done.
     // FIXME: handle exceptions
-    for (unsigned i = 0; i < smp::count; i++) {
+    for (unsigned i = 0; i < this_smp_shard_count(); i++) {
         (void)smp::submit_to(i, [&opts, sdev] {
             uint16_t qid = this_shard_id();
             if (qid < sdev->hw_queues_count()) {
                 auto qp = sdev->init_local_queue(opts, qid);
                 std::map<unsigned, float> cpu_weights;
-                for (unsigned i = sdev->hw_queues_count() + qid % sdev->hw_queues_count(); i < smp::count; i+= sdev->hw_queues_count()) {
+                for (unsigned i = sdev->hw_queues_count() + qid % sdev->hw_queues_count(); i < this_smp_shard_count(); i+= sdev->hw_queues_count()) {
                     cpu_weights[i] = 1;
                 }
                 cpu_weights[qid] = opts.hw_queue_weight.get_value();
@@ -139,10 +132,10 @@ void create_native_net_device(const native_stack_options& opts) {
     // wait for all shards to set their local queue,
     // then when link is ready, communicate the native_stack to the caller
     // via `create_native_stack` (that sets the ready_promise value)
-    (void)sem->wait(smp::count).then([&opts, sdev] {
+    (void)sem->wait(this_smp_shard_count()).then([&opts, sdev] {
         // FIXME: future is discarded
         (void)sdev->link_ready().then([&opts, sdev] {
-            for (unsigned i = 0; i < smp::count; i++) {
+            for (unsigned i = 0; i < this_smp_shard_count(); i++) {
                 // FIXME: future is discarded
                 (void)smp::submit_to(i, [&opts, sdev] {
                     create_native_stack(opts, sdev);
@@ -287,7 +280,7 @@ void native_network_stack::on_dhcp(std::optional<dhcp::lease> lease, bool is_ren
     if (this_shard_id() == 0) {
         // And the other cpus, which, in the case of initial discovery,
         // will be waiting for us.
-        for (unsigned i = 1; i < smp::count; i++) {
+        for (unsigned i = 1; i < this_smp_shard_count(); i++) {
             (void)smp::submit_to(i, [lease, is_renew]() {
                 auto & ns = static_cast<native_network_stack&>(engine().net());
                 ns.on_dhcp(lease, is_renew);

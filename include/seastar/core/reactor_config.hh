@@ -41,16 +41,22 @@ struct reactor_config {
     bool strict_o_direct = true;
     bool bypass_fsync = false;
     bool no_poll_aio = false;
-    bool aio_nowait_works = false;
+    std::optional<bool> aio_nowait_works = false;
     bool abort_on_too_long_task_queue = false;
 };
 /// \endcond
 
 class reactor_backend_selector;
+class crypto_provider_factory;
 class network_stack_factory;
 
 /// Configuration for the reactor.
 struct reactor_options : public program_options::option_group {
+    /// \brief Select cryptographic provider backend.
+    ///
+    /// Available providers:
+    /// * gnutls (default)
+    program_options::selection_value<crypto_provider_factory> crypto_provider;
     /// \brief Select network stack to use.
     ///
     /// Each network stack has it corresponding

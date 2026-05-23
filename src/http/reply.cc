@@ -29,20 +29,12 @@
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 
-#ifdef SEASTAR_MODULE
-module;
-#include <iostream>
-#include <utility>
-#include <unordered_map>
-module seastar;
-#else
 #include <seastar/http/reply.hh>
 #include <seastar/core/print.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/common.hh>
 #include <seastar/http/response_parser.hh>
 #include <seastar/core/loop.hh>
-#endif
 
 namespace seastar {
 
@@ -122,18 +114,18 @@ sstring reply::response_line() const {
     });
 }
 
-void reply::write_body(const sstring& content_type, body_writer_type&& body_writer) {
+void reply::write_body(std::optional<std::string_view> content_type, body_writer_type&& body_writer) {
     set_content_type(content_type);
-    _body_writer  = std::move(body_writer);
+    _body_writer = std::move(body_writer);
 }
 
-void reply::write_body(const sstring& content_type, sstring content) {
+void reply::write_body(std::optional<std::string_view> content_type, sstring content) {
+    set_content_type(content_type);
     _content = std::move(content);
-    done(content_type);
 }
 
 future<> reply::write_reply(output_stream<char>& out) {
-    return out.write(response_line().data(), response_line().size()).then([this, &out] {
+    return out.write(response_line()).then([this, &out] {
         if (_body_writer) {
             add_header("Transfer-Encoding", "chunked");
         } else {

@@ -19,9 +19,6 @@
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <chrono>
 #include <cstring>
@@ -41,9 +38,6 @@ module;
 #include <sys/socket.h>
 #include <seastar/util/assert.hh>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/loop.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/coroutine.hh>
@@ -54,7 +48,6 @@ module seastar;
 #include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
 #include <seastar/util/std-compat.hh>
-#endif
 
 namespace std {
 
@@ -476,21 +469,22 @@ class posix_socket_impl final : public socket_impl {
     pollable_fd _fd;
     std::pmr::polymorphic_allocator<char>* _allocator;
     bool _reuseaddr = false;
+    const int _sock_flags;
 
     future<> find_port_and_connect(socket_address sa, socket_address local, transport proto = transport::TCP) {
         static thread_local std::default_random_engine random_engine{std::random_device{}()};
-        static thread_local std::uniform_int_distribution<uint16_t> u(49152/smp::count + 1, 65535/smp::count - 1);
+        static thread_local std::uniform_int_distribution<uint16_t> u(49152/this_smp_shard_count() + 1, 65535/this_smp_shard_count() - 1);
         // If no explicit local address, set to dest address family wildcard.
         if (local.is_unspecified()) {
             local = net::inet_address(sa.addr().in_family());
         }
         resolve_outgoing_address(sa);
         return repeat([this, sa, local, proto, attempts = 0, requested_port = ntoh(local.as_posix_sockaddr_in().sin_port)] () mutable {
-            _fd = engine().make_pollable_fd(sa, int(proto));
+            _fd = file_desc::socket(sa.u.sa.sa_family, _sock_flags, int(proto));
             _fd.get_file_desc().setsockopt(SOL_SOCKET, SO_REUSEADDR, int(_reuseaddr));
-            uint16_t port = attempts++ < 5 && requested_port == 0 && proto == transport::TCP ? u(random_engine) * smp::count + this_shard_id() : requested_port;
+            uint16_t port = attempts++ < 5 && requested_port == 0 && proto == transport::TCP ? u(random_engine) * this_smp_shard_count() + this_shard_id() : requested_port;
             local.as_posix_sockaddr_in().sin_port = hton(port);
-            return futurize_invoke([this, sa, local] { return internal::posix_connect(_fd, sa, local); }).then_wrapped([port, requested_port] (future<> f) {
+            return internal::posix_connect(_fd, sa, local).then_wrapped([port, requested_port] (future<> f) {
                 try {
                     f.get();
                     return stop_iteration::yes;
@@ -511,7 +505,7 @@ class posix_socket_impl final : public socket_impl {
             local = socket_address{unix_domain_addr{std::string{}}};
         }
 
-        _fd = engine().make_pollable_fd(sa, 0);
+        _fd = file_desc::socket(sa.u.sa.sa_family, _sock_flags, 0);
         return internal::posix_connect(_fd, sa, local).then(
             [fd = _fd, allocator = _allocator](){
                 // a problem with 'private' interaction with 'unique_ptr'
@@ -522,7 +516,10 @@ class posix_socket_impl final : public socket_impl {
     }
 
 public:
-    explicit posix_socket_impl(std::pmr::polymorphic_allocator<char>* allocator=memory::malloc_allocator) : _allocator(allocator) {}
+    posix_socket_impl(bool need_nonblock, std::pmr::polymorphic_allocator<char>* allocator=memory::malloc_allocator)
+            : _allocator(allocator)
+            , _sock_flags(SOCK_STREAM | SOCK_CLOEXEC | (need_nonblock ? SOCK_NONBLOCK : 0))
+    {}
 
     virtual future<connected_socket> connect(socket_address sa, socket_address local, transport proto = transport::TCP) override {
         if (sa.is_af_unix()) {
@@ -722,7 +719,7 @@ posix_server_socket_impl::accept() {
             cth = _conntrack.get_handle();
             break;
         case server_socket::load_balancing_algorithm::port:
-            cth = _conntrack.get_handle(get_port_or_counter(sa) % smp::count);
+            cth = _conntrack.get_handle(get_port_or_counter(sa) % this_smp_shard_count());
             break;
         case server_socket::load_balancing_algorithm::fixed:
             cth = _conntrack.get_handle(_fixed_cpu);
@@ -879,7 +876,7 @@ future<> posix_data_sink_impl::put(std::span<temporary_buffer<char>> bufs) {
     auto [ total, del ] = _vecs.populate(bufs);
     auto sg_id = internal::scheduling_group_index(current_scheduling_group());
     bytes_sent[sg_id] += total;
-    return _fd.write_all(_vecs.v).finally([del = std::move(del)] {} );
+    return _fd.send_all(_vecs.v).finally([del = std::move(del)] {} );
 }
 #else
 future<>
@@ -910,7 +907,10 @@ void posix_data_sink_impl::on_batch_flush_error() noexcept {
 }
 
 posix_network_stack::posix_network_stack(const program_options::option_group& opts, std::pmr::polymorphic_allocator<char>* allocator)
-        : _reuseport(engine().posix_reuseport_available()), _allocator(allocator) {
+        : _reuseport(engine().posix_reuseport_available())
+        , _sock_need_nonblock(engine().posix_sock_need_nonblock())
+        , _allocator(allocator)
+{
 }
 
 server_socket
@@ -931,11 +931,12 @@ posix_network_stack::listen(socket_address sa, listen_options opt) {
 }
 
 ::seastar::socket posix_network_stack::socket() {
-    return ::seastar::socket(std::make_unique<posix_socket_impl>(_allocator));
+    return ::seastar::socket(std::make_unique<posix_socket_impl>(_sock_need_nonblock, _allocator));
 }
 
 posix_ap_network_stack::posix_ap_network_stack(const program_options::option_group& opts, std::pmr::polymorphic_allocator<char>* allocator)
-        : posix_network_stack(opts, allocator), _reuseport(engine().posix_reuseport_available()) {
+        : posix_network_stack(opts, allocator)
+{
 }
 
 server_socket
@@ -949,7 +950,7 @@ posix_ap_network_stack::listen(socket_address sa, listen_options opt) {
         return server_socket(std::make_unique<posix_ap_server_socket_impl>(0, sa, _allocator));
     }
     auto protocol = static_cast<int>(opt.proto);
-    return _reuseport ?
+    return posix_network_stack::_reuseport ?
         server_socket(std::make_unique<posix_reuseport_server_socket_impl>(protocol, sa, internal::posix_listen(sa, opt), _allocator))
         :
         server_socket(std::make_unique<posix_ap_server_socket_impl>(protocol, sa, _allocator));

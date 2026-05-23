@@ -113,7 +113,7 @@ public:
     // FIXME: add reverse_iterator and friend
     using difference_type = ssize_t;  // std::make_signed_t<Size> can be too small
     using size_type = Size;
-    static constexpr size_type  npos = static_cast<size_type>(-1);
+    static constexpr size_t npos = static_cast<size_t>(-1);
     static constexpr unsigned padding() { return unsigned(NulTerminate); }
 public:
     struct initialized_later {};
@@ -785,7 +785,7 @@ void copy_str_to(char*& dst, const T& s) {
 }
 
 template <typename String = sstring, typename... Args>
-static String make_sstring(Args&&... args)
+String make_sstring(Args&&... args)
 {
     String ret = uninitialized_string<String>((str_len(args) + ...));
     auto dst = ret.data();

@@ -31,6 +31,7 @@
 #include <coroutine>
 #include <new>
 #include <cstdlib>
+#include <source_location>
 
 #if !(__GLIBC__ == 2 && __GLIBC_MINOR__ >= 43) && !(__GLIBC__ > 2)
 
@@ -41,7 +42,6 @@ void free_sized(void* ptr, size_t size);
 }
 
 #endif
-
 
 namespace seastar {
 
@@ -95,10 +95,28 @@ public:
         promise_type(promise_type&&) = delete;
         promise_type(const promise_type&) = delete;
 
-        template<typename... U>
-        void return_value(U&&... value) {
-            _promise.set_value(std::forward<U>(value)...);
+#if SEASTAR_API_LEVEL < 10
+        template<typename U>
+        void return_value(U&& value) {
+            _promise.set_value(std::forward<U>(value));
         }
+
+        [[deprecated("Forwarding coroutine returns are deprecated as too dangerous. Use 'co_return co_await ...' until explicit syntax is available.")]]
+        void return_value(future<T>&& fut) noexcept {
+            fut.forward_to(std::move(_promise));
+        }
+#else
+        // this non-templated version only exists to support co_returning a braced-init-list
+        void return_value(T&& value) noexcept {
+            _promise.set_value(std::forward<T>(value));
+        }
+
+        template<typename U>
+        requires std::is_convertible_v<U&&, T>
+        void return_value(U&& value) noexcept {
+            _promise.set_value(std::forward<U>(value));
+        }
+#endif
 
         void return_value(coroutine::exception ce) noexcept {
             _promise.set_exception(std::move(ce.eptr));
@@ -106,11 +124,6 @@ public:
 
         void set_exception(std::exception_ptr&& eptr) noexcept {
             _promise.set_exception(std::move(eptr));
-        }
-
-        [[deprecated("Forwarding coroutine returns are deprecated as too dangerous. Use 'co_return co_await ...' until explicit syntax is available.")]]
-        void return_value(future<T>&& fut) noexcept {
-            fut.forward_to(std::move(_promise));
         }
 
         void unhandled_exception() noexcept {
@@ -193,7 +206,8 @@ public:
     }
 
     template<typename U>
-    void await_suspend(std::coroutine_handle<U> hndl) noexcept {
+    void await_suspend(std::coroutine_handle<U> hndl SEASTAR_COROUTINE_LOC_PARAM) noexcept {
+        SEASTAR_COROUTINE_LOC_STORE(hndl.promise());
         if (!CheckPreempt || !_future.available()) {
             _future.set_coroutine(hndl.promise());
         } else {
@@ -218,7 +232,8 @@ public:
     }
 
     template<typename U>
-    void await_suspend(std::coroutine_handle<U> hndl) noexcept {
+    void await_suspend(std::coroutine_handle<U> hndl SEASTAR_COROUTINE_LOC_PARAM) noexcept {
+        SEASTAR_COROUTINE_LOC_STORE(hndl.promise());
         if (!CheckPreempt || !_future.available()) {
             _future.set_coroutine(hndl.promise());
         } else {

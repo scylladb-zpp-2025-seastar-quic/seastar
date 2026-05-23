@@ -198,11 +198,13 @@ public:
         uint64_t fstream_read_bytes_blocked = 0;
         uint64_t fstream_read_aheads_discarded = 0;
         uint64_t fstream_read_ahead_discarded_bytes = 0;
+        uint64_t fsyncs = 0;
 
     private:
         friend class file_data_source_impl;
         friend void io_completion::complete_with(ssize_t);
         friend class io_queue;
+        friend class posix_file_impl;
         static io_stats& local() noexcept;
     };
     /// Scheduling statistics.
@@ -259,7 +261,6 @@ private:
     timer<manual_clock>::set_t _manual_timers;
     timer<manual_clock>::set_t::timer_list_t _expired_manual_timers;
     io_stats _io_stats;
-    uint64_t _fsyncs = 0;
     uint64_t _cxx_exceptions = 0;
     uint64_t _abandoned_failed_futures = 0;
 
@@ -305,6 +306,7 @@ private:
         void rename(sstring new_name, sstring new_shortname);
     private:
         void register_stats();
+        internal::log_buf::inserter_iterator do_dump(seastar::internal::log_buf::inserter_iterator it) const;
     };
 
     struct task_queue_group final : public sched_entity {
@@ -321,6 +323,7 @@ private:
         bool active() const noexcept;
         void activate(sched_entity*);
     private:
+        bool run_tasks_impl(sched_clock::time_point t_initial);
         void insert_active_entity(sched_entity*);
         sched_entity* pop_active_entity(sched_clock::time_point now);
         void insert_activating_entities();
@@ -364,15 +367,10 @@ private:
     sched_clock::time_point _start_time = now();
     output_stream<char>::batch_flush_list_t _flush_batching;
     std::atomic<bool> _sleeping alignas(seastar::cache_line_size){0};
-    std::atomic<bool> _dying{false};
     gate _background_gate;
 
     inline auto& get_sg_data(const scheduling_group& sg) {
         return _scheduling_group_specific_data.per_scheduling_group_data[sg._id];
-    }
-
-    inline auto& get_sg_data(unsigned sg_id) {
-        return _scheduling_group_specific_data.per_scheduling_group_data[sg_id];
     }
 
 private:
@@ -438,7 +436,9 @@ private:
     bool have_more_tasks() const;
     bool posix_reuseport_detect();
     future<> rename_scheduling_group_specific_data(scheduling_group sg);
+    future<seastar::scheduling_group> init_scheduling_group(sstring name, sstring shortname, float shares, scheduling_supergroup p);
     future<> init_scheduling_group(scheduling_group sg, sstring name, sstring shortname, float shares, scheduling_supergroup p);
+    future<> init_scheduling_group_specific_data(scheduling_group sg);
     future<> init_new_scheduling_group_key(scheduling_group_key key, scheduling_group_key_config cfg);
     future<> destroy_scheduling_group(scheduling_group sg) noexcept;
     uint64_t tasks_processed() const;
@@ -467,6 +467,9 @@ private:
     future<size_t>
     do_sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len);
 
+    future<size_t>
+    do_writev(pollable_fd_state& fd, std::span<iovec> iovs);
+
     future<temporary_buffer<char>>
     do_recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba);
 
@@ -484,26 +487,21 @@ public:
     static sched_clock::time_point now() noexcept {
         return sched_clock::now();
     }
-    sched_clock::duration uptime() {
+    sched_clock::duration uptime() const {
         return now() - _start_time;
     }
 
-    io_queue& get_io_queue(dev_t devid = 0) {
-        auto queue = _io_queues.find(devid);
-        if (queue == _io_queues.end()) {
-            return *_io_queues.at(0);
-        } else {
-            return *(queue->second);
-        }
-    }
+    io_queue& get_io_queue(dev_t devid = 0);
+    io_queue* try_get_io_queue(dev_t devid) noexcept;
 
-    io_queue* try_get_io_queue(dev_t devid) noexcept {
-        auto queue = _io_queues.find(devid);
-        return queue != _io_queues.end() ? queue->second.get() : nullptr;
-    }
+    /// Returns pointers to all io_queues on this shard.
+    std::vector<io_queue*> get_all_io_queues();
+
+    std::string_view get_backend_name() const;
 
 private:
     future<> update_bandwidth_for_queues(internal::priority_class pc, uint64_t bandwidth);
+    future<> update_bandwidth_for_queues(unsigned group_index, uint64_t bandwidth);
     void rename_queues(internal::priority_class pc, sstring new_name);
     void update_shares_for_queues(internal::priority_class pc, uint32_t shares);
     void update_group_shares_for_queues(unsigned, uint32_t shares);
@@ -522,7 +520,10 @@ public:
     // FIXME: reuseport currently leads to heavy load imbalance.
     // Until we fix that, just disable it unconditionally.
     bool posix_reuseport_available() const { return false; }
+    bool posix_sock_need_nonblock() const;
+    bool have_aio_fdatasync() const;
 
+    [[deprecated("Internal reactor function, consider using net sockets")]]
     pollable_fd make_pollable_fd(socket_address sa, int proto);
 
     [[deprecated("Internal reactor function, consider using seastar::connect)")]]
@@ -552,7 +553,7 @@ public:
     future<std::filesystem::space_info> file_system_space(std::string_view pathname) noexcept;
     future<struct statvfs> statvfs(std::string_view pathname) noexcept;
     future<> remove_file(std::string_view pathname) noexcept;
-    future<> rename_file(std::string_view old_pathname, std::string_view new_pathname) noexcept;
+    future<> rename_file(std::string_view old_pathname, std::string_view new_pathname, rename_flags flags = rename_flags::none) noexcept;
     future<> link_file(std::string_view oldpath, std::string_view newpath) noexcept;
     future<> chmod(std::string_view name, file_permissions permissions) noexcept;
 
@@ -699,6 +700,7 @@ private:
     future<> send_all_part(pollable_fd_state& fd, const void* buffer, size_t size, size_t completed);
 #endif
 
+    [[deprecated("Use file::flush() instead")]]
     future<> fdatasync(int fd) noexcept;
 
     void add_timer(timer<steady_clock_type>*) noexcept;
@@ -717,10 +719,11 @@ private:
 
     future<> run_exit_tasks();
     void stop();
-    friend class pollable_fd;
     friend class pollable_fd_state;
+    friend class file_mapping;
     friend class posix_file_impl;
     friend class blockdev_file_impl;
+    friend class pipe_data_source_impl;
     friend class timer<>;
     friend class timer<lowres_clock>;
     friend class timer<manual_clock>;
@@ -728,6 +731,7 @@ private:
     friend class internal::poller;
     friend class scheduling_group;
     friend class scheduling_supergroup;
+    friend size_t internal::scheduling_group_count();
     friend void internal::add_to_flush_poller(output_stream<char>& os) noexcept;
     friend void seastar::internal::increase_thrown_exceptions_counter() noexcept;
     friend void seastar::internal::increase_internal_errors_counter() noexcept;
@@ -739,17 +743,16 @@ private:
     friend future<> seastar::destroy_scheduling_group(scheduling_group) noexcept;
     friend future<> seastar::rename_scheduling_group(scheduling_group sg, sstring new_name, sstring new_shortname) noexcept;
     friend future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg) noexcept;
-    friend seastar::internal::log_buf::inserter_iterator do_dump_task_queue(seastar::internal::log_buf::inserter_iterator it, const task_queue& tq);
     friend void internal::set_current_task(task* t);
     friend scheduling_supergroup internal::scheduling_supergroup_for(scheduling_group sg) noexcept;
 
     future<struct statfs> fstatfs(int fd) noexcept;
     friend future<shared_ptr<file_impl>> make_file_impl(int fd, file_open_options options, int flags, struct stat st) noexcept;
-public:
     future<> readable(pollable_fd_state& fd);
     future<> writeable(pollable_fd_state& fd);
     future<> readable_or_writeable(pollable_fd_state& fd);
     future<> poll_rdhup(pollable_fd_state& fd);
+public:
     /// Sets the "Strict DMA" flag.
     ///
     /// When true (default), file I/O operations must use DMA.  This is

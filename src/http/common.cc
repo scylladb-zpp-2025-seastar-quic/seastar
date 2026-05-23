@@ -19,9 +19,6 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <cstdlib>
 #include <memory>
@@ -29,12 +26,8 @@ module;
 #include <numeric>
 #include <span>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/http/common.hh>
 #include <seastar/core/iostream-impl.hh>
-#endif
 
 namespace seastar {
 
@@ -123,8 +116,26 @@ public:
     }
 #if SEASTAR_API_LEVEL >= 9
     future<> put(std::span<temporary_buffer<char>> data) override {
-        return data_sink_impl::fallback_put(data, [this] (temporary_buffer<char>&& buf) {
-            return do_put(std::move(buf));
+        size_t size = std::accumulate(data.begin(), data.end(), size_t(0),
+                [] (size_t s, const auto& b) { return s + b.size(); });
+        if (size == 0) {
+            // size 0 chunk should be ignored, some server
+            // may consider it an end of message
+            return make_ready_future<>();
+        }
+        // The span is only valid synchronously, so move the buffers into
+        // an owning vector before any suspension. The chunk size header and
+        // trailing CRLF go through small buffered writes, while the user's
+        // payload is forwarded as a span over the owned vector so the
+        // underlying output_stream can splice it into its zero-copy queue
+        // without copying user data.
+        auto buffers = std::vector<temporary_buffer<char>>(
+                std::make_move_iterator(data.begin()),
+                std::make_move_iterator(data.end()));
+        return write_size(size).then([this, buffers = std::move(buffers)] () mutable {
+            return _out.write(std::span<temporary_buffer<char>>(buffers));
+        }).then([this] {
+            return _out.write("\r\n", 2);
         });
     }
 #else
