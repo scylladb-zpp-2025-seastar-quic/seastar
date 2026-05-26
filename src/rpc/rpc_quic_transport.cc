@@ -18,31 +18,7 @@
 
 #include <seastar/rpc/rpc_quic_transport.hh>
 
-namespace seastar::rpc {
-
-connected_socket_transport::connected_socket_transport(connected_socket fd) noexcept
-    : _fd(std::move(fd))
-    , _input(_fd.input())
-    , _output(_fd.output()) {
-}
-
-input_stream<char>& connected_socket_transport::input() {
-    return _input;
-}
-
-output_stream<char>& connected_socket_transport::output() {
-    return _output;
-}
-
-void connected_socket_transport::shutdown_input() {
-    _fd.shutdown_input();
-}
-
-void connected_socket_transport::shutdown_output() {
-    _fd.shutdown_output();
-}
-
-namespace experimental {
+namespace seastar::rpc::experimental {
 
 namespace {
 
@@ -108,6 +84,16 @@ future<> abort_quic_stream(quic::experimental::stream& stream) {
     });
 }
 
+future<> drain_quic_stream_fin(input_stream<char>& in) {
+    return repeat([&in] {
+        return in.read().then([] (temporary_buffer<char> data) {
+            return data.empty() ? stop_iteration::yes : stop_iteration::no;
+        });
+    }).handle_exception([] (std::exception_ptr ep) {
+        return ignore_quic_closed_exception(ep);
+    });
+}
+
 class quic_transport_stream final : public connection::transport::stream {
     quic::experimental::stream _stream;
     input_stream<char> _input;
@@ -147,6 +133,14 @@ public:
 
     future<> abort() override {
         return abort_quic_stream(_stream);
+    }
+
+    bool is_closed_exception(std::exception_ptr ep) const noexcept override {
+        return is_quic_closed_exception(ep);
+    }
+
+    future<> drain_input() override {
+        return drain_quic_stream_fin(_input);
     }
 };
 
@@ -194,6 +188,10 @@ void quic_client_transport::shutdown_output() {
 
 bool quic_client_transport::supports_multiplexed_requests() const {
     return true;
+}
+
+bool quic_client_transport::is_closed_exception(std::exception_ptr ep) const noexcept {
+    return is_quic_closed_exception(ep);
 }
 
 future<> quic_client_transport::stop() {
@@ -267,11 +265,13 @@ bool quic_server_transport::supports_multiplexed_requests() const {
     return true;
 }
 
+bool quic_server_transport::is_closed_exception(std::exception_ptr ep) const noexcept {
+    return is_quic_closed_exception(ep);
+}
+
 future<std::unique_ptr<connection::transport::stream>> quic_server_transport::accept_request_stream() {
     auto stream = co_await _conn.accept_stream();
     co_return std::make_unique<quic_transport_stream>(std::move(stream));
 }
 
-} // namespace experimental
-
-} // namespace seastar::rpc
+} // namespace seastar::rpc::experimental
