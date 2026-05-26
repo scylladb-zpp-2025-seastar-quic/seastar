@@ -226,11 +226,21 @@ struct cancellable {
         return *this;
     }
     void cancel() {
-        if (cancel_send) {
-            cancel_send();
+        auto cs = std::exchange(cancel_send, std::function<void()>{});
+        auto cw = std::exchange(cancel_wait, std::function<void()>{});
+        if (send_back_pointer) {
+            *send_back_pointer = nullptr;
         }
-        if (cancel_wait) {
-            cancel_wait();
+        if (wait_back_pointer) {
+            *wait_back_pointer = nullptr;
+        }
+        send_back_pointer = nullptr;
+        wait_back_pointer = nullptr;
+        if (cs) {
+            cs();
+        }
+        if (cw) {
+            cw();
         }
     }
     ~cancellable() {

@@ -22,24 +22,6 @@
 #include <seastar/quic/quic.hh>
 #include <seastar/rpc/rpc.hh>
 
-namespace seastar::rpc {
-
-class connected_socket_transport final : public connection::transport {
-    connected_socket _fd;
-    input_stream<char> _input;
-    output_stream<char> _output;
-
-public:
-    explicit connected_socket_transport(connected_socket fd) noexcept;
-
-    input_stream<char>& input() override;
-    output_stream<char>& output() override;
-    void shutdown_input() override;
-    void shutdown_output() override;
-};
-
-} // namespace seastar::rpc
-
 namespace seastar::rpc::experimental {
 
 std::unique_ptr<server::acceptor> make_quic_server_acceptor(seastar::quic::experimental::quic_server_config config);
@@ -59,6 +41,7 @@ public:
     void shutdown_input() override;
     void shutdown_output() override;
     future<> stop() override;
+    bool is_closed_exception(std::exception_ptr ep) const noexcept override;
     bool supports_multiplexed_requests() const override;
     future<std::unique_ptr<connection::transport::stream>> open_request_stream() override;
 
@@ -81,6 +64,7 @@ public:
     void shutdown_input() override;
     void shutdown_output() override;
     future<> stop() override;
+    bool is_closed_exception(std::exception_ptr ep) const noexcept override;
     bool supports_multiplexed_requests() const override;
     future<std::unique_ptr<connection::transport::stream>> accept_request_stream() override;
 
