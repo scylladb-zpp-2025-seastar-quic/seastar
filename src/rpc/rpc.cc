@@ -137,6 +137,87 @@ static void log_exception(connection& c, log_level level, const char* log, std::
     c.get_logger()(c.peer_address(), level, std::string_view(formatted.data(), formatted.size()));
 }
 
+static future<> write_snd_buf(output_stream<char>& out, snd_buf buf) {
+    auto* b = std::get_if<temporary_buffer<char>>(&buf.bufs);
+    if (b) {
+        return out.write(std::move(*b));
+    } else {
+        return do_with(std::move(std::get<std::vector<temporary_buffer<char>>>(buf.bufs)),
+                [&out] (std::vector<temporary_buffer<char>>& ar) {
+            return do_for_each(ar.begin(), ar.end(), [&out] (auto& b) {
+                return out.write(std::move(b));
+            });
+        });
+    }
+}
+
+class connected_socket_transport final : public connection::transport {
+    connected_socket _fd;
+    input_stream<char> _input;
+    output_stream<char> _output;
+
+public:
+    explicit connected_socket_transport(connected_socket fd) noexcept
+        : _fd(std::move(fd))
+        , _input(_fd.input())
+        , _output(_fd.output()) {
+    }
+
+    input_stream<char>& input() override {
+        return _input;
+    }
+
+    output_stream<char>& output() override {
+        return _output;
+    }
+
+    void shutdown_input() override {
+        _fd.shutdown_input();
+    }
+
+    void shutdown_output() override {
+        _fd.shutdown_output();
+    }
+};
+
+namespace internal {
+
+class send_cancellation_state {
+    cancellable* _cancel = nullptr;
+    bool _cancelled = false;
+
+public:
+    void attach(cancellable& cancel, lw_shared_ptr<send_cancellation_state> self) {
+        cancel.cancel_send = [self] {
+            self->_cancelled = true;
+        };
+        cancel.send_back_pointer = &_cancel;
+        _cancel = &cancel;
+    }
+
+    bool cancelled() const noexcept {
+        return _cancelled;
+    }
+
+    cancellable* cancel() const noexcept {
+        return _cancel;
+    }
+
+    void uncancellable() noexcept {
+        if (_cancel) {
+            _cancel->cancel_send = std::function<void()>();
+            _cancel->send_back_pointer = nullptr;
+            _cancel = nullptr;
+        }
+    }
+
+    ~send_cancellation_state() {
+        uncancellable();
+    }
+};
+
+} // namespace internal
+
 snd_buf connection::compress(snd_buf buf) {
     if (_compressor) {
         buf = _compressor->compress(4, std::move(buf));
@@ -148,17 +229,7 @@ snd_buf connection::compress(snd_buf buf) {
 }
 
 future<> connection::send_buffer(snd_buf buf) {
-    auto* b = std::get_if<temporary_buffer<char>>(&buf.bufs);
-    if (b) {
-        return _connected->write_buf.write(std::move(*b));
-    } else {
-        return do_with(std::move(std::get<std::vector<temporary_buffer<char>>>(buf.bufs)),
-                [this] (std::vector<temporary_buffer<char>>& ar) {
-            return do_for_each(ar.begin(), ar.end(), [this] (auto& b) {
-                return _connected->write_buf.write(std::move(b));
-            });
-        });
-    }
+    return write_snd_buf(transport_output(), std::move(buf));
 }
 
 future<> connection::send_entry(outgoing_entry& d) noexcept {
@@ -186,7 +257,7 @@ future<> connection::send_entry(outgoing_entry& d) noexcept {
         auto buf = compress(std::move(d.buf));
         return send_buffer(std::move(buf)).then([this] {
             _stats.sent_messages++;
-            return _connected->write_buf.flush();
+            return transport_output().flush();
         });
     });
 }
@@ -198,9 +269,7 @@ void connection::set_negotiated() noexcept {
 
 future<> connection::stop_send_loop(std::exception_ptr ex) {
     _error = true;
-    if (_connected) {
-        _connected->fd.shutdown_output();
-    }
+    shutdown_transport_output();
     if (ex == nullptr) {
         ex = std::make_exception_ptr(closed_error());
     }
@@ -229,15 +298,29 @@ future<> connection::stop_send_loop(std::exception_ptr ex) {
         std::get<0>(res).ignore_ready_future();
         // _sink_closed_future is never exceptional
         bool sink_closed = std::get<1>(res).get();
-        return _connected && !sink_closed ? _connected->write_buf.close() : make_ready_future();
+        return connected() && !sink_closed ? transport_output().close() : make_ready_future();
     });
 }
 
 void connection::set_socket(connected_socket&& fd) {
-    if (_connected.has_value()) {
+    set_transport(std::make_unique<connected_socket_transport>(std::move(fd)));
+}
+
+void connection::set_transport(std::unique_ptr<transport> t) {
+    if (_transport) {
         throw std::runtime_error("already connected");
     }
-    _connected.emplace(std::move(fd));
+    _transport = std::move(t);
+}
+
+internal::reply_handle connection::make_reply_handle() {
+    return internal::reply_handle([this] (snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout) {
+        return send(std::move(data), timeout);
+    });
+}
+
+future<internal::incoming_request> connection::receive_request_frame(input_stream<char>&) {
+    return make_exception_future<internal::incoming_request>(std::runtime_error("transport does not support receiving RPC requests"));
 }
 
 future<> connection::send_negotiation_frame(feature_map features) {
@@ -258,9 +341,9 @@ future<> connection::send_negotiation_frame(feature_map features) {
         p += 4;
         p = std::copy_n(e.second.begin(), e.second.size(), p);
     }
-    return _connected->write_buf.write(std::move(reply)).then([this] {
+    return transport_output().write(std::move(reply)).then([this] {
         _stats.sent_messages++;
-        return _connected->write_buf.flush();
+        return transport_output().flush();
     });
 }
 
@@ -347,7 +430,7 @@ future<> connection::send(snd_buf buf, std::optional<rpc_clock_type::time_point>
 void connection::abort() {
     if (!_error) {
         _error = true;
-        _connected->fd.shutdown_input();
+        shutdown_transport_input();
     }
 }
 
@@ -553,7 +636,7 @@ future<> connection::stream_close() {
         _sink_closed_future = p.get_future();
         // stop_send_loop(), which also calls _write_buf.close(), and this code can run in parallel.
         // Use _sink_closed_future to serialize them and skip second call to close()
-        f = _connected->write_buf.close().finally([p = std::move(p)] () mutable { p.set_value(true);});
+        f = transport_output().close().finally([p = std::move(p)] () mutable { p.set_value(true);});
     }
     return f.finally([this] () mutable { return stop(); });
 }
@@ -569,7 +652,7 @@ future<> connection::stream_process_incoming(rcv_buf&& buf) {
 }
 
 future<> connection::handle_stream_frame() {
-    return read_stream_frame_compressed(_connected->read_buf).then([this] (std::optional<rcv_buf> data) {
+    return read_stream_frame_compressed(transport_input()).then([this] (std::optional<rcv_buf> data) {
         if (!data) {
             _error = true;
             return make_ready_future<>();
@@ -665,8 +748,92 @@ struct request_frame_with_timeout : request_frame {
     }
 };
 
-future<> client::request(uint64_t type, int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel) {
+template <typename FrameType>
+future<request_frame::return_type>
+read_quic_request_frame_uncompressed(server::connection& owner, input_stream<char>& in) {
+    auto header_size = FrameType::header_size();
+    auto header = co_await in.read_exactly(header_size);
+    if (header.size() != header_size) {
+        if (header.size() != 0) {
+            owner.get_logger()(owner.peer_address(), format(
+                    "dropping truncated QUIC request stream header: expected {:d} got {:d}",
+                    header_size, header.size()));
+        }
+        co_return FrameType::empty_value();
+    }
+
+    auto [size, h] = FrameType::decode_header(header.get());
+    if (owner.estimate_request_size(size) > owner.max_request_size()) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping invalid QUIC request stream: payload size {:d} exceeds memory limit {:d}",
+                size, owner.max_request_size()));
+        co_return FrameType::empty_value();
+    }
+
+    if (!size) {
+        co_return FrameType::make_value(h, rcv_buf());
+    }
+
+    auto rb = co_await read_rcv_buf(in, size);
+    if (rb.size != size) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping truncated QUIC request stream data: expected {:d} got {:d}",
+                size, rb.size));
+        co_return FrameType::empty_value();
+    }
+
+    co_return FrameType::make_value(h, std::move(rb));
+}
+
+template <typename FrameType>
+future<request_frame::return_type>
+read_quic_request_frame_compressed(server::connection& owner, std::unique_ptr<compressor>& compressor, input_stream<char>& in) {
+    auto compress_header = co_await in.read_exactly(sizeof(uint32_t));
+    if (compress_header.size() != sizeof(uint32_t)) {
+        if (compress_header.size() != 0) {
+            owner.get_logger()(owner.peer_address(), format(
+                    "dropping truncated compressed QUIC request stream header: expected {:d} got {:d}",
+                    sizeof(uint32_t), compress_header.size()));
+        }
+        co_return FrameType::empty_value();
+    }
+
+    auto ptr = compress_header.get();
+    auto compressed_size = read_le<uint32_t>(ptr);
+    if (owner.estimate_request_size(compressed_size) > owner.max_request_size()) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping invalid compressed QUIC request stream: compressed payload size {:d} exceeds memory limit {:d}",
+                compressed_size, owner.max_request_size()));
+        co_return FrameType::empty_value();
+    }
+
+    auto compressed_data = co_await read_rcv_buf(in, compressed_size);
+    if (compressed_data.size != compressed_size) {
+        owner.get_logger()(owner.peer_address(), format(
+                "dropping truncated compressed QUIC request stream data: expected {:d} got {:d}",
+                compressed_size, compressed_data.size));
+        co_return FrameType::empty_value();
+    }
+
+    auto decompressed = compressor->decompress(std::move(compressed_data));
+    if (decompressed.size == 0) {
+        co_return FrameType::empty_value();
+    }
+
+    auto source = std::visit([] (auto&& b) {
+        return util::as_input_stream(std::move(b));
+    }, decompressed.bufs);
+    auto frame = co_await do_with(std::move(source), [&owner] (input_stream<char>& decompressed_in) {
+        return read_quic_request_frame_uncompressed<FrameType>(owner, decompressed_in);
+    });
+    co_return frame;
+}
+
+future<> client::request(uint64_t type, int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) {
     request_frame_with_timeout::encode_header(type, msg_id, buf);
+    if (_transport && _transport->supports_multiplexed_requests()) {
+        return send_multiplexed_request(msg_id, std::move(buf), timeout, cancel, expect_response);
+    }
     return send(std::move(buf), timeout, cancel);
 }
 
@@ -704,7 +871,7 @@ client::negotiate(feature_map provided) {
 
 future<> client::negotiate_protocol(feature_map features) {
     return send_negotiation_frame(std::move(features)).then([this] {
-        return receive_negotiation_frame(*this, _connected->read_buf).then([this] (feature_map features) {
+        return receive_negotiation_frame(*this, transport_input()).then([this] (feature_map features) {
             return negotiate(std::move(features));
         });
     });
@@ -791,6 +958,223 @@ client::read_response_frame_compressed(input_stream<char>& in) {
     }
 }
 
+future<internal::incoming_response>
+client::receive_response_frame(input_stream<char>& in) {
+    auto [msg_id, handler_duration, data] = co_await read_response_frame_compressed(in);
+    co_return internal::incoming_response{
+        .msg_id = msg_id,
+        .handler_duration = handler_duration,
+        .data = std::move(data),
+    };
+}
+
+future<internal::incoming_response>
+client::receive_response() {
+    return receive_response_frame(transport_input());
+}
+
+void client::handle_response(internal::incoming_response response) {
+    auto msg_id = response.msg_id;
+    auto it = _outstanding.find(std::abs(msg_id));
+    if (!response.data) {
+        _error = true;
+    } else if (it != _outstanding.end()) {
+        auto handler = std::move(it->second);
+        _outstanding.erase(it);
+        (*handler)(*this, msg_id, std::move(response.data.value()));
+        if (response.handler_duration) {
+            _stats.delay_samples++;
+            _stats.delay_total += (rpc_clock_type::now() - handler->start) - std::chrono::microseconds(*response.handler_duration);
+        }
+    } else if (msg_id < 0) {
+        try {
+            std::rethrow_exception(unmarshal_exception(response.data.value()));
+        } catch(const unknown_verb_error& ex) {
+            // if this is unknown verb exception with unknown id ignore it
+            // can happen if unknown verb was used by no_wait client
+            get_logger()(peer_address(), format("unknown verb exception {:d} ignored", ex.type));
+        } catch(...) {
+            // We've got error response but handler is no longer waiting, could be timed out.
+            log_exception(*this, log_level::info, "ignoring error response", std::current_exception());
+        }
+    } else {
+        // we get a reply for a message id not in _outstanding
+        // this can happened if the message id is timed out already
+        get_logger()(peer_address(), log_level::debug, "got a reply for an expired message id");
+    }
+}
+
+bool client::can_send_request(id_type id, bool expect_response) const {
+    return !expect_response || _outstanding.find(id) != _outstanding.end();
+}
+
+bool client::close_outstanding_request(id_type id) {
+    auto it = _outstanding.find(id);
+    if (it == _outstanding.end()) {
+        return false;
+    }
+    auto handler = std::move(it->second);
+    _outstanding.erase(it);
+    handler->closed();
+    return true;
+}
+
+lw_shared_ptr<client::multiplexed_request_state> client::register_multiplexed_request(id_type id) {
+    auto state = make_lw_shared<multiplexed_request_state>();
+    _active_multiplexed_requests.emplace(id, state);
+    return state;
+}
+
+void client::cleanup_multiplexed_request(id_type id, lw_shared_ptr<multiplexed_request_state> request_state) {
+    auto it = _active_multiplexed_requests.find(id);
+    if (it != _active_multiplexed_requests.end() && it->second.get() == request_state.get()) {
+        _active_multiplexed_requests.erase(it);
+    }
+}
+
+void client::abort_multiplexed_request(id_type id) noexcept {
+    auto it = _active_multiplexed_requests.find(id);
+    if (it == _active_multiplexed_requests.end()) {
+        return;
+    }
+    auto state = it->second;
+    state->cancelled = true;
+    if (state->stream) {
+        auto close = state->request_sent ? state->stream->stop_input() : state->stream->abort();
+        (void)std::move(close).finally([state] {}).handle_exception([] (std::exception_ptr) {});
+    }
+}
+
+void client::abort_all_multiplexed_requests() noexcept {
+    for (auto& request : _active_multiplexed_requests) {
+        auto state = request.second;
+        state->cancelled = true;
+        if (state->stream) {
+            auto close = state->request_sent ? state->stream->stop_input() : state->stream->abort();
+            (void)std::move(close).finally([state] {}).handle_exception([] (std::exception_ptr) {});
+        }
+    }
+}
+
+void client::handle_multiplexed_response(id_type msg_id, internal::incoming_response response) {
+    if (!response.data) {
+        close_outstanding_request(msg_id);
+        return;
+    }
+    handle_response(std::move(response));
+}
+
+future<> client::send_multiplexed_request(int64_t msg_id, snd_buf buf, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, bool expect_response) {
+    if (timeout && *timeout <= rpc_clock_type::now()) {
+        return make_ready_future<>();
+    }
+
+    auto cancel_state = make_lw_shared<internal::send_cancellation_state>();
+    if (cancel) {
+        cancel_state->attach(*cancel, cancel_state);
+    }
+    auto request_state = register_multiplexed_request(msg_id);
+
+    if (_negotiated) {
+        return _negotiated->get_shared_future().then([this, msg_id, buf = std::move(buf), timeout, cancel_state, expect_response, request_state] () mutable {
+            return do_send_multiplexed_request(msg_id, std::move(buf), timeout, std::move(cancel_state), expect_response, std::move(request_state));
+        }).handle_exception([this, msg_id, request_state] (std::exception_ptr ep) {
+            cleanup_multiplexed_request(msg_id, request_state);
+            return make_exception_future<>(ep);
+        });
+    }
+    return do_send_multiplexed_request(msg_id, std::move(buf), timeout, std::move(cancel_state), expect_response, std::move(request_state));
+}
+
+future<> client::do_send_multiplexed_request(int64_t msg_id, snd_buf data, std::optional<rpc_clock_type::time_point> timeout, lw_shared_ptr<internal::send_cancellation_state> cancel_state, bool expect_response, lw_shared_ptr<multiplexed_request_state> request_state) {
+    if (request_state->cancelled || cancel_state->cancelled() || (timeout && *timeout <= rpc_clock_type::now())) {
+        cleanup_multiplexed_request(msg_id, request_state);
+        co_return;
+    }
+    if (!can_send_request(msg_id, expect_response)) {
+        cleanup_multiplexed_request(msg_id, request_state);
+        co_return;
+    }
+
+    if (data.size && _propagate_timeout) {
+        static_assert(snd_buf::chunk_size >= sizeof(uint64_t), "send buffer chunk size is too small");
+        if (_timeout_negotiated) {
+            uint64_t left = 0;
+            if (timeout) {
+                left = std::chrono::duration_cast<std::chrono::milliseconds>(*timeout - rpc_clock_type::now()).count();
+            }
+            write_le<uint64_t>(data.front().get_write(), left);
+        } else {
+            data.front().trim_front(sizeof(uint64_t));
+            data.size -= sizeof(uint64_t);
+        }
+    }
+    data = compress(std::move(data));
+
+    try {
+        request_state->stream = co_await _transport->open_request_stream();
+        if (request_state->cancelled
+                || cancel_state->cancelled()
+                || (timeout && *timeout <= rpc_clock_type::now())
+                || !can_send_request(msg_id, expect_response)) {
+            co_await request_state->stream->abort();
+            cleanup_multiplexed_request(msg_id, request_state);
+            co_return;
+        }
+        cancel_state->uncancellable();
+
+        co_await write_snd_buf(request_state->stream->output(), std::move(data));
+        _stats.sent_messages++;
+        co_await request_state->stream->close_output();
+        request_state->request_sent = true;
+
+        if (!expect_response) {
+            (void)with_gate(_response_gate, [this, msg_id, request_state] {
+                return request_state->stream->drain_input().handle_exception([] (std::exception_ptr) {
+                }).finally([this, msg_id, request_state] {
+                    cleanup_multiplexed_request(msg_id, request_state);
+                });
+            });
+            co_return;
+        }
+
+        if (!can_send_request(msg_id, expect_response)) {
+            co_await request_state->stream->abort();
+            cleanup_multiplexed_request(msg_id, request_state);
+            co_return;
+        }
+
+        (void)with_gate(_response_gate, [this, msg_id, request_state] {
+            return receive_response_frame(request_state->stream->input()).then([this, msg_id] (internal::incoming_response response) {
+                handle_multiplexed_response(msg_id, std::move(response));
+            }).handle_exception([this, msg_id] (std::exception_ptr ep) {
+                if (close_outstanding_request(msg_id)) {
+                    if (!error()) {
+                        log_exception(*this, log_level::error, "client multiplexed request stream failed", ep);
+                    }
+                }
+            }).finally([this, msg_id, request_state] {
+                return request_state->stream->drain_input().handle_exception([] (std::exception_ptr) {
+                }).finally([this, msg_id, request_state] {
+                    cleanup_multiplexed_request(msg_id, request_state);
+                });
+            });
+        });
+    } catch (gate_closed_exception&) {
+        cleanup_multiplexed_request(msg_id, request_state);
+        if (expect_response) {
+            close_outstanding_request(msg_id);
+        }
+        throw closed_error();
+    } catch (...) {
+        cleanup_multiplexed_request(msg_id, request_state);
+        if (expect_response) {
+            close_outstanding_request(msg_id);
+        }
+        throw;
+    }
+}
+
 stats client::get_stats() const {
     stats res = _stats;
     res.wait_reply = incoming_queue_length();
@@ -805,8 +1189,13 @@ void client::wait_for_reply(id_type id, std::unique_ptr<reply_handler_base>&& h,
     }
     if (cancel) {
         cancel->cancel_wait = [this, id] {
-            _outstanding[id]->cancel();
-            _outstanding.erase(id);
+            abort_multiplexed_request(id);
+            auto it = _outstanding.find(id);
+            if (it == _outstanding.end()) {
+                return;
+            }
+            it->second->cancel();
+            _outstanding.erase(it);
         };
         h->pcancel = cancel;
         cancel->wait_back_pointer = &h->pcancel;
@@ -815,18 +1204,30 @@ void client::wait_for_reply(id_type id, std::unique_ptr<reply_handler_base>&& h,
 }
 void client::wait_timed_out(id_type id) {
     _stats.timeout++;
-    _outstanding[id]->timeout();
-    _outstanding.erase(id);
+    auto it = _outstanding.find(id);
+    if (it == _outstanding.end()) {
+        return;
+    }
+    abort_multiplexed_request(id);
+    it->second->timeout();
+    _outstanding.erase(it);
 }
 
 future<> client::stop() noexcept {
     _error = true;
+    future<> transport_stopped = make_ready_future<>();
     try {
+        if (_transport) {
+            transport_stopped = _transport->stop();
+        } else {
+            shutdown_transport_input();
+            shutdown_transport_output();
+        }
         _socket.shutdown();
     } catch(...) {
         log_exception(*this, log_level::error, "fail to shutdown connection while stopping", std::current_exception());
     }
-    return _stopped.get_future();
+    return when_all_succeed(std::move(transport_stopped), _stopped.get_future()).discard_result();
 }
 
 void client::abort_all_streams() {
@@ -958,75 +1359,67 @@ client::client(const logger& l, void* s, client_options ops, socket socket, cons
     enqueue_zero_frame();
 }
 
-future<> client::loop(client_options ops, const socket_address& addr, const socket_address& local) {
+client::client(const logger& l, void* s, client_options ops, std::unique_ptr<transport> transport, const socket_address& addr, const socket_address& local)
+        : rpc::connection(l, s), _socket(make_socket()), _server_addr(addr), _local_addr(local), _options(ops), _metrics(*this)
+{
+    set_transport(std::move(transport));
+    // Run client in the background.
+    // Communicate result via _stopped.
+    // The caller has to call client::stop() to synchronize.
+    (void)loop_with_transport();
+    enqueue_zero_frame();
+}
+
+feature_map client::make_client_features() const {
+    feature_map features;
+    if (_options.compressor_factory) {
+        features[protocol_features::COMPRESS] = _options.compressor_factory->supported();
+    }
+    if (_options.send_timeout_data) {
+        features[protocol_features::TIMEOUT] = "";
+    }
+    if (_options.send_handler_duration) {
+        features[protocol_features::HANDLER_DURATION] = "";
+    }
+    if (_options.stream_parent) {
+        features[protocol_features::STREAM_PARENT] = serialize_connection_id(_options.stream_parent);
+    }
+    if (!_options.isolation_cookie.empty()) {
+        features[protocol_features::ISOLATION] = _options.isolation_cookie;
+    }
+    return features;
+}
+
+future<> client::process_client_connection() {
+    co_await negotiate_protocol(make_client_features());
+
+    _propagate_timeout = !is_stream();
+    set_negotiated();
+    while (!transport_input().eof() && !_error) {
+        if (is_stream()) {
+            co_await handle_stream_frame();
+            continue;
+        }
+
+        if (_transport->supports_multiplexed_requests()) {
+            co_await transport_input().read();
+        } else {
+            auto response = co_await receive_response();
+            handle_response(std::move(response));
+        }
+    }
+}
+
+future<> client::loop_with_transport() {
     std::exception_ptr ep;
     try {
-        connected_socket fd = co_await _socket.connect(addr, local);
-        fd.set_nodelay(ops.tcp_nodelay);
-        if (ops.keepalive) {
-            fd.set_keepalive(true);
-            fd.set_keepalive_parameters(ops.keepalive.value());
-        }
-        set_socket(std::move(fd));
-
-        feature_map features;
-        if (_options.compressor_factory) {
-            features[protocol_features::COMPRESS] = _options.compressor_factory->supported();
-        }
-        if (_options.send_timeout_data) {
-            features[protocol_features::TIMEOUT] = "";
-        }
-        if (_options.send_handler_duration) {
-            features[protocol_features::HANDLER_DURATION] = "";
-        }
-        if (_options.stream_parent) {
-            features[protocol_features::STREAM_PARENT] = serialize_connection_id(_options.stream_parent);
-        }
-        if (!_options.isolation_cookie.empty()) {
-            features[protocol_features::ISOLATION] = _options.isolation_cookie;
-        }
-
-        co_await negotiate_protocol(std::move(features));
-
-        _propagate_timeout = !is_stream();
-        set_negotiated();
-        while (!_connected->read_buf.eof() && !_error) {
-            if (is_stream()) {
-                co_await handle_stream_frame();
-                continue;
-            }
-            auto&& [msg_id, ht, data] = co_await read_response_frame_compressed(_connected->read_buf);
-            auto it = _outstanding.find(std::abs(msg_id));
-            if (!data) {
-                _error = true;
-            } else if (it != _outstanding.end()) {
-                auto handler = std::move(it->second);
-                _outstanding.erase(it);
-                (*handler)(*this, msg_id, std::move(data.value()));
-                if (ht) {
-                    _stats.delay_samples++;
-                    _stats.delay_total += (rpc_clock_type::now() - handler->start) - std::chrono::microseconds(*ht);
-                }
-            } else if (msg_id < 0) {
-                try {
-                    std::rethrow_exception(unmarshal_exception(data.value()));
-                } catch(const unknown_verb_error& ex) {
-                    // if this is unknown verb exception with unknown id ignore it
-                    // can happen if unknown verb was used by no_wait client
-                    get_logger()(peer_address(), format("unknown verb exception {:d} ignored", ex.type));
-                } catch(...) {
-                    // We've got error response but handler is no longer waiting, could be timed out.
-                    log_exception(*this, log_level::info, "ignoring error response", std::current_exception());
-                }
-            } else {
-                // we get a reply for a message id not in _outstanding
-                // this can happened if the message id is timed out already
-                get_logger()(peer_address(), log_level::debug, "got a reply for an expired message id");
-            }
-        }
+        co_await process_client_connection();
     } catch (...) {
         ep = std::current_exception();
-        if (_connected) {
+        auto expected_close = _error && _transport && _transport->is_closed_exception(ep);
+        if (expected_close) {
+            ep = nullptr;
+        } else if (connected()) {
             if (is_stream()) {
                 log_exception(*this, log_level::error, "client stream connection dropped", ep);
             } else {
@@ -1046,6 +1439,58 @@ future<> client::loop(client_options ops, const socket_address& addr, const sock
     _error = true;
     future<> f = co_await coroutine::as_future(stop_send_loop(ep));
     f.ignore_ready_future();
+    abort_all_multiplexed_requests();
+    co_await _response_gate.close();
+    _active_multiplexed_requests.clear();
+    _outstanding.clear();
+    if (is_stream()) {
+        deregister_this_stream();
+    } else {
+        abort_all_streams();
+    }
+    if (_compressor) {
+        co_await _compressor->close();
+    }
+    _stopped.set_value();
+}
+
+future<> client::loop(client_options ops, const socket_address& addr, const socket_address& local) {
+    std::exception_ptr ep;
+    try {
+        connected_socket fd = co_await _socket.connect(addr, local);
+        fd.set_nodelay(ops.tcp_nodelay);
+        if (ops.keepalive) {
+            fd.set_keepalive(true);
+            fd.set_keepalive_parameters(ops.keepalive.value());
+        }
+        set_socket(std::move(fd));
+
+        co_await process_client_connection();
+    } catch (...) {
+        ep = std::current_exception();
+        if (connected()) {
+            if (is_stream()) {
+                log_exception(*this, log_level::error, "client stream connection dropped", ep);
+            } else {
+                log_exception(*this, log_level::error, "client connection dropped", ep);
+            }
+        } else {
+            if (is_stream()) {
+                log_exception(*this, log_level::debug, "stream fail to connect", ep);
+            } else {
+                log_exception(*this, log_level::debug, "fail to connect", ep);
+            }
+        }
+    }
+    if (is_stream() && (ep || _error)) {
+        _stream_queue.abort(std::make_exception_ptr(stream_closed()));
+    }
+    _error = true;
+    future<> f = co_await coroutine::as_future(stop_send_loop(ep));
+    f.ignore_ready_future();
+    abort_all_multiplexed_requests();
+    co_await _response_gate.close();
+    _active_multiplexed_requests.clear();
     _outstanding.clear();
     if (is_stream()) {
         deregister_this_stream();
@@ -1166,7 +1611,7 @@ server::connection::negotiate(feature_map requested) {
 
 future<>
 server::connection::negotiate_protocol() {
-    return receive_negotiation_frame(*this, _connected->read_buf).then([this] (feature_map requested_features) {
+    return receive_negotiation_frame(*this, transport_input()).then([this] (feature_map requested_features) {
         return negotiate(std::move(requested_features)).then([this] (feature_map returned_features) {
             return send_negotiation_frame(std::move(returned_features));
         });
@@ -1182,8 +1627,88 @@ server::connection::read_request_frame_compressed(input_stream<char>& in) {
     }
 }
 
+future<internal::incoming_request>
+server::connection::receive_request_frame(input_stream<char>& in) {
+    auto [expire, type, msg_id, data] = co_await read_request_frame_compressed(in);
+    co_return internal::incoming_request{
+        .expire = expire,
+        .type = type,
+        .msg_id = msg_id,
+        .data = std::move(data),
+        .reply = make_reply_handle(),
+    };
+}
+
+future<internal::incoming_request>
+server::connection::receive_quic_request_frame(input_stream<char>& in) {
+    request_frame::return_type frame;
+    if (_timeout_negotiated) {
+        if (_compressor) {
+            frame = co_await read_quic_request_frame_compressed<request_frame_with_timeout>(*this, _compressor, in);
+        } else {
+            frame = co_await read_quic_request_frame_uncompressed<request_frame_with_timeout>(*this, in);
+        }
+    } else {
+        if (_compressor) {
+            frame = co_await read_quic_request_frame_compressed<request_frame>(*this, _compressor, in);
+        } else {
+            frame = co_await read_quic_request_frame_uncompressed<request_frame>(*this, in);
+        }
+    }
+
+    auto [expire, type, msg_id, data] = std::move(frame);
+    co_return internal::incoming_request{
+        .expire = expire,
+        .type = type,
+        .msg_id = msg_id,
+        .data = std::move(data),
+        .reply = make_reply_handle(),
+    };
+}
+
+future<internal::incoming_request>
+server::connection::receive_multiplexed_request() {
+    while (true) {
+        auto stream = co_await _transport->accept_request_stream();
+        auto request = co_await receive_quic_request_frame(stream->input());
+        auto stream_state = make_lw_shared<std::unique_ptr<transport::stream>>(std::move(stream));
+        if (!request.data) {
+            co_await (*stream_state)->close_output();
+            continue;
+        }
+        auto drain_state = stream_state;
+        (void)(*drain_state)->drain_input().finally([drain_state] {}).handle_exception([] (std::exception_ptr) {});
+
+        auto rpc_owner = shared_from_this();
+        request.reply = internal::reply_handle([stream_state, rpc_owner] (snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout) mutable {
+            if (timeout && *timeout <= rpc_clock_type::now()) {
+                return (*stream_state)->close_output();
+            }
+            return write_snd_buf((*stream_state)->output(), rpc_owner->compress(std::move(data))).handle_exception([stream_state] (std::exception_ptr ep) {
+                if ((*stream_state)->is_closed_exception(ep)) {
+                    return make_ready_future<>();
+                }
+                return make_exception_future<>(ep);
+            }).finally([stream_state] {
+                return (*stream_state)->close_output();
+            });
+        }, [stream_state] () mutable {
+            return (*stream_state)->close_output();
+        });
+        co_return request;
+    }
+}
+
+future<internal::incoming_request>
+server::connection::receive_request() {
+    if (_transport && _transport->supports_multiplexed_requests()) {
+        return receive_multiplexed_request();
+    }
+    return receive_request_frame(transport_input());
+}
+
 future<>
-server::connection::respond(int64_t msg_id, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout, std::optional<rpc_clock_type::duration> handler_duration) {
+server::connection::respond(internal::reply_handle reply, int64_t msg_id, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout, std::optional<rpc_clock_type::duration> handler_duration) {
     if (_handler_duration_negotiated) {
         response_frame_with_handler_time::encode_header(msg_id, handler_duration, data);
     } else {
@@ -1191,11 +1716,19 @@ server::connection::respond(int64_t msg_id, snd_buf&& data, std::optional<rpc_cl
         data.size -= sizeof(uint32_t);
         response_frame::encode_header(msg_id, data);
     }
-    return send(std::move(data), timeout);
+    if (!reply.send) {
+        return make_exception_future<>(closed_error());
+    }
+    return reply.send(std::move(data), timeout);
 }
 
-future<> server::connection::send_unknown_verb_reply(std::optional<rpc_clock_type::time_point> timeout, int64_t msg_id, uint64_t type) {
-    return wait_for_resources(28, timeout).then([this, timeout, msg_id, type] (auto permit) {
+future<>
+server::connection::respond(int64_t msg_id, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout, std::optional<rpc_clock_type::duration> handler_duration) {
+    return respond(make_reply_handle(), msg_id, std::move(data), timeout, handler_duration);
+}
+
+future<> server::connection::send_unknown_verb_reply(internal::reply_handle reply, std::optional<rpc_clock_type::time_point> timeout, int64_t msg_id, uint64_t type) {
+    return wait_for_resources(28, timeout).then([this, timeout, msg_id, type, reply = std::move(reply)] (auto permit) mutable {
         // send unknown_verb exception back
         constexpr size_t unknown_verb_message_size = response_frame_headroom + 2 * sizeof(uint32_t) + sizeof(uint64_t);
         snd_buf data(unknown_verb_message_size);
@@ -1207,12 +1740,40 @@ future<> server::connection::send_unknown_verb_reply(std::optional<rpc_clock_typ
         try {
             // Send asynchronously.
             // This is safe since connection::stop() will wait for background work.
-            (void)with_gate(get_server()._reply_gate, [this, timeout, msg_id, data = std::move(data), permit = std::move(permit)] () mutable {
+            (void)with_gate(get_server()._reply_gate, [this, timeout, msg_id, data = std::move(data), permit = std::move(permit), reply = std::move(reply)] () mutable {
                 // workaround for https://gcc.gnu.org/bugzilla/show_bug.cgi?id=83268
                 auto c = shared_from_this();
-                return respond(-msg_id, std::move(data), timeout, std::nullopt).then([c = std::move(c), permit = std::move(permit)] {});
+                return respond(std::move(reply), -msg_id, std::move(data), timeout, std::nullopt).then([c = std::move(c), permit = std::move(permit)] {});
             });
         } catch(gate_closed_exception&) {/* ignore */}
+    });
+}
+
+future<> server::connection::process_request(internal::incoming_request request) {
+    if (!request.data) {
+        _error = true;
+        co_return;
+    }
+
+    std::optional<rpc_clock_type::time_point> timeout;
+    if (request.expire && *request.expire) {
+        timeout = relative_timeout_to_absolute(std::chrono::milliseconds(*request.expire));
+    }
+    auto h = get_server()._proto.get_handler(request.type);
+    if (!h) {
+        co_await send_unknown_verb_reply(std::move(request.reply), timeout, request.msg_id, request.type);
+        co_return;
+    }
+
+    // If the new method of per-connection scheduling group was used, honor it.
+    // Otherwise, use the old per-handler scheduling group.
+    auto sg = _isolation_config ? _isolation_config->sched_group : h->handler.sg;
+    if (sg == current_scheduling_group()) {
+        co_await h->handler.func(shared_from_this(), timeout, request.msg_id, std::move(request.data.value()), std::move(request.reply), std::move(h->holder));
+        co_return;
+    }
+    co_await with_scheduling_group(sg, [this, timeout, msg_id = request.msg_id, &h = h->handler, data = std::move(request.data.value()), reply = std::move(request.reply), guard = std::move(h->holder)] () mutable {
+        return h.func(shared_from_this(), timeout, msg_id, std::move(data), std::move(reply), std::move(guard));
     });
 }
 
@@ -1225,44 +1786,38 @@ future<> server::connection::process() {
         auto sg = _isolation_config ? _isolation_config->sched_group : current_scheduling_group();
         co_await coroutine::switch_to(sg);
         set_negotiated();
-        while (!_connected->read_buf.eof() && !_error) {
+        while (!transport_input().eof() && !_error) {
             if (is_stream()) {
                 co_await handle_stream_frame();
                 continue;
             }
-            auto [expire, type, msg_id, data] = co_await read_request_frame_compressed(_connected->read_buf);
-            if (!data) {
-                _error = true;
-                continue;
-            } else {
-                std::optional<rpc_clock_type::time_point> timeout;
-                if (expire && *expire) {
-                    timeout = relative_timeout_to_absolute(std::chrono::milliseconds(*expire));
-                }
-                auto h = get_server()._proto.get_handler(type);
-                if (!h) {
-                    co_await send_unknown_verb_reply(timeout, msg_id, type);
-                    continue;
-                }
-
-                // If the new method of per-connection scheduling group was used, honor it.
-                // Otherwise, use the old per-handler scheduling group.
-                auto sg = _isolation_config ? _isolation_config->sched_group : h->handler.sg;
-                if (sg == current_scheduling_group()) {
-                    co_await h->handler.func(shared_from_this(), timeout, msg_id, std::move(data.value()), std::move(h->holder));
-                    continue;
-                }
-                co_await with_scheduling_group(sg, [this, timeout, msg_id, &h = h->handler, data = std::move(data.value()), guard = std::move(h->holder)] () mutable {
-                    return h.func(shared_from_this(), timeout, msg_id, std::move(data), std::move(guard));
+            auto request = co_await receive_request();
+            if (_transport && _transport->supports_multiplexed_requests()) {
+                auto error_conn = shared_from_this();
+                (void)try_with_gate(_request_gate, [this, conn = shared_from_this(), request = std::move(request)] () mutable {
+                    return process_request(std::move(request)).finally([conn = std::move(conn)] {});
+                }).handle_exception([this, error_conn = std::move(error_conn)] (std::exception_ptr handler_ep) {
+                    if (!_transport || !_transport->is_closed_exception(handler_ep)) {
+                        _error = true;
+                        shutdown_transport_input();
+                        log_exception(*this, log_level::error, "server request handler failed", handler_ep);
+                    }
                 });
+                continue;
             }
+            co_await process_request(std::move(request));
         }
     } catch (...) {
         ep = std::current_exception();
-        log_exception(*this, log_level::error,
-            format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
+        if (_transport && _transport->is_closed_exception(ep)) {
+            ep = nullptr;
+        } else {
+            log_exception(*this, log_level::error,
+                format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
+        }
     }
-    _connected->fd.shutdown_input();
+    co_await _request_gate.close();
+    shutdown_transport_input();
     if (is_stream() && (ep || _error)) {
         _stream_queue.abort(std::make_exception_ptr(stream_closed()));
     }
@@ -1284,6 +1839,12 @@ future<> server::connection::process() {
 server::connection::connection(server& s, connected_socket&& fd, socket_address&& addr, const logger& l, void* serializer, connection_id id)
         : rpc::connection(std::move(fd), l, serializer, id)
         , _info{.addr{std::move(addr)}, .server{s}, .conn_id{id}} {
+}
+
+server::connection::connection(server& s, std::unique_ptr<transport> transport, socket_address&& addr, const logger& l, void* serializer, connection_id id)
+        : rpc::connection(l, serializer, id)
+        , _info{.addr{std::move(addr)}, .server{s}, .conn_id{id}} {
+    set_transport(std::move(transport));
 }
 
 future<> server::connection::deregister_this_stream() {
@@ -1314,16 +1875,84 @@ future<> server::connection::abort_all_streams() {
 
 thread_local std::unordered_map<streaming_domain_type, server*> server::_servers;
 
+namespace {
+
+class connected_socket_server_acceptor final : public server::acceptor {
+    server_socket _ss;
+    bool _tcp_nodelay = false;
+
+public:
+    connected_socket_server_acceptor(server_socket ss, bool tcp_nodelay)
+            : _ss(std::move(ss))
+            , _tcp_nodelay(tcp_nodelay) {
+    }
+
+    future<server::accepted_connection> accept() override {
+        auto ar = co_await _ss.accept();
+        ar.connection.set_nodelay(_tcp_nodelay);
+        co_return server::accepted_connection{
+            .remote_address = std::move(ar.remote_address),
+            .transport = std::make_unique<connected_socket_transport>(std::move(ar.connection)),
+        };
+    }
+
+    future<> stop() override {
+        _ss.abort_accept();
+        return make_ready_future<>();
+    }
+};
+
+std::unique_ptr<server::acceptor>
+make_connected_socket_server_acceptor(server_socket ss, bool tcp_nodelay) {
+    return std::make_unique<connected_socket_server_acceptor>(std::move(ss), tcp_nodelay);
+}
+
+template <typename Acceptor, typename Handler, typename OnStop>
+void run_accept_loop(Acceptor& acceptor, Handler handler, OnStop on_stop) {
+    // Run asynchronously in background.
+    // Communicate result via _accept_stopped.
+    // The caller has to call server::stop() to synchronize.
+    (void)keep_doing([&acceptor, handler = std::move(handler)] () mutable {
+        return acceptor.accept().then([handler] (auto accepted) mutable {
+            return handler(std::move(accepted));
+        });
+    }).then_wrapped([on_stop = std::move(on_stop)] (future<>&& f) mutable {
+        try {
+            f.get();
+            SEASTAR_ASSERT(false);
+        } catch (...) {
+            on_stop();
+        }
+    });
+}
+
+}
+
 server::server(protocol_base* proto, const socket_address& addr, resource_limits limits)
-        : server(proto, seastar::listen(addr, listen_options{true}), limits, server_options{})
+        : server(proto, server_options{}, addr, limits)
 {}
 
 server::server(protocol_base* proto, server_options opts, const socket_address& addr, resource_limits limits)
-        : server(proto, seastar::listen(addr, listen_options{true, opts.load_balancing_algorithm}), limits, opts)
+        : server(proto,
+                 opts,
+                 seastar::listen(addr, listen_options{true, opts.load_balancing_algorithm}),
+                 limits)
 {}
 
 server::server(protocol_base* proto, server_socket ss, resource_limits limits, server_options opts)
-        : _proto(*proto), _ss(std::move(ss)), _limits(limits), _resources_available(limits.max_memory), _options(opts)
+        : server(proto, make_connected_socket_server_acceptor(std::move(ss), opts.tcp_nodelay), limits, std::move(opts))
+{}
+
+server::server(protocol_base* proto, server_options opts, server_socket ss, resource_limits limits)
+        : server(proto, std::move(ss), limits, std::move(opts))
+{}
+
+server::server(protocol_base* proto, std::unique_ptr<acceptor> acceptor, resource_limits limits, server_options opts)
+        : _proto(*proto)
+        , _acceptor(std::move(acceptor))
+        , _limits(limits)
+        , _resources_available(limits.max_memory)
+        , _options(std::move(opts))
 {
     if (_options.streaming_domain) {
         if (_servers.find(*_options.streaming_domain) != _servers.end()) {
@@ -1334,57 +1963,48 @@ server::server(protocol_base* proto, server_socket ss, resource_limits limits, s
     accept();
 }
 
-server::server(protocol_base* proto, server_options opts, server_socket ss, resource_limits limits)
-        : server(proto, std::move(ss), limits, opts)
+server::server(protocol_base* proto, server_options opts, std::unique_ptr<acceptor> acceptor, resource_limits limits)
+        : server(proto, std::move(acceptor), limits, std::move(opts))
 {}
 
 void server::accept() {
-    // Run asynchronously in background.
-    // Communicate result via __ss_stopped.
-    // The caller has to call server::stop() to synchronize.
-    (void)keep_doing([this] () mutable {
-        return _ss.accept().then([this] (accept_result ar) mutable {
-            if (_options.filter_connection && !_options.filter_connection(ar.remote_address)) {
-                return;
-            }
-            auto fd = std::move(ar.connection);
-            auto addr = std::move(ar.remote_address);
-            fd.set_nodelay(_options.tcp_nodelay);
-            connection_id id = _options.streaming_domain
-                    ? connection_id::make_id(_next_client_id++, uint16_t(this_shard_id()))
-                    : connection_id::make_invalid_id(_next_client_id++);
-            auto conn = _proto.make_server_connection(*this, std::move(fd), std::move(addr), id);
-            auto r = _conns.emplace(id, conn);
-            SEASTAR_ASSERT(r.second);
-            // Process asynchronously in background.
-            (void)conn->process();
-        });
-    }).then_wrapped([this] (future<>&& f){
-        try {
-            f.get();
-            SEASTAR_ASSERT(false);
-        } catch (...) {
-            _ss_stopped.set_value();
+    run_accept_loop(*_acceptor, [this] (accepted_connection accepted) mutable -> future<> {
+        if (_shutdown) {
+            co_await accepted.transport->stop();
+            co_return;
         }
+        if (_options.filter_connection && !_options.filter_connection(accepted.remote_address)) {
+            co_await accepted.transport->stop();
+            co_return;
+        }
+
+        connection_id id = _options.streaming_domain
+                ? connection_id::make_id(_next_client_id++, uint16_t(this_shard_id()))
+                : connection_id::make_invalid_id(_next_client_id++);
+        auto conn = _proto.make_server_connection(*this, std::move(accepted.transport), std::move(accepted.remote_address), id);
+        auto r = _conns.emplace(id, conn);
+        SEASTAR_ASSERT(r.second);
+        (void)conn->process();
+        co_return;
+    }, [this] {
+        _accept_stopped.set_value();
     });
 }
 
 future<> server::shutdown() {
     if (_shutdown) {
-        return make_ready_future<>();
+        co_return;
     }
 
-    _ss.abort_accept();
+    _shutdown = true;
+    co_await _acceptor->stop().handle_exception([] (std::exception_ptr) {});
     _resources_available.broken();
     if (_options.streaming_domain) {
         _servers.erase(*_options.streaming_domain);
     }
-    return _ss_stopped.get_future().then([this] {
-        return parallel_for_each(_conns | boost::adaptors::map_values, [] (shared_ptr<connection> conn) {
-            return conn->stop();
-        });
-    }).finally([this] {
-        _shutdown = true;
+    co_await _accept_stopped.get_future();
+    co_await parallel_for_each(_conns | boost::adaptors::map_values, [] (shared_ptr<connection> conn) {
+        return conn->stop();
     });
 }
 
