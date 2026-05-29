@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -857,6 +858,37 @@ public:
         return _channel;
     }
 
+    future<> send_datagram_packet(const socket_address& dst, temporary_buffer<char> packet) {
+        if (packet.empty()) {
+            return make_ready_future<>();
+        }
+
+        promise<> done;
+        auto result = done.get_future();
+
+        _send_tail = std::move(_send_tail).then_wrapped(
+          [this, dst, packet = std::move(packet), done = std::move(done)] (future<> previous) mutable {
+              try {
+                  previous.get();
+              } catch (...) {
+                  quic_server_log.debug("server udp send chain observed previous send failure");
+              }
+
+              return send_datagram(quic_server_log, _channel, dst, std::move(packet))
+                .then_wrapped([done = std::move(done)] (future<> send_result) mutable {
+                    try {
+                        send_result.get();
+                        done.set_value();
+                    } catch (...) {
+                        done.set_exception(std::current_exception());
+                    }
+                    return make_ready_future<>();
+                });
+          });
+
+        return result;
+    }
+
     void map_dcid(const conn_ptr& conn, const uint8_t* cid, size_t len) {
         // Multiple DCIDs can route to the same connection during migration/rotation.
         auto key = cid_key(cid, len);
@@ -1512,6 +1544,7 @@ private:
     bool _stopping = false;
 
     gate _task_gate;
+    future<> _send_tail = make_ready_future<>();
     condition_variable _accept_cv;
     std::deque<internal::connection_state_ptr> _accepted;
     std::unordered_map<std::string, conn_ptr> _by_dcid;
@@ -1527,7 +1560,7 @@ future<> server_connection::send_datagram_packet(temporary_buffer<char> packet) 
     if (!server_state) {
         co_return;
     }
-    co_await send_datagram(quic_server_log, server_state->channel(), peer, std::move(packet));
+    co_await server_state->send_datagram_packet(peer, std::move(packet));
 }
 
 bool server_connection::can_send_connection_close() const noexcept {
