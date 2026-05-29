@@ -15,8 +15,15 @@ jobs:
       image: alpine:latest
 
     steps:
+    - name: Install git for checkout
+      run: |
+        apk update
+        apk add --no-cache git
+
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Install build dependencies
       run: |
