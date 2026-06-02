@@ -23,6 +23,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Mark workspace safe for git
+      run: git config --global --add safe.directory '*'
+
     - name: Checkout ngtcp2 submodule
       run: git submodule update --init ngtcp2
 
