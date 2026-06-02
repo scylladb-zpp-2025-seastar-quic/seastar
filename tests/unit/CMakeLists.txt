@@ -494,6 +494,13 @@ seastar_add_test (rpc_tcp
     rpc_test_body_tcp.inc.hh
     rpc_tcp_test.cc)
 
+seastar_add_test (rpc_quic
+  SOURCES
+    rpc_test_body.inc.hh
+    rpc_quic_test.cc
+  LIBRARIES Boost::filesystem
+  DEPENDS testcrt)
+
 seastar_add_test (semaphore
   SOURCES
     semaphore_test.cc
