@@ -43,6 +43,8 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/with_timeout.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/socket_defs.hh>
@@ -698,5 +700,45 @@ SEASTAR_TEST_CASE(test_stress_many_clients_large_data) {
         for (auto& c : clients) {
             c->stop().get();
         }
+    });
+}
+
+// Regression: one-way (no_wait) RPC must renew the bidi-stream credit.
+// Each call opens a fresh bidi QUIC stream; if the server never sends
+// MAX_STREAMS as completed streams retire, the client blocks in
+// open_request_stream once initial_max_streams_bidi (512 here) is spent.
+SEASTAR_TEST_CASE(test_no_wait_renews_stream_budget) {
+    return with_env([] (rpc_env& env) {
+        constexpr int stream_budget = 512;          // == initial_max_streams_bidi
+        constexpr int total_calls   = 4 * stream_budget;
+
+        std::atomic<int> served{0};
+        env.register_handler(12, [&served] (int) -> future<rpc::no_wait_type> {
+            served.fetch_add(1, std::memory_order_relaxed);
+            return make_ready_future<rpc::no_wait_type>(rpc::no_wait);
+        });
+
+        auto c_h  = env.make_client();
+        auto& c   = *c_h;
+        auto call = env.proto.make_client<rpc::no_wait_type (int)>(12);
+
+        std::exception_ptr ep;
+        try {
+            for (int i = 0; i < total_calls; ++i) {
+                // Bound each call so a renewal regression fails fast instead of
+                // hanging on the ~60s QUIC idle timeout.
+                with_timeout(lowres_clock::now() + std::chrono::seconds(5),
+                             call(c, i)).get();
+            }
+            for (int i = 0; i < 200 && served.load() < total_calls; ++i) {
+                seastar::sleep(std::chrono::milliseconds(10)).get();
+            }
+        } catch (...) {
+            ep = std::current_exception();
+        }
+        c.stop().get();                 // abort any pending stream before teardown
+        if (ep) { std::rethrow_exception(ep); }
+
+        BOOST_REQUIRE_GT(served.load(), stream_budget);
     });
 }
