@@ -568,7 +568,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 
     void stop_transport() {
-        // This is the terminal local cleanup path after the actor decided to stop.
+        // Terminal local cleanup path used by both explicit owner stop and actor teardown.
         quic_client_log.info(
           "client transport stop: local={} remote={} handshake_done={} channel_ready={}",
           local_address,
@@ -1404,6 +1404,7 @@ public:
         auto st = std::exchange(_state, {});
         quic_client_log.info("client stop start: local={} remote={}", st->local_address, st->remote_address);
         st->request_stop();
+        st->stop_transport();
         co_await st->task_gate.close();
         if (st->channel_ready && !st->channel.is_closed()) {
             st->channel.close();
