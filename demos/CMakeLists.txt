@@ -148,3 +148,12 @@ if (Seastar_MODULE)
       CXX_STANDARD ${CMAKE_CXX_STANDARD}
       CXX_EXTENSIONS ON)
 endif ()
+
+seastar_add_demo (rpc_tcp_bench_server
+  SOURCES rpc_tcp_bench_server.cc)
+seastar_add_demo (rpc_tcp_bench_client
+  SOURCES rpc_tcp_bench_client.cc)
+seastar_add_demo (rpc_bench_server
+  SOURCES rpc_bench_server.cc)
+seastar_add_demo (rpc_bench_client
+  SOURCES rpc_bench_client.cc)
