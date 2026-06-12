@@ -945,10 +945,19 @@ int stream_stop_sending_cb(ngtcp2_conn* conn, int64_t sid, uint64_t app_error_co
     return 0;
 }
 
-int stream_close_cb(ngtcp2_conn*, uint32_t, int64_t sid, uint64_t, void* user_data, void*) {
+int stream_close_cb(ngtcp2_conn* conn, uint32_t, int64_t sid, uint64_t, void* user_data, void*) {
     auto* st = static_cast<client_state*>(user_data);
     if (!st || !st->connection_state) {
         return 0;
+    }
+
+    auto peer_initiated = !ngtcp2_conn_is_local_stream(conn, sid);
+    if (peer_initiated) {
+        if (ngtcp2_is_bidi_stream(sid)) {
+            ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+        } else {
+            ngtcp2_conn_extend_max_streams_uni(conn, 1);
+        }
     }
 
     st->release_stream_data(sid);

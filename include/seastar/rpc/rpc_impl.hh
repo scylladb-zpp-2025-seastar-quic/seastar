@@ -575,7 +575,10 @@ auto send_helper(MsgType xt, signature<Ret (InArgs...)> xsig) {
 
             // prepare reply handler, if return type is now_wait_type this does nothing, since no reply will be sent
             using wait = wait_signature_t<Ret>;
-            return when_all(dst.request(uint64_t(t), msg_id, std::move(data), timeout, cancel), wait_for_reply<Serializer>(wait(), timeout, start, cancel, dst, msg_id, sig)).then([] (auto r) {
+            constexpr bool expect_response = !std::is_same_v<wait, no_wait_type>;
+            auto reply_f = wait_for_reply<Serializer>(wait(), timeout, start, cancel, dst, msg_id, sig);
+            auto request_f = dst.request(uint64_t(t), msg_id, std::move(data), timeout, cancel, expect_response);
+            return when_all(std::move(request_f), std::move(reply_f)).then([] (auto r) {
                     std::get<0>(r).ignore_ready_future();
                     return std::move(std::get<1>(r)); // return future of wait_for_reply
             });
@@ -607,8 +610,8 @@ auto send_helper(MsgType xt, signature<Ret (InArgs...)> xsig) {
 static constexpr size_t response_frame_headroom = 16;
 
 template<typename Serializer, typename RetTypes>
-inline future<> reply(wait_type, future<RetTypes>&& ret, uint64_t verb, int64_t msg_id, shared_ptr<server::connection> client,
-        std::optional<rpc_clock_type::time_point> timeout, std::optional<rpc_clock_type::duration> handler_duration) {
+inline future<> reply(wait_type, future<RetTypes>&& ret, uint64_t, int64_t msg_id, shared_ptr<server::connection> client,
+        internal::reply_handle reply_handle, std::optional<rpc_clock_type::time_point> timeout, std::optional<rpc_clock_type::duration> handler_duration) {
     if (!client->error()) {
         snd_buf data;
         try {
@@ -635,7 +638,7 @@ inline future<> reply(wait_type, future<RetTypes>&& ret, uint64_t verb, int64_t 
             msg_id = -msg_id;
         }
 
-        return client->respond(msg_id, std::move(data), timeout, handler_duration);
+        return client->respond(std::move(reply_handle), msg_id, std::move(data), timeout, handler_duration);
     } else {
         ret.ignore_ready_future();
         return make_ready_future<>();
@@ -645,11 +648,14 @@ inline future<> reply(wait_type, future<RetTypes>&& ret, uint64_t verb, int64_t 
 // specialization for no_wait_type which does not send a reply
 template<typename Serializer>
 inline future<> reply(no_wait_type, future<no_wait_type>&& r, uint64_t verb, int64_t msgid, shared_ptr<server::connection> client,
-        std::optional<rpc_clock_type::time_point>, std::optional<rpc_clock_type::duration>) {
+        internal::reply_handle reply_handle, std::optional<rpc_clock_type::time_point>, std::optional<rpc_clock_type::duration>) {
     try {
         r.get();
     } catch (std::exception& ex) {
         client->get_logger()(client->info(), msgid, format("exception \"{}\" in no_wait handler of the verb {} ignored", ex.what(), verb));
+    }
+    if (reply_handle.close) {
+        return reply_handle.close();
     }
     return make_ready_future<>();
 }
@@ -681,28 +687,29 @@ auto recv_helper(uint64_t verb, signature<Ret (InArgs...)> sig, Func&& func, Wan
                                                                  std::optional<rpc_clock_type::time_point> timeout,
                                                                  int64_t msg_id,
                                                                  rcv_buf data,
+                                                                 internal::reply_handle reply_handle,
                                                                  gate::holder guard) mutable {
         auto memory_consumed = client->estimate_request_size(data.size);
         if (memory_consumed > client->max_request_size()) {
             auto err = format("request size {:d} large than memory limit {:d}, verb {}", memory_consumed, client->max_request_size(), verb);
             client->get_logger()(client->peer_address(), err);
             // FIXME: future is discarded
-            (void)try_with_gate(client->get_server().reply_gate(), [verb, client, timeout, msg_id, err = std::move(err)] {
-                return reply<Serializer>(wait_style(), futurize<Ret>::make_exception_future(std::runtime_error(err.c_str())), verb, msg_id, client, timeout, std::nullopt).handle_exception([verb, client, msg_id] (std::exception_ptr eptr) {
+            (void)try_with_gate(client->get_server().reply_gate(), [verb, client, timeout, msg_id, err = std::move(err), reply_handle = std::move(reply_handle)] () mutable {
+                return reply<Serializer>(wait_style(), futurize<Ret>::make_exception_future(std::runtime_error(err.c_str())), verb, msg_id, client, std::move(reply_handle), timeout, std::nullopt).handle_exception([verb, client, msg_id] (std::exception_ptr eptr) {
                     client->get_logger()(client->info(), msg_id, seastar::format("got exception while processing an oversized message: {} for verb {}", eptr, verb));
                 });
             }).handle_exception_type([] (gate_closed_exception&) {/* ignore */});
             return make_ready_future();
         }
         // note: apply is executed asynchronously with regards to networking so we cannot chain futures here by doing "return apply()"
-        auto f = client->wait_for_resources(memory_consumed, timeout).then([verb, client, timeout, msg_id, data = std::move(data), &func, g = std::move(guard)] (auto permit) mutable {
+        auto f = client->wait_for_resources(memory_consumed, timeout).then([verb, client, timeout, msg_id, data = std::move(data), reply_handle = std::move(reply_handle), &func, g = std::move(guard)] (auto permit) mutable {
                 // FIXME: future is discarded
-                (void)try_with_gate(client->get_server().reply_gate(), [verb, client, timeout, msg_id, data = std::move(data), permit = std::move(permit), &func] () mutable {
+                (void)try_with_gate(client->get_server().reply_gate(), [verb, client, timeout, msg_id, data = std::move(data), permit = std::move(permit), reply_handle = std::move(reply_handle), &func] () mutable {
                     try {
                         auto args = unmarshall<Serializer, InArgs...>(*client, std::move(data));
                         auto start = rpc_clock_type::now();
-                        return apply(func, client->info(), timeout, WantClientInfo(), WantTimePoint(), signature(), std::move(args)).then_wrapped([verb, client, timeout, msg_id, permit = std::move(permit), start] (futurize_t<Ret> ret) mutable {
-                            return reply<Serializer>(wait_style(), std::move(ret), verb, msg_id, client, timeout, rpc_clock_type::now() - start).handle_exception([verb, permit = std::move(permit), client, msg_id] (std::exception_ptr eptr) {
+                        return apply(func, client->info(), timeout, WantClientInfo(), WantTimePoint(), signature(), std::move(args)).then_wrapped([verb, client, timeout, msg_id, permit = std::move(permit), reply_handle = std::move(reply_handle), start] (futurize_t<Ret> ret) mutable {
+                            return reply<Serializer>(wait_style(), std::move(ret), verb, msg_id, client, std::move(reply_handle), timeout, rpc_clock_type::now() - start).handle_exception([verb, permit = std::move(permit), client, msg_id] (std::exception_ptr eptr) {
                                 client->get_logger()(client->info(), msg_id, seastar::format("got exception while processing a message: {}, verb {}", eptr, verb));
                             });
                         });
@@ -1013,5 +1020,3 @@ struct hash<seastar::rpc::streaming_domain_type> {
     }
 };
 }
-
-
