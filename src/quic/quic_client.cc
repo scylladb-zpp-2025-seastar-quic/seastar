@@ -97,7 +97,8 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     gnutls_certificate_credentials_t cred = nullptr;
     gnutls_session_t tls = nullptr;
 
-    gate task_gate;
+    gate actor_gate;
+    gate recv_gate;
     queue<rx_event> rx_queue{1024};
     internal::connection_state_ptr connection_state;
     bool queues_aborted = false;
@@ -568,6 +569,9 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 
     void stop_transport() {
+        if (stopping) {
+            return;
+        }
         // Terminal local cleanup path used by both explicit owner stop and actor teardown.
         quic_client_log.info(
           "client transport stop: local={} remote={} handshake_done={} channel_ready={}",
@@ -1303,14 +1307,14 @@ future<> actor_loop(lw_shared_ptr<client_state> st) {
 void start_background_tasks(const lw_shared_ptr<client_state>& st) {
     quic_client_log.debug("client starting background tasks");
     // Convert uncaught background failures into the normal transport error path.
-    (void)with_gate(st->task_gate, [st] { return actor_loop(st); })
+    (void)with_gate(st->actor_gate, [st] { return actor_loop(st); })
       .handle_exception([st](std::exception_ptr) {
           if (st->active()) {
               st->fail(quic_error_code::io, "actor loop failed");
           }
       })
       .or_terminate();
-    (void)with_gate(st->task_gate, [st] { return recv_loop(st); })
+    (void)with_gate(st->recv_gate, [st] { return recv_loop(st); })
       .handle_exception([st](std::exception_ptr) {
           if (st->active()) {
               st->fail(quic_error_code::io, "receive loop failed");
@@ -1389,7 +1393,8 @@ public:
 
         if (init_error) {
             st->stop_transport();
-            co_await st->task_gate.close();
+            co_await st->actor_gate.close();
+            co_await st->recv_gate.close();
             std::rethrow_exception(init_error);
         }
 
@@ -1404,8 +1409,9 @@ public:
         auto st = std::exchange(_state, {});
         quic_client_log.info("client stop start: local={} remote={}", st->local_address, st->remote_address);
         st->request_stop();
+        co_await st->actor_gate.close();
         st->stop_transport();
-        co_await st->task_gate.close();
+        co_await st->recv_gate.close();
         if (st->channel_ready && !st->channel.is_closed()) {
             st->channel.close();
         }

@@ -334,6 +334,81 @@ void run_stream_roundtrip(rpc_quic_test_env& env, test_rpc_proto::client& cl, in
     BOOST_REQUIRE_EQUAL(server_sum, 55);
 }
 
+
+template <typename Func>
+void with_active_stream(rpc_quic_test_env& env, test_rpc_proto::client& cl, int verb, std::vector<int> values, int expected_sum, Func&& func) {
+    promise<> stream_handler_started;
+    auto stream_handler_started_f = stream_handler_started.get_future();
+    int server_sum = 0;
+    future<> server_done = make_ready_future<>();
+    auto allow_server_close = std::make_shared<promise<>>();
+
+    env.register_handler(verb, [&] (int marker, rpc::source<int> source) {
+        BOOST_REQUIRE_EQUAL(marker, 666);
+        auto sink = source.make_sink<serializer, sstring>();
+        auto close_allowed = allow_server_close->get_future();
+        stream_handler_started.set_value();
+
+        server_done = seastar::async([source, sink, &server_sum, close_allowed = std::move(close_allowed)] () mutable {
+            bool closed = false;
+            try {
+                while (!closed) {
+                    auto data = source().get();
+                    if (data) {
+                        server_sum += std::get<0>(*data);
+                    } else {
+                        closed = true;
+                    }
+                }
+            } catch (const rpc::stream_closed&) {
+                closed = true;
+            }
+            sink("done").get();
+            sink.flush().get();
+            close_allowed.get();
+            sink.close().get();
+        });
+        return sink;
+    });
+
+    auto sink = cl.make_stream_sink<serializer, int>(env.make_socket()).get();
+    auto stream_call = env.proto().make_client<rpc::source<sstring> (int, rpc::sink<int>)>(verb);
+    auto source = stream_call(cl, 666, sink).get();
+    stream_handler_started_f.get();
+
+    bool close_released = false;
+    auto release_close = [&] {
+        if (!close_released) {
+            close_released = true;
+            allow_server_close->set_value();
+        }
+    };
+
+    try {
+        func();
+        for (auto value : values) {
+            sink(value).get();
+        }
+        sink.flush().get();
+        sink.close().get();
+
+        auto result = source().get();
+        BOOST_REQUIRE(result);
+        BOOST_REQUIRE_EQUAL(std::get<0>(*result), "done");
+        release_close();
+        try {
+            auto eof = source().get();
+            BOOST_REQUIRE(!eof);
+        } catch (const rpc::stream_closed&) {
+        }
+        server_done.get();
+        BOOST_REQUIRE_EQUAL(server_sum, expected_sum);
+    } catch (...) {
+        release_close();
+        throw;
+    }
+}
+
 } // namespace
 
 SEASTAR_TEST_CASE(test_rpc_quic_v1_stop_without_client) {
@@ -762,58 +837,15 @@ SEASTAR_TEST_CASE(test_rpc_quic_v1_request_while_stream_active) {
     return rpc_quic_test_env::do_with_thread(std::move(cfg), [] (rpc_quic_test_env& env) {
         auto cl = env.make_client();
         auto stop = deferred_stop(cl);
-        promise<> stream_handler_started;
-        auto stream_handler_started_f = stream_handler_started.get_future();
-        int server_sum = 0;
-        future<> server_done = make_ready_future<>();
-
-        env.register_handler(2, [&] (int marker, rpc::source<int> source) {
-            BOOST_REQUIRE_EQUAL(marker, 666);
-            auto sink = source.make_sink<serializer, sstring>();
-            stream_handler_started.set_value();
-
-            server_done = seastar::async([source, sink, &server_sum] () mutable {
-                bool closed = false;
-                try {
-                    while (!closed) {
-                        auto data = source().get();
-                        if (data) {
-                            server_sum += std::get<0>(*data);
-                        } else {
-                            closed = true;
-                        }
-                    }
-                } catch (const rpc::stream_closed&) {
-                    closed = true;
-                }
-                sink("done").get();
-                sink.flush().get();
-                sink.close().get();
-            });
-            return sink;
-        });
-
-        auto sink = cl.make_stream_sink<serializer, int>(env.make_socket()).get();
-        auto stream_call = env.proto().make_client<rpc::source<sstring> (int, rpc::sink<int>)>(2);
-        auto source = stream_call(cl, 666, sink).get();
-        stream_handler_started_f.get();
 
         env.register_handler(1, [] (int a, int b) {
             return make_ready_future<int>(a + b);
         });
         auto sum = env.proto().make_client<int (int, int)>(1);
-        BOOST_REQUIRE_EQUAL(sum(cl, 20, 22).get(), 42);
 
-        sink(7).get();
-        sink.flush().get();
-        sink.close().get();
-
-        auto result = source().get();
-        BOOST_REQUIRE(result);
-        BOOST_REQUIRE_EQUAL(std::get<0>(*result), "done");
-        BOOST_REQUIRE(!source().get());
-        server_done.get();
-        BOOST_REQUIRE_EQUAL(server_sum, 7);
+        with_active_stream(env, cl, 2, std::vector<int>{7}, 7, [&] {
+            BOOST_REQUIRE_EQUAL(sum(cl, 20, 22).get(), 42);
+        });
     });
 }
 
@@ -824,62 +856,17 @@ SEASTAR_TEST_CASE(test_rpc_quic_v1_rpc_errors_while_stream_active) {
     return rpc_quic_test_env::do_with_thread(std::move(cfg), [] (rpc_quic_test_env& env) {
         auto cl = env.make_client();
         auto stop = deferred_stop(cl);
-        promise<> stream_handler_started;
-        auto stream_handler_started_f = stream_handler_started.get_future();
-        int server_sum = 0;
-        future<> server_done = make_ready_future<>();
 
-        env.register_handler(2, [&] (int marker, rpc::source<int> source) {
-            BOOST_REQUIRE_EQUAL(marker, 666);
-            auto sink = source.make_sink<serializer, sstring>();
-            stream_handler_started.set_value();
+        with_active_stream(env, cl, 2, std::vector<int>{11, 22}, 33, [&] {
+            auto unknown = env.proto().make_client<void ()>(100000000);
+            BOOST_REQUIRE_THROW(unknown(cl).get(), rpc::unknown_verb_error);
 
-            server_done = seastar::async([source, sink, &server_sum] () mutable {
-                bool closed = false;
-                try {
-                    while (!closed) {
-                        auto data = source().get();
-                        if (data) {
-                            server_sum += std::get<0>(*data);
-                        } else {
-                            closed = true;
-                        }
-                    }
-                } catch (const rpc::stream_closed&) {
-                    closed = true;
-                }
-                sink("done").get();
-                sink.flush().get();
-                sink.close().get();
+            env.register_handler(1, [] {
+                throw std::runtime_error("boom");
             });
-            return sink;
+            auto failing = env.proto().make_client<void ()>(1);
+            BOOST_REQUIRE_THROW(failing(cl).get(), rpc::remote_verb_error);
         });
-
-        auto sink = cl.make_stream_sink<serializer, int>(env.make_socket()).get();
-        auto stream_call = env.proto().make_client<rpc::source<sstring> (int, rpc::sink<int>)>(2);
-        auto source = stream_call(cl, 666, sink).get();
-        stream_handler_started_f.get();
-
-        auto unknown = env.proto().make_client<void ()>(100000000);
-        BOOST_REQUIRE_THROW(unknown(cl).get(), rpc::unknown_verb_error);
-
-        env.register_handler(1, [] {
-            throw std::runtime_error("boom");
-        });
-        auto failing = env.proto().make_client<void ()>(1);
-        BOOST_REQUIRE_THROW(failing(cl).get(), rpc::remote_verb_error);
-
-        sink(11).get();
-        sink(22).get();
-        sink.flush().get();
-        sink.close().get();
-
-        auto result = source().get();
-        BOOST_REQUIRE(result);
-        BOOST_REQUIRE_EQUAL(std::get<0>(*result), "done");
-        BOOST_REQUIRE(!source().get());
-        server_done.get();
-        BOOST_REQUIRE_EQUAL(server_sum, 33);
     });
 }
 
@@ -890,44 +877,23 @@ SEASTAR_TEST_CASE(test_rpc_quic_v1_timeout_and_cancel_while_stream_active) {
     return rpc_quic_test_env::do_with_thread(std::move(cfg), [] (rpc_quic_test_env& env) {
         auto cl = env.make_client();
         auto stop = deferred_stop(cl);
-        promise<> stream_handler_started;
-        auto stream_handler_started_f = stream_handler_started.get_future();
-        int server_sum = 0;
-        future<> server_done = make_ready_future<>();
-
-        env.register_handler(2, [&] (int marker, rpc::source<int> source) {
-            BOOST_REQUIRE_EQUAL(marker, 666);
-            auto sink = source.make_sink<serializer, sstring>();
-            stream_handler_started.set_value();
-
-            server_done = seastar::async([source, sink, &server_sum] () mutable {
-                bool closed = false;
-                try {
-                    while (!closed) {
-                        auto data = source().get();
-                        if (data) {
-                            server_sum += std::get<0>(*data);
-                        } else {
-                            closed = true;
-                        }
-                    }
-                } catch (const rpc::stream_closed&) {
-                    closed = true;
-                }
-                sink("done").get();
-                sink.flush().get();
-                sink.close().get();
-            });
-            return sink;
-        });
-
         abort_source abort_handler;
+        int sent = 0;
         int received = 0;
+        int active = 0;
         condition_variable cond;
+        condition_variable done;
+
         env.register_handler(1, [&] (int value) -> future<int> {
+            ++active;
             received = value;
             cond.signal();
-            co_await sleep_abortable(std::chrono::seconds(10), abort_handler);
+            try {
+                co_await sleep_abortable(std::chrono::seconds(10), abort_handler);
+            } catch (const sleep_aborted&) {
+            }
+            --active;
+            done.broadcast();
             co_return value;
         });
         auto wait_until_received = [&] (int expected) {
@@ -935,54 +901,56 @@ SEASTAR_TEST_CASE(test_rpc_quic_v1_timeout_and_cancel_while_stream_active) {
                 cond.wait(std::chrono::seconds(1)).get();
             }
         };
+        auto wait_until_handlers_done = [&] {
+            while (active != 0) {
+                done.wait(std::chrono::seconds(1)).get();
+            }
+        };
 
-        auto sink = cl.make_stream_sink<serializer, int>(env.make_socket()).get();
-        auto stream_call = env.proto().make_client<rpc::source<sstring> (int, rpc::sink<int>)>(2);
-        auto source = stream_call(cl, 666, sink).get();
-        stream_handler_started_f.get();
+        with_active_stream(env, cl, 2, std::vector<int>{3, 4}, 7, [&] {
+            auto slow = env.proto().make_client<int (int)>(1);
+            {
+                auto timed_out = slow(cl, std::chrono::milliseconds(200), ++sent);
+                wait_until_received(sent);
+                BOOST_REQUIRE_THROW(timed_out.get(), rpc::timeout_error);
+            }
+            {
+                rpc::cancellable cancel_rpc;
+                auto canceled = slow(cl, std::chrono::seconds(5), cancel_rpc, ++sent);
+                BOOST_REQUIRE(!canceled.available());
+                wait_until_received(sent);
+                cancel_rpc.cancel();
+                BOOST_REQUIRE_THROW(canceled.get(), rpc::canceled_error);
+            }
 
-        auto slow = env.proto().make_client<int (int)>(1);
-        auto timed_out = slow(cl, std::chrono::milliseconds(20), 1);
-        wait_until_received(1);
-        BOOST_REQUIRE_THROW(timed_out.get(), rpc::timeout_error);
-
-        rpc::cancellable cancel_rpc;
-        auto canceled = slow(cl, std::chrono::seconds(5), cancel_rpc, 2);
-        wait_until_received(2);
-        cancel_rpc.cancel();
-        BOOST_REQUIRE_THROW(canceled.get(), rpc::canceled_error);
-
-        sink(3).get();
-        sink(4).get();
-        sink.flush().get();
-        sink.close().get();
-
-        auto result = source().get();
-        BOOST_REQUIRE(result);
-        BOOST_REQUIRE_EQUAL(std::get<0>(*result), "done");
-        BOOST_REQUIRE(!source().get());
-        server_done.get();
-        BOOST_REQUIRE_EQUAL(server_sum, 7);
-
-        abort_handler.request_abort();
+            abort_handler.request_abort();
+            wait_until_handlers_done();
+        });
     });
 }
 
-SEASTAR_TEST_CASE(test_rpc_quic_v1_two_stream_connections_sequential) {
+SEASTAR_TEST_CASE(test_rpc_quic_v1_two_concurrent_streams) {
     rpc_quic_test_config cfg;
     cfg.server_options.streaming_domain = rpc::streaming_domain_type(1);
 
     return rpc_quic_test_env::do_with_thread(std::move(cfg), [] (rpc_quic_test_env& env) {
         auto cl = env.make_client();
         auto stop = deferred_stop(cl);
-        int server_sum = 0;
-        future<> server_done = make_ready_future<>();
+        int server_sum1 = 0;
+        int server_sum2 = 0;
+        future<> server_done1 = make_ready_future<>();
+        future<> server_done2 = make_ready_future<>();
+        std::vector<std::shared_ptr<promise<>>> allow_server_close(3);
 
         env.register_handler(3, [&] (int marker, rpc::source<int> source) {
+            BOOST_REQUIRE(marker == 1 || marker == 2);
             auto sink = source.make_sink<serializer, sstring>();
             auto reply = marker == 1 ? sstring("one") : sstring("two");
+            auto close_allowed = allow_server_close[marker]->get_future();
 
-            server_done = seastar::async([source, sink, &server_sum, reply = std::move(reply)] () mutable {
+            auto& server_done = marker == 1 ? server_done1 : server_done2;
+            auto& server_sum = marker == 1 ? server_sum1 : server_sum2;
+            server_done = seastar::async([source, sink, &server_sum, reply = std::move(reply), close_allowed = std::move(close_allowed)] () mutable {
                 bool closed = false;
                 try {
                     while (!closed) {
@@ -1000,43 +968,64 @@ SEASTAR_TEST_CASE(test_rpc_quic_v1_two_stream_connections_sequential) {
                     sink(reply).get();
                 }
                 sink.flush().get();
+                close_allowed.get();
                 sink.close().get();
             });
             return sink;
         });
 
         auto stream_call = env.proto().make_client<rpc::source<sstring> (int, rpc::sink<int>)>(3);
-        auto check_source = [] (rpc::source<sstring> source, const sstring& expected) {
-            int received = 0;
-            for (;;) {
-                auto data = source().get();
-                if (!data) {
-                    break;
+        auto check_source = [] (rpc::source<sstring> source, const sstring& expected, std::shared_ptr<promise<>> close_allowed) {
+            bool close_released = false;
+            auto release_close = [&] {
+                if (!close_released) {
+                    close_released = true;
+                    close_allowed->set_value();
                 }
-                BOOST_REQUIRE_EQUAL(std::get<0>(*data), expected);
-                ++received;
+            };
+            int received = 0;
+            try {
+                while (received != 3) {
+                    auto data = source().get();
+                    BOOST_REQUIRE(data);
+                    BOOST_REQUIRE_EQUAL(std::get<0>(*data), expected);
+                    ++received;
+                }
+            } catch (...) {
+                release_close();
+                throw;
             }
-            BOOST_REQUIRE_EQUAL(received, 3);
-            BOOST_REQUIRE_THROW(source().get(), rpc::stream_closed);
-        };
-        auto run_stream = [&] (int marker, int first, int second, const sstring& expected, int expected_sum) {
-            server_sum = 0;
-            server_done = make_ready_future<>();
-            auto sink = cl.make_stream_sink<serializer, int>(env.make_socket()).get();
-            auto source = stream_call(cl, marker, sink).get();
-
-            sink(first).get();
-            sink(second).get();
-            sink.flush().get();
-            sink.close().get();
-
-            check_source(source, expected);
-            server_done.get();
-            BOOST_REQUIRE_EQUAL(server_sum, expected_sum);
+            release_close();
+            try {
+                auto data = source().get();
+                BOOST_REQUIRE(!data);
+            } catch (const rpc::stream_closed&) {
+            }
         };
 
-        run_stream(1, 1, 2, "one", 3);
-        run_stream(2, 10, 20, "two", 30);
+        allow_server_close[1] = std::make_shared<promise<>>();
+        allow_server_close[2] = std::make_shared<promise<>>();
+
+        auto sink1 = cl.make_stream_sink<serializer, int>(env.make_socket()).get();
+        auto source1 = stream_call(cl, 1, sink1).get();
+        auto sink2 = cl.make_stream_sink<serializer, int>(env.make_socket()).get();
+        auto source2 = stream_call(cl, 2, sink2).get();
+
+        sink1(1).get();
+        sink2(10).get();
+        sink1(2).get();
+        sink2(20).get();
+        sink1.flush().get();
+        sink2.flush().get();
+        sink1.close().get();
+        sink2.close().get();
+
+        check_source(source1, "one", allow_server_close[1]);
+        check_source(source2, "two", allow_server_close[2]);
+        server_done1.get();
+        server_done2.get();
+        BOOST_REQUIRE_EQUAL(server_sum1, 3);
+        BOOST_REQUIRE_EQUAL(server_sum2, 30);
     });
 }
 

@@ -100,12 +100,24 @@ public:
     }
 
     void close() noexcept {
+        if (_close_requested) {
+            return;
+        }
         _close_requested = true;
-        _session.reset();
         if (_client) {
             auto client = std::exchange(_client, {});
-            (void)client->stop().finally([client = std::move(client)] {}).handle_exception([] (std::exception_ptr) {});
+            if (_session) {
+                auto session = std::exchange(_session, {});
+                auto close_f = session->close();
+                (void)close_f.finally([client = std::move(client), session = std::move(session)] () mutable {
+                    return client->stop().finally([client = std::move(client), session = std::move(session)] {});
+                }).handle_exception([] (std::exception_ptr) {});
+            } else {
+                (void)client->stop().finally([client = std::move(client)] {}).handle_exception([] (std::exception_ptr) {});
+            }
+            return;
         }
+        _session.reset();
     }
 };
 
