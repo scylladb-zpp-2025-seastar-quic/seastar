@@ -24,6 +24,7 @@
 #include "quic_common.hh"
 #include "quic_impl.hh"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -1115,9 +1116,9 @@ void init_client_connection(client_state& st) {
     ngtcp2_settings settings{};
     ngtcp2_settings_default(&settings);
     settings.initial_ts = quic_now_ns();
-    if (st.cfg.session_options.transport.initial_rtt_ns
-        && *st.cfg.session_options.transport.initial_rtt_ns > 0) {
-        settings.initial_rtt = *st.cfg.session_options.transport.initial_rtt_ns;
+    if (st.cfg.session_options.transport.initial_rtt
+        && *st.cfg.session_options.transport.initial_rtt > std::chrono::nanoseconds::zero()) {
+        settings.initial_rtt = static_cast<uint64_t>(st.cfg.session_options.transport.initial_rtt->count());
     }
     if (st.cfg.session_options.transport.max_tx_udp_payload_size) {
         settings.max_tx_udp_payload_size = *st.cfg.session_options.transport.max_tx_udp_payload_size;
@@ -1154,7 +1155,7 @@ void init_client_connection(client_state& st) {
       st.cfg.session_options.transport.initial_max_data);
     params.initial_max_streams_bidi = st.cfg.session_options.transport.initial_max_streams_bidi;
     params.initial_max_streams_uni = st.cfg.session_options.transport.initial_max_streams_uni;
-    params.max_idle_timeout = st.cfg.session_options.transport.max_idle_timeout_ns;
+    params.max_idle_timeout = static_cast<uint64_t>(st.cfg.session_options.transport.max_idle_timeout.count());
     if (st.cfg.session_options.transport.max_udp_payload_size) {
         params.max_udp_payload_size = *st.cfg.session_options.transport.max_udp_payload_size;
     }
@@ -1321,9 +1322,11 @@ void start_background_tasks(const lw_shared_ptr<client_state>& st) {
 
 } // namespace
 
+namespace internal {
+
 class quic_client_impl final {
 public:
-    future<internal::connection_state_ptr> connect(quic_client_config config) {
+    future<connection_state_ptr> connect(quic_client_config config) {
         if (_state) {
             throw_quic_error(quic_error_code::invalid_state, "client is already connected");
         }
@@ -1337,8 +1340,8 @@ public:
 
         auto st = make_lw_shared<client_state>();
         st->cfg = std::move(config);
-        st->command_runtime = internal::make_command_runtime(st->cfg.session_options);
-        st->connection_state = internal::make_connection_state(st->command_runtime, st->cfg.session_options);
+        st->command_runtime = make_command_runtime(st->cfg.session_options);
+        st->connection_state = make_connection_state(st->command_runtime, st->cfg.session_options);
         st->command_runtime->set_command_notifier([raw = st.get()] {
             // The runtime only posts work; the actor remains the sole transport mutator.
             raw->wake_actor();
@@ -1380,7 +1383,7 @@ public:
               st->tx_payload_limit,
               st->command_runtime->selected_alpn());
         } catch (const quic_error& e) {
-            quic_client_log.error("client connect failed: code={} detail='{}'", to_string(e.code()), e.what());
+            quic_client_log.error("client connect failed: code={} detail='{}'", e.code().message(), e.what());
             init_error = std::current_exception();
         } catch (...) {
             quic_client_log.error("client connect failed: unexpected exception");
@@ -1415,8 +1418,10 @@ private:
     lw_shared_ptr<client_state> _state;
 };
 
+} // namespace internal
+
 quic_client::quic_client()
-    : _impl(std::make_unique<quic_client_impl>()) {
+    : _impl(std::make_unique<internal::quic_client_impl>()) {
 }
 
 quic_client::~quic_client() = default;

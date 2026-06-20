@@ -21,28 +21,40 @@
 
 #pragma once
 
-#include <memory>
 #include <vector>
 
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/quic/quic.hh>
 
 namespace seastar::quic::experimental {
 
-// Listener configuration shared by all connections accepted from this server.
+namespace internal {
+class quic_server_impl;
+}
+
+/// Listener configuration shared by all connections accepted from this server.
 struct quic_server_config {
+    /// Local UDP endpoint to bind.
     socket_address listen_address;
+
+    /// PEM certificate chain file used by the server TLS session.
     sstring crt_file;
+
+    /// PEM private key file used by the server TLS session.
     sstring key_file;
+
+    /// ALPN protocols advertised during the TLS handshake.
     std::vector<sstring> alpns = {sstring("h3")};
+
+    /// Runtime and transport limits for accepted connections.
     connection_options session_options{};
 };
 
-class quic_server_impl;
-
-// Server-side owner of the listening transport and accepted QUIC connections.
+/// Server-side owner of the listening transport and accepted QUIC connections.
 class quic_server final {
 public:
+    /// Constructs a stopped QUIC server.
     quic_server();
     ~quic_server();
 
@@ -52,12 +64,17 @@ public:
     quic_server(const quic_server&) = delete;
     quic_server& operator=(const quic_server&) = delete;
 
+    /// Starts listening for QUIC Initial packets using config.
     future<> start(quic_server_config config);
+
+    /// Waits for the next connection that completed the QUIC and TLS handshakes.
     future<connection> accept();
+
+    /// Stops the listener and all server-owned connections.
     future<> stop();
 
 private:
-    std::shared_ptr<quic_server_impl> _impl;
+    lw_shared_ptr<internal::quic_server_impl> _impl;
 };
 
 } // namespace seastar::quic::experimental

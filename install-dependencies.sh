@@ -33,6 +33,7 @@ debian_packages=(
     doxygen
     g++
     gcc
+    git
     libboost-all-dev
     libc-ares-dev
     libcrypto++-dev
@@ -85,6 +86,7 @@ redhat_packages=(
     doxygen
     fmt-devel
     gcc
+    git
     gnutls-devel
     hwloc-devel
     libpciaccess-devel
@@ -175,6 +177,7 @@ arch_packages=(
     fmt
     gcc
     glibc
+    git
     gnutls
     hwloc
     libpciaccess
@@ -212,6 +215,7 @@ opensuse_packages=(
     libboost_date_time1_66_0-devel
     libboost_filesystem1_66_0
     libboost_filesystem1_66_0-devel
+    git
     libboost_program_options1_66_0
     libboost_program_options1_66_0-devel
     libboost_system1_66_0
