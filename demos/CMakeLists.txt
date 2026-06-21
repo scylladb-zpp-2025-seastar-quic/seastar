@@ -132,6 +132,12 @@ seastar_add_demo (quic_server
 seastar_add_demo (quic_client
   SOURCES quic_client_demo.cc)
 
+seastar_add_demo (quic_bench_server
+  SOURCES quic_bench_server.cc)
+
+seastar_add_demo (quic_bench_client
+  SOURCES quic_bench_client.cc)
+
 if (Seastar_MODULE)
   add_executable (hello_cxx_module)
   target_sources (hello_cxx_module

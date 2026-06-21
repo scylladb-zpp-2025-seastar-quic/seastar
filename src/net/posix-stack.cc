@@ -1034,9 +1034,9 @@ private:
 
         if (is_inet(family)) {
             fd.setsockopt(SOL_IP, IP_PKTINFO, true);
-            if (engine().posix_reuseport_available()) {
-                fd.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1);
-            }
+            // UDP sharding relies on the kernel reuseport fanout. This is
+            // independent from the disabled TCP reuseport acceptor path.
+            fd.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1);
         }
 
         return fd;

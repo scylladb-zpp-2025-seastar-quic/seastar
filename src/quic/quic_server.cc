@@ -1686,6 +1686,10 @@ future<connection> quic_server::accept() {
     co_return connection(std::make_unique<connection::impl>(std::move(connection_state)));
 }
 
+socket_address quic_server::local_address() const noexcept {
+    return _impl ? _impl->listen_address() : socket_address{};
+}
+
 future<> quic_server::stop() {
     quic_server_log.debug("quic_server::stop");
     co_await _impl->stop();
