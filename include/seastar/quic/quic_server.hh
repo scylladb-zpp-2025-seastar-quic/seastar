@@ -70,6 +70,9 @@ public:
     /// Waits for the next connection that completed the QUIC and TLS handshakes.
     future<connection> accept();
 
+    /// Returns the local UDP endpoint currently used by the server.
+    socket_address local_address() const noexcept;
+
     /// Stops the listener and all server-owned connections.
     future<> stop();
 

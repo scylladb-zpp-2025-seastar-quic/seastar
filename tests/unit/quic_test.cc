@@ -20,6 +20,9 @@
  * Copyright (C) 2026 ScyllaDB Ltd.
  */
 
+#include <arpa/inet.h>
+
+#include <algorithm>
 #include <array>
 #include <deque>
 #include <limits>
@@ -37,6 +40,7 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
@@ -44,6 +48,7 @@
 #include <seastar/quic/quic.hh>
 #include <seastar/quic/quic_client.hh>
 #include <seastar/quic/quic_server.hh>
+#include <seastar/quic/sharded_quic_server.hh>
 #include <seastar/testing/test_case.hh>
 
 #include "quic/quic_common.hh"
@@ -362,6 +367,17 @@ socket_address allocate_loopback_quic_address() {
     auto address = probe.local_address();
     probe.close();
     return address;
+}
+
+uint16_t quic_socket_address_port(const socket_address& address) {
+    switch (address.family()) {
+    case AF_INET:
+        return ntohs(address.as_posix_sockaddr_in().sin_port);
+    case AF_INET6:
+        return ntohs(address.as_posix_sockaddr_in6().sin6_port);
+    default:
+        return 0;
+    }
 }
 
 future<> echo_quic_stream(quic_stream stream) {
@@ -774,6 +790,102 @@ SEASTAR_TEST_CASE(test_quic_client_server_handles_large_framed_request) {
             if (!error) {
                 error = std::current_exception();
             }
+        }
+    }
+
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
+
+future<> quic_echo_client_round_trip(socket_address server_address, sstring payload) {
+    quic_client client;
+    std::optional<connection> session;
+    std::exception_ptr error;
+
+    try {
+        quic_client_config client_cfg;
+        client_cfg.remote_address = server_address;
+        client_cfg.server_name = "test.scylladb.org";
+        client_cfg.ca_file = "test.crt";
+        session.emplace(co_await client.connect(std::move(client_cfg)));
+        co_await quic_echo_round_trip(*session, std::move(payload));
+    } catch (...) {
+        error = std::current_exception();
+    }
+
+    if (session) {
+        try {
+            co_await session->close();
+        } catch (...) {
+            if (!error) {
+                error = std::current_exception();
+            }
+        }
+    }
+
+    try {
+        co_await client.stop();
+    } catch (...) {
+        if (!error) {
+            error = std::current_exception();
+        }
+    }
+
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
+SEASTAR_TEST_CASE(test_sharded_quic_server_echoes_connections) {
+    sharded_quic_server server;
+    std::exception_ptr error;
+
+    try {
+        quic_server_config server_cfg;
+        server_cfg.listen_address = make_ipv4_address({0x7f000001, 0});
+        server_cfg.crt_file = "test.crt";
+        server_cfg.key_file = "test.key";
+        co_await server.start(std::move(server_cfg));
+
+        auto server_address = server.local_address();
+        BOOST_REQUIRE_EQUAL(server_address.family(), AF_INET);
+        BOOST_REQUIRE_NE(quic_socket_address_port(server_address), 0);
+
+        co_await server.serve([] {
+            return [] (connection session) mutable -> future<> {
+                try {
+                    auto quic_stream = co_await session.accept_stream();
+                    co_await echo_quic_stream(std::move(quic_stream));
+                } catch (const quic_error& e) {
+                    if (e.code() != quic_error::closed) {
+                        throw;
+                    }
+                }
+                try {
+                    co_await session.close();
+                } catch (...) {
+                }
+            };
+        });
+
+        auto client_count = std::max(4u, this_smp_shard_count() * 2u);
+        std::vector<future<>> clients;
+        clients.reserve(client_count);
+        for (unsigned i = 0; i < client_count; ++i) {
+            clients.push_back(quic_echo_client_round_trip(server_address, format("sharded echo {}", i)));
+        }
+        co_await when_all_succeed(clients.begin(), clients.end());
+    } catch (...) {
+        error = std::current_exception();
+    }
+
+    try {
+        co_await server.stop();
+    } catch (...) {
+        if (!error) {
+            error = std::current_exception();
         }
     }
 
