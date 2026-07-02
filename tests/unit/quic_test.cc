@@ -262,7 +262,7 @@ public:
         last_error_detail = std::move(detail);
     }
 
-    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) {
+    void complete_open_stream(quic_internal::open_stream_result_ptr result, stream_id sid) {
         ++complete_open_stream_calls;
         completed_open_sid = sid;
         if (result) {
@@ -270,7 +270,7 @@ public:
         }
     }
 
-    void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) {
+    void fail_open_stream(quic_internal::open_stream_result_ptr result, quic_error_code error, sstring detail) {
         ++fail_open_stream_calls;
         open_stream_error = error;
         open_stream_error_detail = detail;
@@ -1602,7 +1602,7 @@ SEASTAR_TEST_CASE(test_quic_open_stream_command_completes_result) {
           .sid = 21,
         });
 
-        auto result = std::make_shared<promise<stream_id>>();
+        auto result = make_lw_shared<promise<stream_id>>();
         auto result_future = result->get_future();
 
         quic_internal::transport_command cmd;
@@ -1632,7 +1632,7 @@ SEASTAR_TEST_CASE(test_quic_open_stream_command_failure_propagates_error) {
           .sid = invalid_stream_id,
         });
 
-        auto result = std::make_shared<promise<stream_id>>();
+        auto result = make_lw_shared<promise<stream_id>>();
         auto result_future = result->get_future();
 
         quic_internal::transport_command cmd;
@@ -1670,7 +1670,7 @@ SEASTAR_TEST_CASE(test_quic_open_stream_command_defers_when_stream_id_blocked) {
           .sid = invalid_stream_id,
         });
 
-        auto result = std::make_shared<promise<stream_id>>();
+        auto result = make_lw_shared<promise<stream_id>>();
         auto result_future = result->get_future();
 
         quic_internal::transport_command cmd;
@@ -1700,7 +1700,7 @@ SEASTAR_TEST_CASE(test_quic_retry_blocked_open_streams_completes_deferred_stream
           .sid = 23,
         });
 
-        auto result = std::make_shared<promise<stream_id>>();
+        auto result = make_lw_shared<promise<stream_id>>();
         auto result_future = result->get_future();
 
         quic_internal::transport_command cmd;
