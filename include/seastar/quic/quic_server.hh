@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/quic/quic.hh>
 
@@ -31,6 +32,13 @@ namespace seastar::quic::experimental {
 
 namespace internal {
 class quic_server_impl;
+class quic_server_shard;
+
+class quic_packet_router {
+public:
+    virtual ~quic_packet_router() = default;
+    virtual future<> route_quic_packet(unsigned shard, socket_address local_address, socket_address src, temporary_buffer<char> packet) = 0;
+};
 }
 
 /// Listener configuration shared by all connections accepted from this server.
@@ -77,6 +85,11 @@ public:
     future<> stop();
 
 private:
+    friend class internal::quic_server_shard;
+
+    void set_packet_router(internal::quic_packet_router* router) noexcept;
+    future<> inject_datagram(socket_address src, temporary_buffer<char> packet);
+
     lw_shared_ptr<internal::quic_server_impl> _impl;
 };
 
