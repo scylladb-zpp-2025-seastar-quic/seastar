@@ -28,6 +28,7 @@
 #include <optional>
 #include <ranges>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 #include <seastar/core/coroutine.hh>
@@ -84,13 +85,21 @@ bool is_bind_conflict(std::exception_ptr ep) noexcept {
 
 namespace internal {
 
-class quic_server_shard final {
+class quic_server_shard;
+
+thread_local std::unordered_map<socket_address, quic_server_shard*> quic_server_shards;
+
+class quic_server_shard final : public quic_packet_router {
 public:
     future<> start(quic_server_config config) {
         if (_started) {
             throw_quic_error(quic_error_code::invalid_state, "sharded QUIC server shard already started");
         }
+        _server.set_packet_router(this);
         co_await _server.start(std::move(config));
+        _local_address = _server.local_address();
+        quic_server_shards[_local_address] = this;
+        _registered = true;
         _started = true;
     }
 
@@ -111,6 +120,9 @@ public:
         if (!_started && !_accept_task) {
             co_return;
         }
+
+        unregister_router();
+        _server.set_packet_router(nullptr);
 
         std::exception_ptr error;
         try {
@@ -150,7 +162,36 @@ public:
         return _server.local_address();
     }
 
+    future<> route_quic_packet(unsigned shard, socket_address local_address, socket_address src, temporary_buffer<char> packet) override {
+        if (shard >= this_smp_shard_count()) {
+            co_return;
+        }
+        co_await smp::submit_to(shard, [local_address, src, packet = std::move(packet)] () mutable {
+            auto it = quic_server_shards.find(local_address);
+            if (it == quic_server_shards.end() || !it->second) {
+                sharded_quic_server_log.debug("drop forwarded QUIC datagram: no server registered on shard {} for {}", this_shard_id(), local_address);
+                return make_ready_future<>();
+            }
+            return it->second->inject_datagram(src, std::move(packet));
+        });
+    }
+
+    future<> inject_datagram(socket_address src, temporary_buffer<char> packet) {
+        co_await _server.inject_datagram(src, std::move(packet));
+    }
+
 private:
+    void unregister_router() noexcept {
+        if (!_registered) {
+            return;
+        }
+        auto it = quic_server_shards.find(_local_address);
+        if (it != quic_server_shards.end() && it->second == this) {
+            quic_server_shards.erase(it);
+        }
+        _registered = false;
+    }
+
     future<> accept_loop() {
         while (true) {
             connection session;
@@ -182,6 +223,8 @@ private:
     gate _connections;
     sharded_quic_server::accept_handler _handler;
     std::optional<future<>> _accept_task;
+    socket_address _local_address;
+    bool _registered = false;
     bool _started = false;
 };
 

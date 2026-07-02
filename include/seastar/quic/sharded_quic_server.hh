@@ -33,9 +33,10 @@ namespace seastar::quic::experimental {
 
 /// Per-shard QUIC listener using UDP SO_REUSEPORT when the POSIX stack supports it.
 ///
-/// The class owns one quic_server instance per shard. Packets are distributed by the
-/// kernel receive path, and accepted connections are handled on the shard that owns
-/// the matching UDP socket.
+/// The class owns one quic_server instance per shard. Packets are normally
+/// distributed by the kernel receive path. Server-generated connection IDs encode
+/// the owning shard, so packets for established connections that arrive on a
+/// non-owner shard can be forwarded to the shard that owns the connection.
 class sharded_quic_server final {
 public:
     using accept_handler = noncopyable_function<future<> (connection)>;
