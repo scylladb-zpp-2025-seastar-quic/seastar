@@ -473,14 +473,14 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         rx_queue.abort(ex);
     }
 
-    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) {
+    void complete_open_stream(internal::open_stream_result_ptr result, stream_id sid) {
         if (command_runtime) {
             command_runtime->complete_open_stream(std::move(result), sid);
         }
     }
 
     void fail_open_stream(
-      std::shared_ptr<promise<stream_id>> result,
+      internal::open_stream_result_ptr result,
       quic_error_code error,
       sstring detail) {
         if (command_runtime) {

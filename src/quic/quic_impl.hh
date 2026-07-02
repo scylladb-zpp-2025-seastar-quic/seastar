@@ -64,6 +64,7 @@ class connection_state;
 using command_runtime_ptr = shared_ptr<command_runtime>;
 using stream_state_ptr = shared_ptr<stream_state>;
 using connection_state_ptr = shared_ptr<connection_state>;
+using open_stream_result_ptr = lw_shared_ptr<promise<stream_id>>;
 
 // Payload scheduled by the command runtime to be written by the transport.
 struct quic_message {
@@ -101,7 +102,7 @@ struct transport_command {
     stream_type type = stream_type::bidirectional;
     size_t consumed_bytes = 0;
     application_error_code app_error_code = 0;
-    std::shared_ptr<promise<stream_id>> open_result;
+    open_stream_result_ptr open_result;
 };
 
 // Bridge between the public stream API and the transport actor.
@@ -126,8 +127,8 @@ public:
     virtual bool has_pending_commands() const noexcept = 0;
     virtual std::optional<transport_command> poll_command() = 0;
     virtual void set_command_notifier(std::function<void()> notifier) = 0;
-    virtual void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) = 0;
-    virtual void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) = 0;
+    virtual void complete_open_stream(open_stream_result_ptr result, stream_id sid) = 0;
+    virtual void fail_open_stream(open_stream_result_ptr result, quic_error_code error, sstring detail) = 0;
     virtual void mark_transport_ready(socket_address local, socket_address peer, sstring selected_alpn) = 0;
     virtual void mark_transport_closed() = 0;
     virtual void mark_error(quic_error_code error, sstring detail) = 0;
@@ -180,8 +181,8 @@ struct connection_transport {
     void (*stop_transport_fn)(void*) = nullptr;
     void (*fail_transport_fn)(void*, quic_error_code, sstring) = nullptr;
 
-    void (*complete_open_stream_fn)(void*, std::shared_ptr<promise<stream_id>>, stream_id) = nullptr;
-    void (*fail_open_stream_fn)(void*, std::shared_ptr<promise<stream_id>>, quic_error_code, sstring) = nullptr;
+    void (*complete_open_stream_fn)(void*, open_stream_result_ptr, stream_id) = nullptr;
+    void (*fail_open_stream_fn)(void*, open_stream_result_ptr, quic_error_code, sstring) = nullptr;
     void (*defer_blocked_open_stream_fn)(void*, transport_command) = nullptr;
     std::optional<transport_command> (*pop_blocked_open_stream_fn)(void*, stream_type) = nullptr;
     bool (*blocked_open_stream_retry_pending_fn)(void*, stream_type) noexcept = nullptr;
@@ -223,9 +224,9 @@ struct connection_transport {
     void stop_transport() { stop_transport_fn(ctx); }
     void fail_transport(quic_error_code error, sstring detail) { fail_transport_fn(ctx, error, std::move(detail)); }
 
-    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) { complete_open_stream_fn(ctx, std::move(result), sid); }
+    void complete_open_stream(open_stream_result_ptr result, stream_id sid) { complete_open_stream_fn(ctx, std::move(result), sid); }
     void fail_open_stream(
-      std::shared_ptr<promise<stream_id>> result,
+      open_stream_result_ptr result,
       quic_error_code error,
       sstring detail) {
         fail_open_stream_fn(ctx, std::move(result), error, std::move(detail));
@@ -280,10 +281,10 @@ connection_transport make_connection_transport(Owner& owner) {
       .fail_transport_fn = [] (void* ctx, quic_error_code error, sstring detail) {
           static_cast<Owner*>(ctx)->fail_transport(error, std::move(detail));
       },
-      .complete_open_stream_fn = [] (void* ctx, std::shared_ptr<promise<stream_id>> result, stream_id sid) {
+      .complete_open_stream_fn = [] (void* ctx, open_stream_result_ptr result, stream_id sid) {
           static_cast<Owner*>(ctx)->complete_open_stream(std::move(result), sid);
       },
-      .fail_open_stream_fn = [] (void* ctx, std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) {
+      .fail_open_stream_fn = [] (void* ctx, open_stream_result_ptr result, quic_error_code error, sstring detail) {
           static_cast<Owner*>(ctx)->fail_open_stream(std::move(result), error, std::move(detail));
       },
       .defer_blocked_open_stream_fn = [] (void* ctx, transport_command cmd) {
