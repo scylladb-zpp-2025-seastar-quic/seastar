@@ -25,6 +25,7 @@
 #include <errno.h>
 
 #include <exception>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <system_error>
@@ -32,7 +33,9 @@
 #include <utility>
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/deleter.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/internal/run_in_background.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
@@ -79,6 +82,21 @@ bool is_bind_conflict(std::exception_ptr ep) noexcept {
     } catch (...) {
     }
     return false;
+}
+
+using forwarded_packet_ptr = foreign_ptr<std::unique_ptr<temporary_buffer<char>>>;
+
+temporary_buffer<char> make_shard_local_packet(forwarded_packet_ptr packet) {
+    if (!packet) {
+        return temporary_buffer<char>();
+    }
+    if (packet.get_owner_shard() == this_shard_id()) {
+        return std::move(*packet);
+    }
+    return temporary_buffer<char>(
+      packet->get_write(),
+      packet->size(),
+      make_object_deleter(std::move(packet)));
 }
 
 } // namespace
@@ -166,13 +184,14 @@ public:
         if (shard >= this_smp_shard_count()) {
             co_return;
         }
-        co_await smp::submit_to(shard, [local_address, src, packet = std::move(packet)] () mutable {
+        auto forwarded = make_foreign(std::make_unique<temporary_buffer<char>>(std::move(packet)));
+        co_await smp::submit_to(shard, [local_address, src, packet = std::move(forwarded)] () mutable {
             auto it = quic_server_shards.find(local_address);
             if (it == quic_server_shards.end() || !it->second) {
                 sharded_quic_server_log.debug("drop forwarded QUIC datagram: no server registered on shard {} for {}", this_shard_id(), local_address);
                 return make_ready_future<>();
             }
-            return it->second->inject_datagram(src, std::move(packet));
+            return it->second->inject_datagram(src, make_shard_local_packet(std::move(packet)));
         });
     }
 
@@ -232,12 +251,20 @@ private:
 
 class sharded_quic_server::impl final {
 public:
+    impl()
+      : _shards(std::make_unique<sharded<internal::quic_server_shard>>()) {
+    }
+
+    ~impl() {
+        request_stop_detached();
+    }
+
     future<> start(quic_server_config config) {
         if (_started || _shards_started) {
             throw_quic_error(quic_error_code::invalid_state, "sharded QUIC server already started");
         }
 
-        co_await _shards.start();
+        co_await _shards->start();
         _shards_started = true;
 
         std::exception_ptr error;
@@ -254,7 +281,7 @@ public:
 
         if (error) {
             try {
-                co_await _shards.stop();
+                co_await _shards->stop();
             } catch (...) {
             }
             _shards_started = false;
@@ -275,7 +302,7 @@ public:
 
         std::exception_ptr error;
         try {
-            co_await _shards.invoke_on_all([make_handler = std::move(make_handler)] (internal::quic_server_shard& shard) mutable {
+            co_await _shards->invoke_on_all([make_handler = std::move(make_handler)] (internal::quic_server_shard& shard) mutable {
                 return shard.serve(make_handler());
             });
             _serving = true;
@@ -296,7 +323,7 @@ public:
 
         std::exception_ptr error;
         try {
-            co_await _shards.stop();
+            co_await _shards->stop();
         } catch (...) {
             error = std::current_exception();
         }
@@ -316,34 +343,61 @@ public:
     }
 
 private:
+    void request_stop_detached() noexcept {
+        if (!_shards_started || !_shards) {
+            return;
+        }
+
+        sharded_quic_server_log.warn("sharded_quic_server destroyed without awaiting stop(); shutting down detached");
+        auto shards = std::move(_shards);
+        _started = false;
+        _serving = false;
+        _shards_started = false;
+        _local_address = socket_address{};
+
+        auto cleanup = shards->stop()
+          .handle_exception([] (std::exception_ptr ep) {
+              try {
+                  std::rethrow_exception(ep);
+              } catch (const std::exception& e) {
+                  sharded_quic_server_log.warn("detached sharded QUIC server stop failed: {}", e.what());
+              } catch (...) {
+                  sharded_quic_server_log.warn("detached sharded QUIC server stop failed");
+              }
+          })
+          .finally([shards = std::move(shards)] {});
+        seastar::internal::run_in_background(std::move(cleanup));
+    }
+
+private:
     future<> start_with_ephemeral_port(quic_server_config config) {
-        co_await _shards.invoke_on(0, [config] (internal::quic_server_shard& shard) mutable {
+        co_await _shards->invoke_on(0, [config] (internal::quic_server_shard& shard) mutable {
             return shard.start(std::move(config));
         });
 
-        auto local = co_await _shards.invoke_on(0, [] (internal::quic_server_shard& shard) {
+        auto local = co_await _shards->invoke_on(0, [] (internal::quic_server_shard& shard) {
             return make_ready_future<socket_address>(shard.local_address());
         });
         _local_address = local;
         set_socket_address_port(config.listen_address, socket_address_port(local));
 
         auto remaining_shards = std::views::iota(1u, this_smp_shard_count());
-        co_await _shards.invoke_on(remaining_shards, [config = std::move(config)] (internal::quic_server_shard& shard) mutable {
+        co_await _shards->invoke_on(remaining_shards, [config = std::move(config)] (internal::quic_server_shard& shard) mutable {
             return shard.start(config);
         });
     }
 
     future<> start_on_all_shards(quic_server_config config) {
-        co_await _shards.invoke_on_all([config] (internal::quic_server_shard& shard) mutable {
+        co_await _shards->invoke_on_all([config] (internal::quic_server_shard& shard) mutable {
             return shard.start(config);
         });
-        _local_address = co_await _shards.invoke_on(0, [] (internal::quic_server_shard& shard) {
+        _local_address = co_await _shards->invoke_on(0, [] (internal::quic_server_shard& shard) {
             return make_ready_future<socket_address>(shard.local_address());
         });
     }
 
 private:
-    sharded<internal::quic_server_shard> _shards;
+    std::unique_ptr<sharded<internal::quic_server_shard>> _shards;
     socket_address _local_address;
     bool _started = false;
     bool _serving = false;

@@ -40,6 +40,7 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
@@ -863,10 +864,6 @@ SEASTAR_TEST_CASE(test_sharded_quic_server_echoes_connections) {
                         throw;
                     }
                 }
-                try {
-                    co_await session.close();
-                } catch (...) {
-                }
             };
         });
 
@@ -883,6 +880,79 @@ SEASTAR_TEST_CASE(test_sharded_quic_server_echoes_connections) {
 
     try {
         co_await server.stop();
+    } catch (...) {
+        if (!error) {
+            error = std::current_exception();
+        }
+    }
+
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
+SEASTAR_TEST_CASE(test_sharded_quic_server_destructor_stops_detached) {
+    {
+        sharded_quic_server server;
+
+        quic_server_config server_cfg;
+        server_cfg.listen_address = make_ipv4_address({0x7f000001, 0});
+        server_cfg.crt_file = "test.crt";
+        server_cfg.key_file = "test.key";
+        co_await server.start(std::move(server_cfg));
+    }
+
+    co_await sleep(std::chrono::milliseconds{100});
+}
+
+SEASTAR_TEST_CASE(test_sharded_quic_server_destructor_stops_detached_with_active_session) {
+    quic_client client;
+    std::optional<connection> session;
+    std::exception_ptr error;
+
+    try {
+        {
+            sharded_quic_server server;
+
+            quic_server_config server_cfg;
+            server_cfg.listen_address = make_ipv4_address({0x7f000001, 0});
+            server_cfg.crt_file = "test.crt";
+            server_cfg.key_file = "test.key";
+            co_await server.start(std::move(server_cfg));
+
+            auto server_address = server.local_address();
+            co_await server.serve([] {
+                return [] (connection session) mutable -> future<> {
+                    co_await sleep(std::chrono::milliseconds{200});
+                    try {
+                        co_await session.close();
+                    } catch (...) {
+                    }
+                };
+            });
+
+            quic_client_config client_cfg;
+            client_cfg.remote_address = server_address;
+            client_cfg.server_name = "test.scylladb.org";
+            client_cfg.ca_file = "test.crt";
+            session.emplace(co_await client.connect(std::move(client_cfg)));
+            co_await sleep(std::chrono::milliseconds{25});
+        }
+
+        co_await sleep(std::chrono::milliseconds{300});
+    } catch (...) {
+        error = std::current_exception();
+    }
+
+    if (session) {
+        try {
+            co_await session->close();
+        } catch (...) {
+        }
+    }
+
+    try {
+        co_await client.stop();
     } catch (...) {
         if (!error) {
             error = std::current_exception();
