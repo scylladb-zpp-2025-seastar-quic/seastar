@@ -4,4 +4,4 @@
 
 [submodule "ngtcp2"]
 	path = ngtcp2
-	url = https://github.com/TusikNusik/ngtcp2
+	url = https://github.com/scylladb-zpp-2025-seastar-quic/ngtcp2
