@@ -1037,7 +1037,7 @@ void init_tls(client_state& st) {
     }
     if (!alpns.empty()) {
         // GnuTLS borrows ALPN buffers for the call only, so the local vector is enough.
-        rv = gnutls_alpn_set_protocols(st.tls, alpns.data(), alpns.size(), 0);
+        rv = gnutls_alpn_set_protocols(st.tls, alpns.data(), alpns.size(), GNUTLS_ALPN_MANDATORY);
         if (rv < 0) {
             throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
         }

@@ -1283,7 +1283,7 @@ private:
             });
         }
         if (!alpns.empty()) {
-            rv = gnutls_alpn_set_protocols(tls, alpns.data(), alpns.size(), 0);
+            rv = gnutls_alpn_set_protocols(tls, alpns.data(), alpns.size(), GNUTLS_ALPN_MANDATORY);
             if (rv < 0) {
                 gnutls_deinit(tls);
                 throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));

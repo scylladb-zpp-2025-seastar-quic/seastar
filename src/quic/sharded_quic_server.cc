@@ -93,10 +93,10 @@ temporary_buffer<char> make_shard_local_packet(forwarded_packet_ptr packet) {
     if (packet.get_owner_shard() == this_shard_id()) {
         return std::move(*packet);
     }
-    return temporary_buffer<char>(
-      packet->get_write(),
-      packet->size(),
-      make_object_deleter(std::move(packet)));
+    auto* data = packet->get_write();
+    auto size = packet->size();
+    auto deleter = make_object_deleter(std::move(packet));
+    return temporary_buffer<char>(data, size, std::move(deleter));
 }
 
 } // namespace
