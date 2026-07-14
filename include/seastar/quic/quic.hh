@@ -16,7 +16,7 @@
  * under the License.
  */
 /*
- * Copyright (C) 2026 Piotr Korcz
+ * Copyright (C) 2026 ScyllaDB
  */
 
 #pragma once
