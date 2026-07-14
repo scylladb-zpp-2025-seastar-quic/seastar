@@ -148,157 +148,53 @@ struct transport_open_stream_result {
     stream_id sid = invalid_stream_id;
 };
 
-// Callback-based view of client/server transport operations shared by common helpers.
-struct connection_transport {
-    // Type-erased callback table lets client and server share transport helpers.
-    void* ctx = nullptr;
+// Base class for client/server transport operations shared by common helpers.
+class connection_transport {
+public:
+    virtual ~connection_transport() = default;
 
-    bool (*transport_active_fn)(void*) noexcept = nullptr;
-    bool (*has_transport_connection_fn)(void*) noexcept = nullptr;
-    bool (*can_retry_blocked_open_streams_fn)(void*) noexcept = nullptr;
-    size_t (*tx_payload_limit_bytes_fn)(void*) noexcept = nullptr;
+    virtual bool transport_active() const noexcept = 0;
+    virtual bool has_transport_connection() const noexcept = 0;
+    virtual bool can_retry_blocked_open_streams() const noexcept = 0;
+    virtual size_t tx_payload_limit_bytes() const noexcept = 0;
 
-    int64_t (*write_pending_packet_fn)(void*, uint8_t*, size_t) = nullptr;
-    transport_stream_write_result (*write_stream_packet_fn)(void*, stream_id, const char*, size_t, bool, uint8_t*, size_t) = nullptr;
-    transport_open_stream_result (*try_open_stream_fn)(void*, stream_type) = nullptr;
-    void (*retain_stream_data_fn)(void*, stream_id, temporary_buffer<char>) = nullptr;
-    void (*complete_send_bytes_fn)(void*, size_t) = nullptr;
-    int (*consume_stream_data_fn)(void*, stream_id, size_t) = nullptr;
-    int (*shutdown_stream_write_fn)(void*, stream_id, application_error_code) = nullptr;
-    int (*shutdown_stream_read_fn)(void*, stream_id, application_error_code) = nullptr;
-    int (*read_transport_datagram_fn)(void*, const socket_address&, const char*, size_t) = nullptr;
-    void (*sync_transport_path_fn)(void*) = nullptr;
-    uint64_t (*transport_expiry_ns_fn)(void*) noexcept = nullptr;
-    int (*handle_transport_expiry_fn)(void*, uint64_t) = nullptr;
-    temporary_buffer<char>& (*tx_packet_buffer_fn)(void*) = nullptr;
-
-    future<> (*send_datagram_packet_fn)(void*, temporary_buffer<char>) = nullptr;
-    bool (*can_send_connection_close_fn)(void*) noexcept = nullptr;
-    int64_t (*write_connection_close_packet_fn)(void*, uint8_t*, size_t) = nullptr;
-    void (*on_stream_write_closed_fn)(void*, stream_id) = nullptr;
-    void (*rearm_transport_timer_fn)(void*) = nullptr;
-    void (*request_close_fn)(void*) = nullptr;
-    void (*stop_transport_fn)(void*) = nullptr;
-    void (*fail_transport_fn)(void*, quic_error_code, sstring) = nullptr;
-
-    void (*complete_open_stream_fn)(void*, open_stream_result_ptr, stream_id) = nullptr;
-    void (*fail_open_stream_fn)(void*, open_stream_result_ptr, quic_error_code, sstring) = nullptr;
-    void (*defer_blocked_open_stream_fn)(void*, transport_command) = nullptr;
-    std::optional<transport_command> (*pop_blocked_open_stream_fn)(void*, stream_type) = nullptr;
-    bool (*blocked_open_stream_retry_pending_fn)(void*, stream_type) noexcept = nullptr;
-    void (*clear_blocked_open_stream_retry_fn)(void*, stream_type) noexcept = nullptr;
-
-    bool transport_active() const noexcept { return transport_active_fn(ctx); }
-    bool has_transport_connection() const noexcept { return has_transport_connection_fn(ctx); }
-    bool can_retry_blocked_open_streams() const noexcept { return can_retry_blocked_open_streams_fn(ctx); }
-    size_t tx_payload_limit_bytes() const noexcept { return tx_payload_limit_bytes_fn(ctx); }
-
-    int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) { return write_pending_packet_fn(ctx, outbuf, outbuf_size); }
-    transport_stream_write_result write_stream_packet(
+    virtual int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
+    virtual transport_stream_write_result write_stream_packet(
       stream_id sid,
       const char* data,
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size) {
-        return write_stream_packet_fn(ctx, sid, data, len, fin, outbuf, outbuf_size);
-    }
-    transport_open_stream_result try_open_stream(stream_type type) { return try_open_stream_fn(ctx, type); }
-    void retain_stream_data(stream_id sid, temporary_buffer<char> payload) { retain_stream_data_fn(ctx, sid, std::move(payload)); }
-    void complete_send_bytes(size_t len) { complete_send_bytes_fn(ctx, len); }
-    int consume_stream_data(stream_id sid, size_t len) { return consume_stream_data_fn(ctx, sid, len); }
-    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) { return shutdown_stream_write_fn(ctx, sid, app_error_code); }
-    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) { return shutdown_stream_read_fn(ctx, sid, app_error_code); }
-    int read_transport_datagram(const socket_address& src, const char* data, size_t len) { return read_transport_datagram_fn(ctx, src, data, len); }
-    void sync_transport_path() { sync_transport_path_fn(ctx); }
-    uint64_t transport_expiry_ns() const noexcept { return transport_expiry_ns_fn(ctx); }
-    int handle_transport_expiry(uint64_t now_ns) { return handle_transport_expiry_fn(ctx, now_ns); }
-    temporary_buffer<char>& tx_packet_buffer() { return tx_packet_buffer_fn(ctx); }
+      size_t outbuf_size) = 0;
+    virtual transport_open_stream_result try_open_stream(stream_type type) = 0;
+    virtual void retain_stream_data(stream_id sid, temporary_buffer<char> payload) = 0;
+    virtual void complete_send_bytes(size_t len) = 0;
+    virtual int consume_stream_data(stream_id sid, size_t len) = 0;
+    virtual int shutdown_stream_write(stream_id sid, application_error_code app_error_code) = 0;
+    virtual int shutdown_stream_read(stream_id sid, application_error_code app_error_code) = 0;
+    virtual int read_transport_datagram(const socket_address& src, const char* data, size_t len) = 0;
+    virtual void sync_transport_path() = 0;
+    virtual uint64_t transport_expiry_ns() const noexcept = 0;
+    virtual int handle_transport_expiry(uint64_t now_ns) = 0;
+    virtual temporary_buffer<char>& tx_packet_buffer() = 0;
 
-    future<> send_datagram_packet(temporary_buffer<char> packet) { return send_datagram_packet_fn(ctx, std::move(packet)); }
-    bool can_send_connection_close() const noexcept { return can_send_connection_close_fn(ctx); }
-    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) { return write_connection_close_packet_fn(ctx, outbuf, outbuf_size); }
-    void on_stream_write_closed(stream_id sid) { on_stream_write_closed_fn(ctx, sid); }
-    void rearm_transport_timer() { rearm_transport_timer_fn(ctx); }
-    void request_close() { request_close_fn(ctx); }
-    void stop_transport() { stop_transport_fn(ctx); }
-    void fail_transport(quic_error_code error, sstring detail) { fail_transport_fn(ctx, error, std::move(detail)); }
+    virtual future<> send_datagram_packet(temporary_buffer<char> packet) = 0;
+    virtual bool can_send_connection_close() const noexcept = 0;
+    virtual int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) = 0;
+    virtual void on_stream_write_closed(stream_id sid) = 0;
+    virtual void rearm_transport_timer() = 0;
+    virtual void request_close() = 0;
+    virtual void stop_transport() = 0;
+    virtual void fail_transport(quic_error_code error, sstring detail) = 0;
 
-    void complete_open_stream(open_stream_result_ptr result, stream_id sid) { complete_open_stream_fn(ctx, std::move(result), sid); }
-    void fail_open_stream(
-      open_stream_result_ptr result,
-      quic_error_code error,
-      sstring detail) {
-        fail_open_stream_fn(ctx, std::move(result), error, std::move(detail));
-    }
-    void defer_blocked_open_stream(transport_command cmd) { defer_blocked_open_stream_fn(ctx, std::move(cmd)); }
-    std::optional<transport_command> pop_blocked_open_stream(stream_type type) { return pop_blocked_open_stream_fn(ctx, type); }
-    bool blocked_open_stream_retry_pending(stream_type type) const noexcept { return blocked_open_stream_retry_pending_fn(ctx, type); }
-    void clear_blocked_open_stream_retry(stream_type type) noexcept { clear_blocked_open_stream_retry_fn(ctx, type); }
+    virtual void complete_open_stream(open_stream_result_ptr result, stream_id sid) = 0;
+    virtual void fail_open_stream(open_stream_result_ptr result, quic_error_code error, sstring detail) = 0;
+    virtual void defer_blocked_open_stream(transport_command cmd) = 0;
+    virtual std::optional<transport_command> pop_blocked_open_stream(stream_type type) = 0;
+    virtual bool blocked_open_stream_retry_pending(stream_type type) const noexcept = 0;
+    virtual void clear_blocked_open_stream_retry(stream_type type) noexcept = 0;
+
 };
-
-template <typename Owner>
-connection_transport make_connection_transport(Owner& owner) {
-    // Owner methods stay concrete while common code depends only on connection_transport.
-    return connection_transport{
-      .ctx = &owner,
-      .transport_active_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->transport_active(); },
-      .has_transport_connection_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->has_transport_connection(); },
-      .can_retry_blocked_open_streams_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->can_retry_blocked_open_streams(); },
-      .tx_payload_limit_bytes_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->tx_payload_limit_bytes(); },
-      .write_pending_packet_fn = [] (void* ctx, uint8_t* outbuf, size_t outbuf_size) { return static_cast<Owner*>(ctx)->write_pending_packet(outbuf, outbuf_size); },
-      .write_stream_packet_fn = [] (void* ctx, stream_id sid, const char* data, size_t len, bool fin, uint8_t* outbuf, size_t outbuf_size) {
-          return static_cast<Owner*>(ctx)->write_stream_packet(sid, data, len, fin, outbuf, outbuf_size);
-      },
-      .try_open_stream_fn = [] (void* ctx, stream_type type) { return static_cast<Owner*>(ctx)->try_open_stream(type); },
-      .retain_stream_data_fn = [] (void* ctx, stream_id sid, temporary_buffer<char> payload) {
-          static_cast<Owner*>(ctx)->retain_stream_data(sid, std::move(payload));
-      },
-      .complete_send_bytes_fn = [] (void* ctx, size_t len) { static_cast<Owner*>(ctx)->complete_send_bytes(len); },
-      .consume_stream_data_fn = [] (void* ctx, stream_id sid, size_t len) { return static_cast<Owner*>(ctx)->consume_stream_data(sid, len); },
-      .shutdown_stream_write_fn = [] (void* ctx, stream_id sid, application_error_code app_error_code) {
-          return static_cast<Owner*>(ctx)->shutdown_stream_write(sid, app_error_code);
-      },
-      .shutdown_stream_read_fn = [] (void* ctx, stream_id sid, application_error_code app_error_code) {
-          return static_cast<Owner*>(ctx)->shutdown_stream_read(sid, app_error_code);
-      },
-      .read_transport_datagram_fn = [] (void* ctx, const socket_address& src, const char* data, size_t len) {
-          return static_cast<Owner*>(ctx)->read_transport_datagram(src, data, len);
-      },
-      .sync_transport_path_fn = [] (void* ctx) { static_cast<Owner*>(ctx)->sync_transport_path(); },
-      .transport_expiry_ns_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->transport_expiry_ns(); },
-      .handle_transport_expiry_fn = [] (void* ctx, uint64_t now_ns) { return static_cast<Owner*>(ctx)->handle_transport_expiry(now_ns); },
-      .tx_packet_buffer_fn = [] (void* ctx) -> temporary_buffer<char>& { return static_cast<Owner*>(ctx)->tx_packet_buffer(); },
-      .send_datagram_packet_fn = [] (void* ctx, temporary_buffer<char> packet) { return static_cast<Owner*>(ctx)->send_datagram_packet(std::move(packet)); },
-      .can_send_connection_close_fn = [] (void* ctx) noexcept { return static_cast<Owner*>(ctx)->can_send_connection_close(); },
-      .write_connection_close_packet_fn = [] (void* ctx, uint8_t* outbuf, size_t outbuf_size) {
-          return static_cast<Owner*>(ctx)->write_connection_close_packet(outbuf, outbuf_size);
-      },
-      .on_stream_write_closed_fn = [] (void* ctx, stream_id sid) { static_cast<Owner*>(ctx)->on_stream_write_closed(sid); },
-      .rearm_transport_timer_fn = [] (void* ctx) { static_cast<Owner*>(ctx)->rearm_transport_timer(); },
-      .request_close_fn = [] (void* ctx) { static_cast<Owner*>(ctx)->request_close(); },
-      .stop_transport_fn = [] (void* ctx) { static_cast<Owner*>(ctx)->stop_transport(); },
-      .fail_transport_fn = [] (void* ctx, quic_error_code error, sstring detail) {
-          static_cast<Owner*>(ctx)->fail_transport(error, std::move(detail));
-      },
-      .complete_open_stream_fn = [] (void* ctx, open_stream_result_ptr result, stream_id sid) {
-          static_cast<Owner*>(ctx)->complete_open_stream(std::move(result), sid);
-      },
-      .fail_open_stream_fn = [] (void* ctx, open_stream_result_ptr result, quic_error_code error, sstring detail) {
-          static_cast<Owner*>(ctx)->fail_open_stream(std::move(result), error, std::move(detail));
-      },
-      .defer_blocked_open_stream_fn = [] (void* ctx, transport_command cmd) {
-          static_cast<Owner*>(ctx)->defer_blocked_open_stream(std::move(cmd));
-      },
-      .pop_blocked_open_stream_fn = [] (void* ctx, stream_type type) { return static_cast<Owner*>(ctx)->pop_blocked_open_stream(type); },
-      .blocked_open_stream_retry_pending_fn = [] (void* ctx, stream_type type) noexcept {
-          return static_cast<Owner*>(ctx)->blocked_open_stream_retry_pending(type);
-      },
-      .clear_blocked_open_stream_retry_fn = [] (void* ctx, stream_type type) noexcept {
-          static_cast<Owner*>(ctx)->clear_blocked_open_stream_retry(type);
-      },
-    };
-}
 
 class connection_state {
 public:

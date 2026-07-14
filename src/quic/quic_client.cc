@@ -79,7 +79,7 @@ struct client_state;
 void sync_current_path(client_state& st);
 
 // Owns one client-side transport instance: socket, TLS, ngtcp2 state and actor queues.
-struct client_state : public enable_lw_shared_from_this<client_state> {
+struct client_state final : public enable_lw_shared_from_this<client_state>, public internal::connection_transport {
     quic_client_config cfg{};
     internal::command_runtime_ptr command_runtime;
 
@@ -119,13 +119,10 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     };
     std::unordered_map<stream_id, uint64_t> next_stream_send_offsets;
     std::unordered_map<stream_id, std::deque<retained_stream_data>> retained_stream_data_by_stream;
-    internal::connection_transport transport;
 
-    client_state()
-        : transport(internal::make_connection_transport(*this)) {
-    }
+    client_state() = default;
 
-    ~client_state() {
+    ~client_state() override {
         // Destruction can happen while user futures still exist; complete them before
         // releasing TLS/ngtcp2 state.
         fail_blocked_open_streams(quic_error_code::closed, "client state destroyed");
@@ -647,7 +644,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
 
     future<> actor_handle_stop_request() {
         // This is the last point where the actor owns enough state to close cleanly.
-        co_await internal::send_connection_close(transport);
+        co_await internal::send_connection_close(*this);
         stop_transport();
     }
 
@@ -673,7 +670,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
 
     future<> actor_handle_next_rx_event() {
         auto evt = rx_queue.pop();
-        co_await internal::recv_transport_datagram(transport, evt.src, std::move(evt.packet));
+        co_await internal::recv_transport_datagram(*this, evt.src, std::move(evt.packet));
         request_blocked_send_retry();
     }
 
@@ -708,7 +705,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
             co_return;
         }
         auto blocked_stream = cmd->msg.stream;
-        auto blocked = co_await internal::handle_transport_command(transport, std::move(*cmd));
+        auto blocked = co_await internal::handle_transport_command(*this, std::move(*cmd));
         if (blocked) {
             if (retrying_blocked_send) {
                 defer_retried_blocked_send(std::move(*blocked));
@@ -724,8 +721,8 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
         if (!handshake_done) {
             co_return;
         }
-        co_await internal::retry_blocked_open_streams(transport, stream_type::bidirectional);
-        co_await internal::retry_blocked_open_streams(transport, stream_type::unidirectional);
+        co_await internal::retry_blocked_open_streams(*this, stream_type::bidirectional);
+        co_await internal::retry_blocked_open_streams(*this, stream_type::unidirectional);
     }
 
     bool actor_tick_pending() const noexcept {
@@ -737,7 +734,7 @@ struct client_state : public enable_lw_shared_from_this<client_state> {
     }
 
     future<> actor_handle_timer_tick() {
-        co_await internal::handle_transport_timer(transport);
+        co_await internal::handle_transport_timer(*this);
         request_blocked_send_retry();
     }
 };
@@ -1204,7 +1201,7 @@ void init_client_connection(client_state& st) {
 }
 
 future<> flush_pending_packets_actor(lw_shared_ptr<client_state> st) {
-    co_await internal::flush_pending_transport_packets(st->transport);
+    co_await internal::flush_pending_transport_packets(*st);
 }
 
     future<> recv_loop(lw_shared_ptr<client_state> st) {

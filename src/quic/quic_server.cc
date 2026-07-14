@@ -178,7 +178,7 @@ struct server_connection;
 void sync_current_path(server_connection& conn);
 
 // Per-peer server-side transport state created after the first Initial packet.
-struct server_connection : public enable_lw_shared_from_this<server_connection> {
+struct server_connection final : public enable_lw_shared_from_this<server_connection>, public internal::connection_transport {
     weak_ptr<internal::quic_server_impl> server;
     internal::command_runtime_ptr command_runtime;
     internal::connection_state_ptr connection_state;
@@ -215,13 +215,10 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
     std::unordered_map<stream_id, uint64_t> next_stream_send_offsets;
     std::unordered_map<stream_id, std::deque<retained_stream_data>> retained_stream_data_by_stream;
     std::unordered_set<std::string> mapped_dcids;
-    internal::connection_transport transport;
 
-    server_connection()
-        : transport(internal::make_connection_transport(*this)) {
-    }
+    server_connection() = default;
 
-    ~server_connection() {
+    ~server_connection() override {
         // Complete pending user promises before tearing down ngtcp2-owned callbacks.
         fail_blocked_open_streams(quic_error_code::closed, "server connection destroyed");
         discard_blocked_send();
@@ -697,7 +694,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
             co_return;
         }
         auto blocked_stream = cmd->msg.stream;
-        auto blocked = co_await internal::handle_transport_command(transport, std::move(*cmd));
+        auto blocked = co_await internal::handle_transport_command(*this, std::move(*cmd));
         if (blocked) {
             if (retrying_blocked_send) {
                 defer_retried_blocked_send(std::move(*blocked));
@@ -709,8 +706,8 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         }
     }
     future<> actor_retry_blocked_open_streams() {
-        co_await internal::retry_blocked_open_streams(transport, stream_type::bidirectional);
-        co_await internal::retry_blocked_open_streams(transport, stream_type::unidirectional);
+        co_await internal::retry_blocked_open_streams(*this, stream_type::bidirectional);
+        co_await internal::retry_blocked_open_streams(*this, stream_type::unidirectional);
     }
     bool actor_tick_pending() const noexcept {
         return connection_state->tick_pending();
@@ -1494,7 +1491,7 @@ private:
     }
 
     static future<> flush_pending_packets_actor(conn_ptr conn) {
-        co_await flush_pending_transport_packets(conn->transport);
+        co_await flush_pending_transport_packets(*conn);
     }
 
     static future<> conn_actor_loop(conn_ptr conn) {
@@ -1686,7 +1683,7 @@ bool server_connection::can_send_connection_close() const noexcept {
 
 future<> server_connection::actor_handle_next_rx_event() {
     auto evt = rx_queue.pop();
-    co_await internal::recv_transport_datagram(transport, evt.src, std::move(evt.packet));
+    co_await internal::recv_transport_datagram(*this, evt.src, std::move(evt.packet));
     request_blocked_send_retry();
 }
 
@@ -1699,7 +1696,7 @@ future<> server_connection::actor_handle_stop_request() {
     discard_blocked_send();
 
     // Send the close frame from the actor while transport state is still owned here.
-    co_await internal::send_connection_close(transport);
+    co_await internal::send_connection_close(*this);
 
     closing = true;
     abort_event_queues(stop_error_local ? "server connection failed" : "server connection stopped");
@@ -1723,7 +1720,7 @@ future<> server_connection::actor_handle_stop_request() {
 }
 
 future<> server_connection::actor_handle_timer_tick() {
-    co_await internal::handle_transport_timer(transport);
+    co_await internal::handle_transport_timer(*this);
     request_blocked_send_retry();
 }
 

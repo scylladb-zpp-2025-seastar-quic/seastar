@@ -284,9 +284,8 @@ private:
 
 class fake_connection_transport final : public quic_internal::connection_transport {
 public:
-    fake_connection_transport() {
-        static_cast<quic_internal::connection_transport&>(*this) = quic_internal::make_connection_transport(*this);
-    }
+    fake_connection_transport() = default;
+    ~fake_connection_transport() override = default;
 
     bool active = true;
     bool has_connection = true;
