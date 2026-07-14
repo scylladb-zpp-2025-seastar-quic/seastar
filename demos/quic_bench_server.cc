@@ -29,12 +29,14 @@
 
 #include <arpa/inet.h>
 
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <fmt/core.h>
 
@@ -44,6 +46,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/quic/sharded_quic_server.hh>
 
@@ -97,6 +100,14 @@ struct server_stats {
     uint64_t bytes_echoed = 0;    // total bytes written back (bidi streams only)
     uint64_t streams_completed = 0;
     uint64_t connections_accepted = 0;
+
+    server_stats& operator+=(const server_stats& other) {
+        bytes_received += other.bytes_received;
+        bytes_echoed += other.bytes_echoed;
+        streams_completed += other.streams_completed;
+        connections_accepted += other.connections_accepted;
+        return *this;
+    }
 };
 
 static thread_local server_stats g_stats;
@@ -191,6 +202,10 @@ static future<> handle_bench_session(connection session) {
             }).handle_exception([](std::exception_ptr ep) {
                 try {
                     std::rethrow_exception(ep);
+                } catch (const quic_error& e) {
+                    if (e.code() != quic_error::closed) {
+                        std::cerr << "[server] stream task failed: " << e.what() << "\n";
+                    }
                 } catch (const std::exception& e) {
                     std::cerr << "[server] stream task failed: " << e.what() << "\n";
                 }
@@ -208,27 +223,79 @@ static future<> handle_bench_session(connection session) {
 }
 
 
-// Prints a one-line stats summary every `interval_s` seconds until aborted.
+static future<std::vector<server_stats>> collect_server_stats() {
+    std::vector<future<server_stats>> pending;
+    pending.reserve(this_smp_shard_count());
+    for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
+        pending.push_back(smp::submit_to(shard, [] {
+            return g_stats;
+        }));
+    }
+    co_return co_await when_all_succeed(pending.begin(), pending.end());
+}
+
+static void print_interval_stats(
+        const std::vector<server_stats>& current,
+        const std::vector<server_stats>& previous,
+        double elapsed_s) {
+    server_stats total;
+    server_stats previous_total;
+    for (unsigned shard = 0; shard < current.size(); ++shard) {
+        total += current[shard];
+        previous_total += previous[shard];
+        fmt::print(
+            "[server shard={}] conns={} streams={} rx={:.1f} MB/s tx={:.1f} MB/s\n",
+            shard,
+            current[shard].connections_accepted,
+            current[shard].streams_completed,
+            static_cast<double>(current[shard].bytes_received - previous[shard].bytes_received) / 1e6 / elapsed_s,
+            static_cast<double>(current[shard].bytes_echoed - previous[shard].bytes_echoed) / 1e6 / elapsed_s);
+    }
+    fmt::print(
+        "[server total] conns={} streams={} rx={:.1f} MB/s tx={:.1f} MB/s\n",
+        total.connections_accepted,
+        total.streams_completed,
+        static_cast<double>(total.bytes_received - previous_total.bytes_received) / 1e6 / elapsed_s,
+        static_cast<double>(total.bytes_echoed - previous_total.bytes_echoed) / 1e6 / elapsed_s);
+    std::cout.flush();
+}
+
+static future<> print_final_stats() {
+    auto current = co_await collect_server_stats();
+    server_stats total;
+    fmt::print("\n=== QUIC server shard distribution ===\n");
+    for (unsigned shard = 0; shard < current.size(); ++shard) {
+        total += current[shard];
+        fmt::print(
+            "  shard {:2d}: conns={:6d} streams={:8d} rx={:12.2f} MB tx={:12.2f} MB\n",
+            shard,
+            current[shard].connections_accepted,
+            current[shard].streams_completed,
+            static_cast<double>(current[shard].bytes_received) / 1e6,
+            static_cast<double>(current[shard].bytes_echoed) / 1e6);
+    }
+    fmt::print(
+        "  total:    conns={:6d} streams={:8d} rx={:12.2f} MB tx={:12.2f} MB\n\n",
+        total.connections_accepted,
+        total.streams_completed,
+        static_cast<double>(total.bytes_received) / 1e6,
+        static_cast<double>(total.bytes_echoed) / 1e6);
+    std::cout.flush();
+}
+
+// Collects and prints all shard-local counters every `interval_s` seconds.
 static future<> print_stats_loop(unsigned interval_s, abort_source& as) {
-    uint64_t prev_rx = 0;
-    uint64_t prev_tx = 0;
+    std::vector<server_stats> previous(this_smp_shard_count());
+    auto previous_at = std::chrono::steady_clock::now();
     try {
         while (true) {
             co_await sleep_abortable(std::chrono::seconds(interval_s), as);
-            uint64_t rx = g_stats.bytes_received;
-            uint64_t tx = g_stats.bytes_echoed;
-            double rx_mb_s = static_cast<double>(rx - prev_rx) / 1e6 / interval_s;
-            double tx_mb_s = static_cast<double>(tx - prev_tx) / 1e6 / interval_s;
-            prev_rx = rx;
-            prev_tx = tx;
-            fmt::print(
-                "[server shard={}] conns={} streams_done={} rx={:.1f} MB/s tx={:.1f} MB/s\n",
-                this_shard_id(),
-                g_stats.connections_accepted,
-                g_stats.streams_completed,
-                rx_mb_s,
-                tx_mb_s);
-            std::cout.flush();
+            auto now = std::chrono::steady_clock::now();
+            auto current = co_await collect_server_stats();
+            auto elapsed_s = std::chrono::duration<double>(now - previous_at).count();
+            print_interval_stats(current, previous, elapsed_s);
+            previous = std::move(current);
+            previous_at = now;
         }
     } catch (const sleep_aborted&) {
         // Normal shutdown path.
@@ -329,6 +396,7 @@ int main(int argc, char** argv) {
         if (stats_task) {
             try { co_await std::move(*stats_task); } catch (...) {}
         }
+        try { co_await print_final_stats(); } catch (...) {}
         try { co_await server.stop(); } catch (...) {}
 
         if (error) {

@@ -44,8 +44,8 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <numeric>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -59,7 +59,7 @@
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/smp.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/quic/quic_client.hh>
 
@@ -127,6 +127,13 @@ struct throughput_result {
     uint64_t bytes_sent     = 0;
     uint64_t bytes_received = 0;  // meaningful only for bidi
     uint64_t messages_sent  = 0;
+
+    throughput_result& operator+=(const throughput_result& other) {
+        bytes_sent += other.bytes_sent;
+        bytes_received += other.bytes_received;
+        messages_sent += other.messages_sent;
+        return *this;
+    }
 };
 
 // All latency samples in microseconds, collected across all streams.
@@ -319,7 +326,7 @@ static future<> run_latency_stream(
 // ---------------------------------------------------------------------------
 
 static future<> run_connection_throughput(
-        quic_client_config       cfg,
+        lw_shared_ptr<connection> conn,
         int                      n_streams,
         stream_type              stype,
         const std::vector<char>& msg,
@@ -327,70 +334,214 @@ static future<> run_connection_throughput(
         size_t                   flush_messages,
         throughput_result&       result) {
 
-    quic_client client;
     std::exception_ptr err;
-    try {
-        auto conn = make_lw_shared<connection>(co_await client.connect(cfg));
-
-        std::vector<future<>> futs;
-        futs.reserve(n_streams);
-        for (int i = 0; i < n_streams; ++i) {
-            if (stype == stream_type::bidirectional) {
-                futs.push_back(run_bidi_throughput_stream(conn, msg, deadline, flush_messages, result));
-            } else {
-                futs.push_back(run_uni_throughput_stream(conn, msg, deadline, flush_messages, result));
-            }
+    std::vector<future<>> futs;
+    futs.reserve(n_streams);
+    for (int i = 0; i < n_streams; ++i) {
+        if (stype == stream_type::bidirectional) {
+            futs.push_back(run_bidi_throughput_stream(conn, msg, deadline, flush_messages, result));
+        } else {
+            futs.push_back(run_uni_throughput_stream(conn, msg, deadline, flush_messages, result));
         }
-
-        auto stream_results = co_await when_all(futs.begin(), futs.end());
-        for (auto& f : stream_results) {
-            try { f.get(); }
-            catch (const std::exception& e) {
-                std::cerr << "[client] stream error: " << e.what() << "\n";
-            }
-        }
-
-        try { co_await conn->close(); } catch (...) {}
-    } catch (...) {
-        err = std::current_exception();
     }
-    try { co_await client.stop(); } catch (...) {}
+
+    auto stream_results = co_await when_all(futs.begin(), futs.end());
+    for (auto& f : stream_results) {
+        try {
+            f.get();
+        } catch (...) {
+            if (!err) {
+                err = std::current_exception();
+            }
+        }
+    }
     if (err) { std::rethrow_exception(err); }
 }
 
 static future<> run_connection_latency(
-        quic_client_config       cfg,
+        lw_shared_ptr<connection> conn,
         int                      n_streams,
         const std::vector<char>& msg,
         time_point               deadline,
         latency_samples&         samples) {
 
-    quic_client client;
     std::exception_ptr err;
-    try {
-        auto conn = make_lw_shared<connection>(co_await client.connect(cfg));
+    std::vector<future<>> futs;
+    futs.reserve(n_streams);
+    for (int i = 0; i < n_streams; ++i) {
+        futs.push_back(run_latency_stream(conn, msg, deadline, samples));
+    }
 
-        std::vector<future<>> futs;
-        futs.reserve(n_streams);
-        for (int i = 0; i < n_streams; ++i) {
-            futs.push_back(run_latency_stream(conn, msg, deadline, samples));
-        }
-
-        auto stream_results = co_await when_all(futs.begin(), futs.end());
-        for (auto& f : stream_results) {
-            try { f.get(); }
-            catch (const std::exception& e) {
-                std::cerr << "[client] stream error: " << e.what() << "\n";
+    auto stream_results = co_await when_all(futs.begin(), futs.end());
+    for (auto& f : stream_results) {
+        try {
+            f.get();
+        } catch (...) {
+            if (!err) {
+                err = std::current_exception();
             }
         }
-
-        try { co_await conn->close(); } catch (...) {}
-    } catch (...) {
-        err = std::current_exception();
     }
-    try { co_await client.stop(); } catch (...) {}
     if (err) { std::rethrow_exception(err); }
 }
+
+struct client_shard_result {
+    throughput_result throughput;
+    latency_samples latency;
+    unsigned connections = 0;
+    unsigned failures = 0;
+};
+
+class benchmark_connection final {
+public:
+    future<> connect(quic_client_config cfg) {
+        _connection = make_lw_shared<connection>(co_await _client.connect(std::move(cfg)));
+    }
+
+    lw_shared_ptr<connection> session() const {
+        return _connection;
+    }
+
+    future<> stop() {
+        std::exception_ptr error;
+        if (_connection) {
+            try {
+                co_await _connection->close();
+            } catch (...) {
+                error = std::current_exception();
+            }
+            _connection = {};
+        }
+        try {
+            co_await _client.stop();
+        } catch (...) {
+            if (!error) {
+                error = std::current_exception();
+            }
+        }
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+
+private:
+    quic_client _client;
+    lw_shared_ptr<connection> _connection;
+};
+
+class benchmark_client_shard final {
+public:
+    future<> connect(quic_client_config cfg, unsigned connection_count) {
+        _result.connections = connection_count;
+        _connections.reserve(connection_count);
+        std::vector<future<>> pending;
+        pending.reserve(connection_count);
+        for (unsigned i = 0; i < connection_count; ++i) {
+            auto connection = std::make_unique<benchmark_connection>();
+            pending.push_back(connection->connect(cfg));
+            _connections.push_back(std::move(connection));
+        }
+
+        auto results = co_await when_all(pending.begin(), pending.end());
+        std::exception_ptr error;
+        for (auto& result : results) {
+            try {
+                result.get();
+            } catch (...) {
+                ++_result.failures;
+                if (!error) {
+                    error = std::current_exception();
+                }
+            }
+        }
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+
+    future<> run_throughput(
+            int streams_per_connection,
+            stream_type stype,
+            std::vector<char> msg,
+            time_point deadline,
+            size_t flush_messages,
+            bool record_result) {
+        throughput_result phase_result;
+        std::vector<future<>> pending;
+        pending.reserve(_connections.size());
+        for (auto& connection : _connections) {
+            pending.push_back(run_connection_throughput(
+                connection->session(), streams_per_connection, stype, msg,
+                deadline, flush_messages, phase_result));
+        }
+        co_await finish_phase(std::move(pending));
+        if (record_result) {
+            _result.throughput = phase_result;
+        }
+    }
+
+    future<> run_latency(
+            int streams_per_connection,
+            std::vector<char> msg,
+            time_point deadline,
+            bool record_result) {
+        latency_samples phase_samples;
+        std::vector<future<>> pending;
+        pending.reserve(_connections.size());
+        for (auto& connection : _connections) {
+            pending.push_back(run_connection_latency(
+                connection->session(), streams_per_connection, msg,
+                deadline, phase_samples));
+        }
+        co_await finish_phase(std::move(pending));
+        if (record_result) {
+            _result.latency = std::move(phase_samples);
+        }
+    }
+
+    client_shard_result take_result() {
+        return std::move(_result);
+    }
+
+    future<> stop() {
+        std::vector<future<>> pending;
+        pending.reserve(_connections.size());
+        for (auto& connection : _connections) {
+            pending.push_back(connection->stop());
+        }
+        auto results = co_await when_all(pending.begin(), pending.end());
+        _connections.clear();
+        for (auto& result : results) {
+            try {
+                result.get();
+            } catch (...) {
+                ++_result.failures;
+            }
+        }
+    }
+
+private:
+    future<> finish_phase(std::vector<future<>> pending) {
+        auto results = co_await when_all(pending.begin(), pending.end());
+        for (auto& result : results) {
+            try {
+                result.get();
+            } catch (const std::exception& e) {
+                ++_result.failures;
+                std::cerr << "[client shard " << this_shard_id()
+                          << "] benchmark connection failed: " << e.what() << "\n";
+            } catch (...) {
+                ++_result.failures;
+                std::cerr << "[client shard " << this_shard_id()
+                          << "] benchmark connection failed\n";
+            }
+        }
+    }
+
+private:
+    std::vector<std::unique_ptr<benchmark_connection>> _connections;
+    client_shard_result _result;
+};
 
 // ---------------------------------------------------------------------------
 // Statistics printers
@@ -469,64 +620,36 @@ static unsigned connections_on_shard(unsigned total, unsigned shard) {
     return total / this_smp_shard_count() + (shard < total % this_smp_shard_count() ? 1u : 0u);
 }
 
-static future<throughput_result> run_throughput_shard(
-        quic_client_config base_cfg,
-        unsigned connections,
-        int streams_per_connection,
-        stream_type stype,
-        std::vector<char> msg,
-        time_point deadline,
-        size_t flush_messages) {
-    throughput_result result;
-    std::vector<future<>> connection_futures;
-    connection_futures.reserve(connections);
-    for (unsigned i = 0; i < connections; ++i) {
-        connection_futures.push_back(run_connection_throughput(
-            base_cfg, streams_per_connection, stype, msg, deadline, flush_messages, result));
-    }
-
-    auto results = co_await when_all(connection_futures.begin(), connection_futures.end());
-    for (auto& connection_result : results) {
-        try {
-            connection_result.get();
-        } catch (const std::exception& e) {
-            std::cerr << "[client shard " << this_shard_id()
-                      << "] connection error: " << e.what() << "\n";
-        }
-    }
-    co_return result;
-}
-
-static future<latency_samples> run_latency_shard(
-        quic_client_config base_cfg,
-        unsigned connections,
-        int streams_per_connection,
-        std::vector<char> msg,
-        time_point deadline) {
-    latency_samples samples;
-    std::vector<future<>> connection_futures;
-    connection_futures.reserve(connections);
-    for (unsigned i = 0; i < connections; ++i) {
-        connection_futures.push_back(run_connection_latency(
-            base_cfg, streams_per_connection, msg, deadline, samples));
-    }
-
-    auto results = co_await when_all(connection_futures.begin(), connection_futures.end());
-    for (auto& connection_result : results) {
-        try {
-            connection_result.get();
-        } catch (const std::exception& e) {
-            std::cerr << "[client shard " << this_shard_id()
-                      << "] connection error: " << e.what() << "\n";
-        }
-    }
-    co_return samples;
-}
-
 static void add_result(throughput_result& total, const throughput_result& local) {
-    total.bytes_sent += local.bytes_sent;
-    total.bytes_received += local.bytes_received;
-    total.messages_sent += local.messages_sent;
+    total += local;
+}
+
+static void print_client_shard_results(
+        const std::vector<client_shard_result>& results,
+        double elapsed_s,
+        bool throughput_mode) {
+    fmt::print("\n=== QUIC client shard distribution ===\n");
+    for (unsigned shard = 0; shard < results.size(); ++shard) {
+        const auto& result = results[shard];
+        if (throughput_mode) {
+            fmt::print(
+                "  shard {:2d}: conns={:6d} failures={:4d} tx={:10.2f} MB/s rx={:10.2f} MB/s\n",
+                shard,
+                result.connections,
+                result.failures,
+                static_cast<double>(result.throughput.bytes_sent) / 1e6 / elapsed_s,
+                static_cast<double>(result.throughput.bytes_received) / 1e6 / elapsed_s);
+        } else {
+            fmt::print(
+                "  shard {:2d}: conns={:6d} failures={:4d} latency-samples={:10d}\n",
+                shard,
+                result.connections,
+                result.failures,
+                result.latency.size());
+        }
+    }
+    fmt::print("\n");
+    std::cout.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -561,10 +684,16 @@ int main(int argc, char** argv) {
         ("max-tx-udp-payload-size", bpo::value<uint64_t>()->default_value(benchmark_udp_payload_size),
          "Maximum UDP payload size used for transmitted QUIC packets")
         ("duration", bpo::value<unsigned>()->default_value(10),
-         "Benchmark duration in seconds");
+         "Benchmark duration in seconds")
+        ("warmup", bpo::value<unsigned>()->default_value(2),
+         "Warmup duration in seconds after all connections are established");
 
     return app.run(argc, argv, [&app]() -> future<int> {
+        sharded<benchmark_client_shard> clients;
+        bool clients_started = false;
+        bool connections_stopped = false;
         std::exception_ptr error;
+        bool benchmark_failed = false;
         try {
             auto&& cfg       = app.configuration();
             auto address     = cfg["address"].as<std::string>();
@@ -580,6 +709,7 @@ int main(int argc, char** argv) {
             auto max_udp_payload_size = cfg["max-udp-payload-size"].as<uint64_t>();
             auto max_tx_udp_payload_size = cfg["max-tx-udp-payload-size"].as<uint64_t>();
             auto dur_s       = cfg["duration"].as<unsigned>();
+            auto warmup_s    = cfg["warmup"].as<unsigned>();
 
             if (mode != "throughput" && mode != "latency") {
                 throw std::runtime_error(
@@ -594,6 +724,9 @@ int main(int argc, char** argv) {
             }
             if (msg_size < 1) {
                 throw std::runtime_error("--message-size must be >= 1");
+            }
+            if (dur_s < 1) {
+                throw std::runtime_error("--duration must be >= 1");
             }
             if (max_udp_payload_size < 1200 || max_tx_udp_payload_size < 1200) {
                 throw std::runtime_error("--max-udp-payload-size and --max-tx-udp-payload-size must be >= 1200");
@@ -630,76 +763,129 @@ int main(int argc, char** argv) {
             base_cfg.session_options.transport.max_tx_udp_payload_size = max_tx_udp_payload_size;
             base_cfg.session_options.transport.disable_tx_udp_payload_size_shaping = true;
 
-            const auto deadline = bm_clock::now() + std::chrono::seconds(dur_s);
-
             fmt::print(
-                "[client] mode={} stream-type={} shards={} conns={} streams/conn={} msg={}B dur={}s flush-msgs={}\n",
+                "[client] mode={} stream-type={} shards={} conns={} streams/conn={} msg={}B warmup={}s dur={}s flush-msgs={}\n",
                 mode,
                 stype == stream_type::bidirectional ? "bidi" : "uni",
                 this_smp_shard_count(),
-                n_conns, n_streams, msg_size, dur_s, flush_messages);
+                n_conns, n_streams, msg_size, warmup_s, dur_s, flush_messages);
             fmt::print(
                 "[client] udp-payload={}B tx-udp-payload={}B\n",
                 max_udp_payload_size,
                 max_tx_udp_payload_size);
             std::cout.flush();
 
-            // ------------------------------------------------------------------
-            // Throughput benchmark
-            // ------------------------------------------------------------------
+            co_await clients.start();
+            clients_started = true;
+            co_await clients.invoke_on_all(
+                [base_cfg, n_conns] (benchmark_client_shard& shard) mutable {
+                    auto local_connections = connections_on_shard(
+                        static_cast<unsigned>(n_conns), this_shard_id());
+                    return shard.connect(std::move(base_cfg), local_connections);
+                });
+            fmt::print("[client] all {} connections established\n", n_conns);
+            std::cout.flush();
+
+            if (warmup_s > 0) {
+                fmt::print("[client] warmup started\n");
+                std::cout.flush();
+                auto warmup_deadline = bm_clock::now() + std::chrono::seconds(warmup_s);
+                if (mode == "throughput") {
+                    co_await clients.invoke_on_all(
+                        [n_streams, stype, msg, warmup_deadline, flush_messages]
+                        (benchmark_client_shard& shard) mutable {
+                            return shard.run_throughput(
+                                n_streams, stype, std::move(msg), warmup_deadline,
+                                flush_messages, false);
+                        });
+                } else {
+                    co_await clients.invoke_on_all(
+                        [n_streams, msg, warmup_deadline]
+                        (benchmark_client_shard& shard) mutable {
+                            return shard.run_latency(
+                                n_streams, std::move(msg), warmup_deadline, false);
+                        });
+                }
+            }
+
+            fmt::print("[client] measurement started\n");
+            std::cout.flush();
+            auto deadline = bm_clock::now() + std::chrono::seconds(dur_s);
+            if (mode == "throughput") {
+                co_await clients.invoke_on_all(
+                    [n_streams, stype, msg, deadline, flush_messages]
+                    (benchmark_client_shard& shard) mutable {
+                        return shard.run_throughput(
+                            n_streams, stype, std::move(msg), deadline,
+                            flush_messages, true);
+                    });
+            } else {
+                co_await clients.invoke_on_all(
+                    [n_streams, msg, deadline]
+                    (benchmark_client_shard& shard) mutable {
+                        return shard.run_latency(
+                            n_streams, std::move(msg), deadline, true);
+                    });
+            }
+
+            co_await clients.invoke_on_all(&benchmark_client_shard::stop);
+            connections_stopped = true;
+
+            std::vector<client_shard_result> shard_results;
+            shard_results.reserve(this_smp_shard_count());
+            for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
+                shard_results.push_back(co_await clients.invoke_on(
+                    shard, [] (benchmark_client_shard& local) {
+                        return local.take_result();
+                    }));
+            }
+            co_await clients.stop();
+            clients_started = false;
+
+            const double elapsed_s = static_cast<double>(dur_s);
+            print_client_shard_results(shard_results, elapsed_s, mode == "throughput");
+            unsigned failures = 0;
+            for (const auto& local : shard_results) {
+                failures += local.failures;
+            }
+
             if (mode == "throughput") {
                 throughput_result total;
-                const auto bench_start = bm_clock::now();
-
-                std::vector<future<throughput_result>> shard_futures;
-                shard_futures.reserve(this_smp_shard_count());
-                for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
-                    const auto local_connections = connections_on_shard(n_conns, shard);
-                    shard_futures.push_back(smp::submit_to(shard,
-                        [base_cfg, local_connections, n_streams, stype, msg, deadline, flush_messages] () mutable {
-                            return run_throughput_shard(std::move(base_cfg), local_connections,
-                                n_streams, stype, std::move(msg), deadline, flush_messages);
-                        }));
-                }
-
-                auto shard_results = co_await when_all_succeed(
-                    shard_futures.begin(), shard_futures.end());
                 for (const auto& local : shard_results) {
-                    add_result(total, local);
+                    add_result(total, local.throughput);
                 }
-
-                const auto elapsed = std::chrono::duration<double>(
-                    deadline - bench_start).count();
-                print_throughput(total, elapsed, stype, n_conns, n_streams, msg_size);
+                print_throughput(total, elapsed_s, stype, n_conns, n_streams, msg_size);
             } else {
                 latency_samples all_samples;
-                const auto bench_start = bm_clock::now();
-
-                std::vector<future<latency_samples>> shard_futures;
-                shard_futures.reserve(this_smp_shard_count());
-                for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
-                    const auto local_connections = connections_on_shard(n_conns, shard);
-                    shard_futures.push_back(smp::submit_to(shard,
-                        [base_cfg, local_connections, n_streams, msg, deadline] () mutable {
-                            return run_latency_shard(std::move(base_cfg), local_connections,
-                                n_streams, std::move(msg), deadline);
-                        }));
-                }
-
-                auto shard_results = co_await when_all_succeed(
-                    shard_futures.begin(), shard_futures.end());
                 for (auto& local : shard_results) {
-                    all_samples.insert(all_samples.end(),
-                        std::make_move_iterator(local.begin()),
-                        std::make_move_iterator(local.end()));
+                    all_samples.insert(
+                        all_samples.end(),
+                        std::make_move_iterator(local.latency.begin()),
+                        std::make_move_iterator(local.latency.end()));
                 }
+                print_latency(all_samples, elapsed_s, stype, n_conns, n_streams, msg_size);
+            }
 
-                const auto elapsed = std::chrono::duration<double>(
-                    deadline - bench_start).count();
-                print_latency(all_samples, elapsed, stype, n_conns, n_streams, msg_size);
+            if (failures > 0) {
+                std::cerr << "[client] benchmark completed with " << failures
+                          << " failed connection phases\n";
+                benchmark_failed = true;
             }
         } catch (...) {
             error = std::current_exception();
+        }
+
+        if (clients_started) {
+            if (!connections_stopped) {
+                try {
+                    co_await clients.invoke_on_all(&benchmark_client_shard::stop);
+                } catch (...) {
+                }
+            }
+            try {
+                co_await clients.stop();
+            } catch (...) {
+            }
         }
 
         if (error) {
@@ -713,6 +899,6 @@ int main(int argc, char** argv) {
             co_return 1;
         }
 
-        co_return 0;
+        co_return benchmark_failed ? 1 : 0;
     });
 }
