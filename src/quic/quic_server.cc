@@ -246,21 +246,21 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         return server.get();
     }
 
-    bool transport_active() const noexcept {
+    bool transport_active() const noexcept override {
         return active();
     }
 
-    bool has_transport_connection() const noexcept {
+    bool has_transport_connection() const noexcept override {
         return conn != nullptr;
     }
 
-    bool can_retry_blocked_open_streams() const noexcept {
+    bool can_retry_blocked_open_streams() const noexcept override {
         // Server streams can open as soon as the connection is active; no client-side
         // handshake promise gate is needed here.
         return active() && !stop_requested;
     }
 
-    size_t tx_payload_limit_bytes() const noexcept {
+    size_t tx_payload_limit_bytes() const noexcept override {
         return tx_payload_limit;
     }
 
@@ -292,7 +292,7 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         connection_state->wake_actor();
     }
 
-    void retain_stream_data(stream_id sid, temporary_buffer<char> payload) {
+    void retain_stream_data(stream_id sid, temporary_buffer<char> payload) override {
         if (sid == invalid_stream_id || payload.empty()) {
             return;
         }
@@ -337,7 +337,7 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         next_stream_send_offsets.erase(sid);
     }
 
-    int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) {
+    int64_t write_pending_packet(uint8_t* outbuf, size_t outbuf_size) override {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -351,7 +351,7 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
       size_t len,
       bool fin,
       uint8_t* outbuf,
-      size_t outbuf_size) {
+      size_t outbuf_size) override {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -380,13 +380,13 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         };
     }
 
-    void complete_send_bytes(size_t len) {
+    void complete_send_bytes(size_t len) override {
         if (command_runtime) {
             command_runtime->complete_send_bytes(len);
         }
     }
 
-    internal::transport_open_stream_result try_open_stream(stream_type type) {
+    internal::transport_open_stream_result try_open_stream(stream_type type) override {
         int64_t sid = invalid_stream_id;
         auto rv = type == stream_type::bidirectional
                     ? ngtcp2_conn_open_bidi_stream(conn, &sid, nullptr)
@@ -397,11 +397,11 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         };
     }
 
-    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) {
+    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) override {
         return ngtcp2_conn_shutdown_stream_write(conn, 0, sid, app_error_code);
     }
 
-    int consume_stream_data(stream_id sid, size_t len) {
+    int consume_stream_data(stream_id sid, size_t len) override {
         if (!conn || !len) {
             return 0;
         }
@@ -413,11 +413,11 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         return 0;
     }
 
-    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) {
+    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override {
         return ngtcp2_conn_shutdown_stream_read(conn, 0, sid, app_error_code);
     }
 
-    int read_transport_datagram(const socket_address& src, const char* data, size_t len) {
+    int read_transport_datagram(const socket_address& src, const char* data, size_t len) override {
         sockaddr_storage peer_addr_ss{};
         socklen_t peer_addr_ss_len = 0;
         to_sockaddr_storage(src, peer_addr_ss, peer_addr_ss_len);
@@ -435,27 +435,27 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
           quic_now_ns());
     }
 
-    void sync_transport_path() {
+    void sync_transport_path() override {
         sync_current_path(*this);
     }
 
-    uint64_t transport_expiry_ns() const noexcept {
+    uint64_t transport_expiry_ns() const noexcept override {
         return ngtcp2_conn_get_expiry(conn);
     }
 
-    int handle_transport_expiry(uint64_t now_local) {
+    int handle_transport_expiry(uint64_t now_local) override {
         return ngtcp2_conn_handle_expiry(conn, now_local);
     }
 
-    temporary_buffer<char>& tx_packet_buffer() {
+    temporary_buffer<char>& tx_packet_buffer() override {
         return tx_packet_scratch;
     }
 
-    future<> send_datagram_packet(temporary_buffer<char> packet);
+    future<> send_datagram_packet(temporary_buffer<char> packet) override;
 
-    bool can_send_connection_close() const noexcept;
+    bool can_send_connection_close() const noexcept override;
 
-    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) {
+    int64_t write_connection_close_packet(uint8_t* outbuf, size_t outbuf_size) override {
         ngtcp2_path path{};
         fill_path(path);
         ngtcp2_pkt_info pkt_info{};
@@ -472,7 +472,7 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
           quic_now_ns());
     }
 
-    void on_stream_write_closed(stream_id sid) {
+    void on_stream_write_closed(stream_id sid) override {
         if (!connection_state || !conn) {
             return;
         }
@@ -481,7 +481,7 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         connection_state->on_stream_stop_sending(sid, type, peer_initiated, 0, internal::stream_shutdown_side::write);
     }
 
-    void rearm_transport_timer() {
+    void rearm_transport_timer() override {
         // Store timer state in connection_state so callbacks can wake the actor.
         if (!connection_state) {
             return;
@@ -493,7 +493,7 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         connection_state->rearm_timer_from_expiry(ngtcp2_conn_get_expiry(conn), quic_now_ns(), closing);
     }
 
-    void request_close() {
+    void request_close() override {
         request_stop();
     }
 
@@ -512,7 +512,7 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         rx_queue.abort(ex);
     }
 
-    void complete_open_stream(internal::open_stream_result_ptr result, stream_id sid) {
+    void complete_open_stream(internal::open_stream_result_ptr result, stream_id sid) override {
         if (command_runtime) {
             command_runtime->complete_open_stream(std::move(result), sid);
         }
@@ -521,21 +521,21 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
     void fail_open_stream(
       internal::open_stream_result_ptr result,
       quic_error_code error,
-      sstring detail) {
+      sstring detail) override {
         if (command_runtime) {
             command_runtime->fail_open_stream(std::move(result), error, std::move(detail));
         }
     }
 
-    bool blocked_open_stream_retry_pending(stream_type type) const noexcept {
+    bool blocked_open_stream_retry_pending(stream_type type) const noexcept override {
         return connection_state->blocked_open_stream_retry_pending(type);
     }
 
-    void defer_blocked_open_stream(transport_command cmd) {
+    void defer_blocked_open_stream(transport_command cmd) override {
         connection_state->defer_blocked_open_stream(std::move(cmd));
     }
 
-    std::optional<transport_command> pop_blocked_open_stream(stream_type type) {
+    std::optional<transport_command> pop_blocked_open_stream(stream_type type) override {
         return connection_state->pop_blocked_open_stream(type);
     }
 
@@ -610,7 +610,7 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         blocked_send_retry_requested.clear();
     }
 
-    void clear_blocked_open_stream_retry(stream_type type) noexcept {
+    void clear_blocked_open_stream_retry(stream_type type) noexcept override {
         connection_state->clear_blocked_open_stream_retry(type);
     }
 
@@ -716,9 +716,9 @@ struct server_connection final : public enable_lw_shared_from_this<server_connec
         connection_state->clear_tick();
     }
     future<> actor_handle_timer_tick();
-    void stop_transport();
+    void stop_transport() override;
     void fail(quic_error_code error, const sstring& detail);
-    void fail_transport(quic_error_code error, sstring detail);
+    void fail_transport(quic_error_code error, sstring detail) override;
 };
 
 using conn_ptr = lw_shared_ptr<server_connection>;
