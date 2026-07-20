@@ -57,6 +57,9 @@ struct quic_server_config {
 
     /// Runtime and transport limits for accepted connections.
     connection_options session_options{};
+
+    /// Allows multiple UDP sockets to bind the same endpoint for kernel fanout.
+    bool reuse_port = false;
 };
 
 /// Server-side owner of the listening transport and accepted QUIC connections.

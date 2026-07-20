@@ -264,6 +264,8 @@ public:
             throw_quic_error(quic_error_code::invalid_state, "sharded QUIC server already started");
         }
 
+        config.reuse_port = this_smp_shard_count() > 1;
+
         co_await _shards->start();
         _shards_started = true;
 

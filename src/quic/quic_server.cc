@@ -798,7 +798,9 @@ public:
             throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
         }
 
-        _channel = engine().net().make_bound_datagram_channel(_cfg.listen_address);
+        _channel = engine().net().make_bound_datagram_channel(
+          _cfg.listen_address,
+          net::datagram_channel_options{.reuse_port = _cfg.reuse_port});
         _channel_ready = true;
         _listen_address = _channel.local_address();
         _started = true;
