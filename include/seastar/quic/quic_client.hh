@@ -30,21 +30,35 @@
 
 namespace seastar::quic::experimental {
 
+namespace internal {
 class quic_client_impl;
+}
 
-// Configuration for a single outbound QUIC connection attempt.
+/// Configuration for a single outbound QUIC connection attempt.
 struct quic_client_config {
+    /// Remote UDP endpoint to connect to.
     socket_address remote_address;
+
+    /// Local UDP endpoint to bind, or any address in the remote address family.
     std::optional<socket_address> local_address{};
+
+    /// Server Name Indication value used for TLS certificate validation.
     sstring server_name = "localhost";
+
+    /// Optional CA bundle used to validate the server certificate.
     std::optional<sstring> ca_file{};
+
+    /// ALPN protocols offered during the TLS handshake.
     std::vector<sstring> alpns = {sstring("h3")};
+
+    /// Runtime and transport limits for the resulting connection.
     connection_options session_options{};
 };
 
-// Client-side owner of the transport state that yields one established connection.
+/// Client-side owner of transport state that yields one established connection.
 class quic_client final {
 public:
+    /// Constructs a stopped QUIC client.
     quic_client();
     ~quic_client();
 
@@ -54,11 +68,14 @@ public:
     quic_client(const quic_client&) = delete;
     quic_client& operator=(const quic_client&) = delete;
 
+    /// Opens a QUIC connection using config.
     future<connection> connect(quic_client_config config);
+
+    /// Stops background transport work and closes the UDP channel.
     future<> stop();
 
 private:
-    std::unique_ptr<quic_client_impl> _impl;
+    std::unique_ptr<internal::quic_client_impl> _impl;
 };
 
 } // namespace seastar::quic::experimental

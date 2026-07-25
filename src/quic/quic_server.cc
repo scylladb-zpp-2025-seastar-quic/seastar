@@ -25,6 +25,7 @@
 #include "quic_impl.hh"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -135,7 +136,7 @@ void sync_current_path(server_connection& conn);
 
 // Per-peer server-side transport state created after the first Initial packet.
 struct server_connection : public enable_lw_shared_from_this<server_connection> {
-    std::weak_ptr<quic_server_impl> server;
+    std::weak_ptr<internal::quic_server_impl> server;
     internal::command_runtime_ptr command_runtime;
     internal::connection_state_ptr connection_state;
 
@@ -201,7 +202,7 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&peer_ss), peer_ss_len);
     }
 
-    std::shared_ptr<quic_server_impl> lock_server() const {
+    std::shared_ptr<internal::quic_server_impl> lock_server() const {
         return server.lock();
     }
 
@@ -721,11 +722,13 @@ void sync_current_path(server_connection& conn) {
 
 } // namespace
 
+namespace internal {
+
 // Owns the listener socket and tracks the set of active server-side connections.
-class quic_server_impl : public std::enable_shared_from_this<quic_server_impl> {
+class quic_server_impl final : public std::enable_shared_from_this<quic_server_impl> {
 public:
     quic_server_impl() = default;
-    virtual ~quic_server_impl() {
+    ~quic_server_impl() {
         request_stop_detached();
         cleanup_resources();
     }
@@ -775,7 +778,7 @@ public:
         co_return;
     }
 
-    future<internal::connection_state_ptr> accept() {
+    future<connection_state_ptr> accept() {
         if (!_started) {
             throw_quic_error(quic_error_code::invalid_state, "server is not started");
         }
@@ -926,7 +929,7 @@ public:
         quic_server_log.info("server connection unregistered: active_conns={} mapped_dcids={}", _conns.size(), _by_dcid.size());
     }
 
-    void enqueue_accepted_session(const internal::connection_state_ptr& connection_state) {
+    void enqueue_accepted_session(const connection_state_ptr& connection_state) {
         // Listener accept observes handshake-ready connections, not raw Initial packets.
         _accepted.push_back(connection_state);
         quic_server_log.debug("server queued accepted session: pending_accepted={}", _accepted.size());
@@ -1122,7 +1125,7 @@ private:
         }
         auto type = ngtcp2_is_bidi_stream(sid) ? stream_type::bidirectional : stream_type::unidirectional;
         auto peer_initiated = !ngtcp2_conn_is_local_stream(ngconn, sid);
-        conn->connection_state->on_stream_stop_sending(sid, type, peer_initiated, app_error_code, internal::stream_shutdown_side::write);
+        conn->connection_state->on_stream_stop_sending(sid, type, peer_initiated, app_error_code, stream_shutdown_side::write);
         return 0;
     }
 
@@ -1233,8 +1236,8 @@ private:
         }
         auto conn = make_lw_shared<server_connection>();
         conn->server = shared_from_this();
-        conn->command_runtime = internal::make_command_runtime(_cfg.session_options);
-        conn->connection_state = internal::make_connection_state(conn->command_runtime, _cfg.session_options);
+        conn->command_runtime = make_command_runtime(_cfg.session_options);
+        conn->connection_state = make_connection_state(conn->command_runtime, _cfg.session_options);
         conn->command_runtime->set_command_notifier([raw = conn.get()] {
             raw->wake_actor();
         });
@@ -1294,9 +1297,9 @@ private:
         ngtcp2_settings settings{};
         ngtcp2_settings_default(&settings);
         settings.initial_ts = quic_now_ns();
-        if (_cfg.session_options.transport.initial_rtt_ns
-            && *_cfg.session_options.transport.initial_rtt_ns > 0) {
-            settings.initial_rtt = *_cfg.session_options.transport.initial_rtt_ns;
+        if (_cfg.session_options.transport.initial_rtt
+            && *_cfg.session_options.transport.initial_rtt > std::chrono::nanoseconds::zero()) {
+            settings.initial_rtt = static_cast<uint64_t>(_cfg.session_options.transport.initial_rtt->count());
         }
         if (_cfg.session_options.transport.max_tx_udp_payload_size) {
             settings.max_tx_udp_payload_size = *_cfg.session_options.transport.max_tx_udp_payload_size;
@@ -1335,7 +1338,7 @@ private:
           _cfg.session_options.transport.initial_max_data);
         params.initial_max_streams_bidi = _cfg.session_options.transport.initial_max_streams_bidi;
         params.initial_max_streams_uni = _cfg.session_options.transport.initial_max_streams_uni;
-        params.max_idle_timeout = _cfg.session_options.transport.max_idle_timeout_ns;
+        params.max_idle_timeout = static_cast<uint64_t>(_cfg.session_options.transport.max_idle_timeout.count());
         if (_cfg.session_options.transport.max_udp_payload_size) {
             params.max_udp_payload_size = *_cfg.session_options.transport.max_udp_payload_size;
         }
@@ -1400,7 +1403,7 @@ private:
     }
 
     static future<> flush_pending_packets_actor(conn_ptr conn) {
-        co_await internal::flush_pending_transport_packets(conn->transport);
+        co_await flush_pending_transport_packets(conn->transport);
     }
 
     static future<> conn_actor_loop(conn_ptr conn) {
@@ -1546,10 +1549,12 @@ private:
     gate _task_gate;
     future<> _send_tail = make_ready_future<>();
     condition_variable _accept_cv;
-    std::deque<internal::connection_state_ptr> _accepted;
+    std::deque<connection_state_ptr> _accepted;
     std::unordered_map<std::string, conn_ptr> _by_dcid;
     std::vector<conn_ptr> _conns;
 };
+
+} // namespace internal
 
 bool server_connection::active() const noexcept {
     return !closing && command_runtime && !server.expired();
@@ -1658,7 +1663,7 @@ void server_connection::fail_transport(quic_error_code error, sstring detail) {
 }
 
 quic_server::quic_server()
-    : _impl(std::make_shared<quic_server_impl>()) {
+    : _impl(std::make_shared<internal::quic_server_impl>()) {
 }
 
 quic_server::~quic_server() {
