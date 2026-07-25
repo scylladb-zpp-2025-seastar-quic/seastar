@@ -1383,7 +1383,7 @@ public:
               st->tx_payload_limit,
               st->command_runtime->selected_alpn());
         } catch (const quic_error& e) {
-            quic_client_log.error("client connect failed: code={} detail='{}'", to_string(e.code()), e.what());
+            quic_client_log.error("client connect failed: code={} detail='{}'", e.code().message(), e.what());
             init_error = std::current_exception();
         } catch (...) {
             quic_client_log.error("client connect failed: unexpected exception");

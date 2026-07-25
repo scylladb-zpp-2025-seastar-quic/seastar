@@ -21,6 +21,9 @@
 
 #include "quic_error_impl.hh"
 
+#include <system_error>
+#include <utility>
+
 #include <ngtcp2/ngtcp2.h>
 
 #include <gnutls/gnutls.h>
@@ -53,15 +56,40 @@ const char* to_string(quic_error_code error) noexcept {
     return "unknown";
 }
 
-quic_error::quic_error(quic_error_code error, std::string detail)
-    : std::runtime_error(detail.empty()
-              ? std::string(to_string(error))
-              : std::string(to_string(error)) + ": " + detail)
-    , _error(error) {
+namespace {
+
+class quic_error_category_impl final : public std::error_category {
+public:
+    const char* name() const noexcept override {
+        return "seastar.quic";
+    }
+
+    std::string message(int ev) const override {
+        return to_string(static_cast<quic_error_code>(ev));
+    }
+};
+
+std::system_error make_quic_system_error(quic_error_code error, std::string detail) {
+    auto code = make_error_code(error);
+    if (detail.empty()) {
+        return std::system_error(code);
+    }
+    return std::system_error(code, std::move(detail));
 }
 
-quic_error_code quic_error::code() const noexcept {
-    return _error;
+} // namespace
+
+const std::error_category& quic_error_category() noexcept {
+    static const quic_error_category_impl category;
+    return category;
+}
+
+std::error_code make_error_code(quic_error_code error) noexcept {
+    return {static_cast<int>(error), quic_error_category()};
+}
+
+quic_error::quic_error(quic_error_code error, std::string detail)
+    : std::system_error(make_quic_system_error(error, std::move(detail))) {
 }
 
 [[noreturn]] void throw_quic_error(quic_error_code error, std::string_view detail) {

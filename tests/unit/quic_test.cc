@@ -1845,7 +1845,8 @@ SEASTAR_TEST_CASE(test_quic_error_strings_and_exception_details) {
 
     quic_error detailed(quic_error::protocol, "bad packet");
     BOOST_REQUIRE(detailed.code() == quic_error::protocol);
-    BOOST_REQUIRE_EQUAL(std::string(detailed.what()), "protocol: bad packet");
+    BOOST_REQUIRE_EQUAL(std::string(detailed.what()), "bad packet: protocol");
+    BOOST_REQUIRE(plain.code().category() == quic_error_category());
     return make_ready_future<>();
 }
 
