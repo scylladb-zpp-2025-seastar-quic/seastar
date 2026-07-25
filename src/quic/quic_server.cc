@@ -740,6 +740,7 @@ public:
         }
         ensure_gnutls_global();
         validate_ip_socket_address(cfg.listen_address, "listen_address");
+        validate_alpn_protocols(cfg.alpns);
         quic_server_log.info(
           "server start: listen={} crt_file='{}' key_file='{}' alpn_count={}",
           cfg.listen_address,
@@ -1016,6 +1017,13 @@ private:
         if (!conn || !conn->command_runtime) {
             return 0;
         }
+        auto selected_alpn = selected_alpn_or_empty(conn->tls);
+        if (selected_alpn.empty()) {
+            constexpr std::string_view detail = "TLS handshake completed without a negotiated ALPN protocol";
+            quic_server_log.warn("server handshake verification failed: peer={} detail='{}'", conn->peer, detail);
+            conn->fail(quic_error_code::protocol, sstring(detail));
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
         auto server = conn->server_impl();
         conn->handshake_done = true;
         sync_current_path(*conn);
@@ -1023,7 +1031,7 @@ private:
           to_socket_address(ngtcp2_conn_get_path(conn->conn)->local).value_or(
             server ? server->listen_address() : socket_address{}),
           conn->peer,
-          selected_alpn_or_empty(conn->tls));
+          std::move(selected_alpn));
         if (!conn->accepted_to_listener && server && conn->connection_state) {
             conn->accepted_to_listener = true;
             server->enqueue_accepted_session(conn->connection_state);
@@ -1196,7 +1204,7 @@ private:
             });
         }
         if (!alpns.empty()) {
-            rv = gnutls_alpn_set_protocols(tls, alpns.data(), alpns.size(), 0);
+            rv = gnutls_alpn_set_protocols(tls, alpns.data(), alpns.size(), GNUTLS_ALPN_MANDATORY);
             if (rv < 0) {
                 gnutls_deinit(tls);
                 throw_quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
@@ -1684,6 +1692,10 @@ future<connection> quic_server::accept() {
     quic_server_log.debug("quic_server::accept");
     auto connection_state = co_await _impl->accept();
     co_return connection(std::make_unique<connection::impl>(std::move(connection_state)));
+}
+
+socket_address quic_server::local_address() const noexcept {
+    return _impl ? _impl->listen_address() : socket_address{};
 }
 
 future<> quic_server::stop() {

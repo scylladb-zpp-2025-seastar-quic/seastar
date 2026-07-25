@@ -487,6 +487,71 @@ connection_options large_payload_options() {
     return options;
 }
 
+future<> require_quic_handshake_rejected(
+  sstring server_name,
+  sstring ca_file,
+  std::vector<sstring> client_alpns,
+  std::vector<sstring> server_alpns = {sstring("h3")},
+  std::optional<quic_error_code> expected_error = quic_error::protocol) {
+    quic_server server;
+    quic_client client;
+    std::optional<connection> session;
+    std::exception_ptr error;
+    bool rejected = false;
+
+    try {
+        quic_server_config server_cfg;
+        server_cfg.listen_address = make_ipv4_address({0x7f000001, 0});
+        server_cfg.crt_file = "test.crt";
+        server_cfg.key_file = "test.key";
+        server_cfg.alpns = std::move(server_alpns);
+        co_await server.start(std::move(server_cfg));
+
+        quic_client_config client_cfg;
+        client_cfg.remote_address = server.local_address();
+        client_cfg.server_name = std::move(server_name);
+        client_cfg.ca_file = std::move(ca_file);
+        client_cfg.alpns = std::move(client_alpns);
+        session.emplace(co_await client.connect(std::move(client_cfg)));
+    } catch (const quic_error& e) {
+        rejected = true;
+        if (expected_error && e.code() != *expected_error) {
+            error = std::current_exception();
+        }
+    } catch (...) {
+        error = std::current_exception();
+    }
+
+    if (session) {
+        try {
+            co_await session->close();
+        } catch (...) {
+            if (!error) {
+                error = std::current_exception();
+            }
+        }
+    }
+    try {
+        co_await client.stop();
+    } catch (...) {
+        if (!error) {
+            error = std::current_exception();
+        }
+    }
+    try {
+        co_await server.stop();
+    } catch (...) {
+        if (!error) {
+            error = std::current_exception();
+        }
+    }
+
+    if (error) {
+        std::rethrow_exception(error);
+    }
+    BOOST_REQUIRE(rejected);
+}
+
 } // namespace
 
 SEASTAR_TEST_CASE(test_quic_default_public_objects_are_safe) {
@@ -780,6 +845,60 @@ SEASTAR_TEST_CASE(test_quic_client_server_handles_large_framed_request) {
     if (error) {
         std::rethrow_exception(error);
     }
+}
+
+SEASTAR_TEST_CASE(test_quic_client_rejects_certificate_for_wrong_server_name) {
+    return require_quic_handshake_rejected(
+      "wrong.scylladb.org", "test.crt", {sstring("h3")});
+}
+
+SEASTAR_TEST_CASE(test_quic_client_rejects_untrusted_server_certificate) {
+    return require_quic_handshake_rejected(
+      "test.scylladb.org", "other.crt", {sstring("h3")});
+}
+
+SEASTAR_TEST_CASE(test_quic_handshake_rejects_missing_common_alpn) {
+    return require_quic_handshake_rejected(
+      "test.scylladb.org",
+      "test.crt",
+      {sstring("custom-client-protocol")},
+      {sstring("h3")},
+      std::nullopt);
+}
+
+SEASTAR_TEST_CASE(test_quic_client_rejects_empty_alpn_configuration) {
+    return seastar::async([] {
+        quic_client client;
+        quic_client_config cfg;
+        cfg.remote_address = make_ipv4_address({0x7f000001, 4433});
+        cfg.alpns.clear();
+
+        require_quic_future_exception(client.connect(std::move(cfg)), quic_error::invalid_argument);
+    });
+}
+
+SEASTAR_TEST_CASE(test_quic_client_rejects_empty_alpn_identifier) {
+    return seastar::async([] {
+        quic_client client;
+        quic_client_config cfg;
+        cfg.remote_address = make_ipv4_address({0x7f000001, 4433});
+        cfg.alpns = {sstring()};
+
+        require_quic_future_exception(client.connect(std::move(cfg)), quic_error::invalid_argument);
+    });
+}
+
+SEASTAR_TEST_CASE(test_quic_server_rejects_empty_alpn_configuration) {
+    return seastar::async([] {
+        quic_server server;
+        quic_server_config cfg;
+        cfg.listen_address = make_ipv4_address({0x7f000001, 0});
+        cfg.crt_file = "unused.crt";
+        cfg.key_file = "unused.key";
+        cfg.alpns.clear();
+
+        require_quic_future_exception(server.start(std::move(cfg)), quic_error::invalid_argument);
+    });
 }
 
 SEASTAR_TEST_CASE(test_quic_connection_metadata_tracks_transport_ready) {

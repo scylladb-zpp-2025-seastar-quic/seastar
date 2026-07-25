@@ -142,6 +142,21 @@ void validate_ip_socket_address(const socket_address& sa, std::string_view what)
     }
 }
 
+void validate_alpn_protocols(const std::vector<sstring>& alpns) {
+    if (alpns.empty()) {
+        throw_quic_error(
+          quic_error_code::invalid_argument,
+          "at least one ALPN protocol must be configured");
+    }
+    for (const auto& alpn : alpns) {
+        if (alpn.empty()) {
+            throw_quic_error(
+              quic_error_code::invalid_argument,
+              "ALPN protocol identifiers must not be empty");
+        }
+    }
+}
+
 std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr) {
     if (!addr.addr || addr.addrlen == 0) {
         return std::nullopt;

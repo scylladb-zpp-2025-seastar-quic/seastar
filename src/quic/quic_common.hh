@@ -25,6 +25,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include <ngtcp2/ngtcp2.h>
 
@@ -44,6 +45,7 @@ const ngtcp2_mem* ngtcp2_mem_for_thread();
 void init_ngtcp2_addr(ngtcp2_addr* addr, const sockaddr* sa, size_t len);
 void to_sockaddr_storage(const socket_address& sa, sockaddr_storage& out, socklen_t& outlen);
 void validate_ip_socket_address(const socket_address& sa, std::string_view what);
+void validate_alpn_protocols(const std::vector<sstring>& alpns);
 std::optional<socket_address> to_socket_address(const ngtcp2_addr& addr);
 
 ngtcp2_tstamp quic_now_ns() noexcept;

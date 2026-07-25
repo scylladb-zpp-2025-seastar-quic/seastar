@@ -44,7 +44,8 @@ struct quic_server_config {
     /// PEM private key file used by the server TLS session.
     sstring key_file;
 
-    /// ALPN protocols advertised during the TLS handshake.
+    /// Non-empty ALPN protocols advertised during the TLS handshake.
+    /// The list and each protocol identifier must be non-empty.
     std::vector<sstring> alpns = {sstring("h3")};
 
     /// Runtime and transport limits for accepted connections.
@@ -69,6 +70,9 @@ public:
 
     /// Waits for the next connection that completed the QUIC and TLS handshakes.
     future<connection> accept();
+
+    /// Returns the local UDP endpoint currently used by the server.
+    socket_address local_address() const noexcept;
 
     /// Stops the listener and all server-owned connections.
     future<> stop();

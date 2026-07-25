@@ -857,10 +857,17 @@ int handshake_completed_cb(ngtcp2_conn*, void* user_data) {
         st->fail(verification_failure->error, verification_failure->detail);
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
+    auto selected_alpn = selected_alpn_or_empty(st->tls);
+    if (selected_alpn.empty()) {
+        constexpr std::string_view detail = "TLS handshake completed without a negotiated ALPN protocol";
+        quic_client_log.warn("client handshake verification failed: detail='{}'", detail);
+        st->fail(quic_error_code::protocol, sstring(detail));
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     st->handshake_done = true;
     // Publish readiness only after certificate verification and final path sync.
     sync_current_path(*st);
-    st->command_runtime->mark_transport_ready(st->local_address, st->remote_address, selected_alpn_or_empty(st->tls));
+    st->command_runtime->mark_transport_ready(st->local_address, st->remote_address, std::move(selected_alpn));
     st->resolve_handshake_ready();
     quic_client_log.info("client handshake completed");
 
@@ -1037,7 +1044,7 @@ void init_tls(client_state& st) {
     }
     if (!alpns.empty()) {
         // GnuTLS borrows ALPN buffers for the call only, so the local vector is enough.
-        rv = gnutls_alpn_set_protocols(st.tls, alpns.data(), alpns.size(), 0);
+        rv = gnutls_alpn_set_protocols(st.tls, alpns.data(), alpns.size(), GNUTLS_ALPN_MANDATORY);
         if (rv < 0) {
             throw quic_error(classify_gnutls_error(rv), gnutls_error_message(rv));
         }
@@ -1330,6 +1337,7 @@ public:
         if (_state) {
             throw_quic_error(quic_error_code::invalid_state, "client is already connected");
         }
+        validate_alpn_protocols(config.alpns);
         ensure_gnutls_global();
         quic_client_log.info(
           "client connect start: remote={} local={} server_name='{}' alpn_count={}",

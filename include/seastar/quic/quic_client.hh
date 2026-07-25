@@ -48,7 +48,8 @@ struct quic_client_config {
     /// Optional CA bundle used to validate the server certificate.
     std::optional<sstring> ca_file{};
 
-    /// ALPN protocols offered during the TLS handshake.
+    /// Non-empty ALPN protocols offered during the TLS handshake.
+    /// The list and each protocol identifier must be non-empty.
     std::vector<sstring> alpns = {sstring("h3")};
 
     /// Runtime and transport limits for the resulting connection.
