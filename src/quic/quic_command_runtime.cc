@@ -105,7 +105,7 @@ public:
 
     future<stream_id> open_stream(stream_type type) override {
         throw_if_terminal("open_stream");
-        auto result = std::make_shared<promise<stream_id>>();
+        auto result = make_lw_shared<promise<stream_id>>();
         _commands.emplace_back(transport_command{
           .op = transport_command::kind::open_stream,
           .type = type,
@@ -208,13 +208,13 @@ public:
         _command_notifier = std::move(notifier);
     }
 
-    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) override {
+    void complete_open_stream(internal::open_stream_result_ptr result, stream_id sid) override {
         if (result) {
             result->set_value(sid);
         }
     }
 
-    void fail_open_stream(std::shared_ptr<promise<stream_id>> result, quic_error_code error, sstring detail) override {
+    void fail_open_stream(internal::open_stream_result_ptr result, quic_error_code error, sstring detail) override {
         if (result) {
             result->set_exception(std::make_exception_ptr(quic_error(error, detail)));
         }
@@ -292,7 +292,7 @@ private:
         for (auto& cmd : _commands) {
             if (cmd.op == transport_command::kind::open_stream && cmd.open_result) {
                 cmd.open_result->set_exception(ex);
-                cmd.open_result.reset();
+                cmd.open_result = {};
             }
         }
     }

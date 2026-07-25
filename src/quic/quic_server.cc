@@ -54,6 +54,7 @@
 #include <seastar/core/queue.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/weak_ptr.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/util/log.hh>
 
@@ -136,7 +137,7 @@ void sync_current_path(server_connection& conn);
 
 // Per-peer server-side transport state created after the first Initial packet.
 struct server_connection : public enable_lw_shared_from_this<server_connection> {
-    std::weak_ptr<internal::quic_server_impl> server;
+    weak_ptr<internal::quic_server_impl> server;
     internal::command_runtime_ptr command_runtime;
     internal::connection_state_ptr connection_state;
 
@@ -202,8 +203,8 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         init_ngtcp2_addr(&path.remote, reinterpret_cast<sockaddr*>(&peer_ss), peer_ss_len);
     }
 
-    std::shared_ptr<internal::quic_server_impl> lock_server() const {
-        return server.lock();
+    internal::quic_server_impl* server_impl() const noexcept {
+        return server.get();
     }
 
     bool transport_active() const noexcept {
@@ -472,14 +473,14 @@ struct server_connection : public enable_lw_shared_from_this<server_connection> 
         rx_queue.abort(ex);
     }
 
-    void complete_open_stream(std::shared_ptr<promise<stream_id>> result, stream_id sid) {
+    void complete_open_stream(internal::open_stream_result_ptr result, stream_id sid) {
         if (command_runtime) {
             command_runtime->complete_open_stream(std::move(result), sid);
         }
     }
 
     void fail_open_stream(
-      std::shared_ptr<promise<stream_id>> result,
+      internal::open_stream_result_ptr result,
       quic_error_code error,
       sstring detail) {
         if (command_runtime) {
@@ -725,7 +726,7 @@ void sync_current_path(server_connection& conn) {
 namespace internal {
 
 // Owns the listener socket and tracks the set of active server-side connections.
-class quic_server_impl final : public std::enable_shared_from_this<quic_server_impl> {
+class quic_server_impl final : public enable_lw_shared_from_this<quic_server_impl>, public weakly_referencable<quic_server_impl> {
 public:
     quic_server_impl() = default;
     ~quic_server_impl() {
@@ -1015,7 +1016,7 @@ private:
         if (!conn || !conn->command_runtime) {
             return 0;
         }
-        auto server = conn->lock_server();
+        auto server = conn->server_impl();
         conn->handshake_done = true;
         sync_current_path(*conn);
         conn->command_runtime->mark_transport_ready(
@@ -1073,7 +1074,7 @@ private:
     static int dcid_status_cb(ngtcp2_conn*, ngtcp2_connection_id_status_type type, uint64_t, const ngtcp2_cid* cid, const uint8_t*, void* user_data) {
         // ngtcp2 tells us when a routed DCID becomes usable or retired.
         auto* conn = static_cast<server_connection*>(user_data);
-        auto server = conn ? conn->lock_server() : nullptr;
+        auto server = conn ? conn->server_impl() : nullptr;
         if (!conn || !server || !cid) {
             return 0;
         }
@@ -1235,7 +1236,7 @@ private:
             throw_quic_error(quic_error_code::invalid_argument, "max_tx_udp_payload_size must be <= max_udp_payload_size");
         }
         auto conn = make_lw_shared<server_connection>();
-        conn->server = shared_from_this();
+        conn->server = weak_from_this();
         conn->command_runtime = make_command_runtime(_cfg.session_options);
         conn->connection_state = make_connection_state(conn->command_runtime, _cfg.session_options);
         conn->command_runtime->set_command_notifier([raw = conn.get()] {
@@ -1394,7 +1395,7 @@ private:
               if (conn->command_runtime && conn->command_runtime->is_open()) {
                   conn->command_runtime->mark_error(quic_error_code::io, "server actor loop failed");
               }
-              if (auto server = conn->lock_server()) {
+              if (auto server = conn->server_impl()) {
                   server->unregister_connection(conn);
               }
           })
@@ -1557,20 +1558,20 @@ private:
 } // namespace internal
 
 bool server_connection::active() const noexcept {
-    return !closing && command_runtime && !server.expired();
+    return !closing && command_runtime && server;
 }
 
 future<> server_connection::send_datagram_packet(temporary_buffer<char> packet) {
-    auto server_state = lock_server();
-    if (!server_state) {
+    auto* srv = server_impl();
+    if (!srv) {
         co_return;
     }
-    co_await server_state->send_datagram_packet(peer, std::move(packet));
+    co_await srv->send_datagram_packet(peer, std::move(packet));
 }
 
 bool server_connection::can_send_connection_close() const noexcept {
-    auto server_state = lock_server();
-    return conn && server_state && !server_state->channel().is_closed();
+    auto* srv = server_impl();
+    return conn && srv && !srv->channel().is_closed();
 }
 
 future<> server_connection::actor_handle_next_rx_event() {
@@ -1606,8 +1607,8 @@ future<> server_connection::actor_handle_stop_request() {
             connection_state->on_transport_closed(std::make_exception_ptr(quic_error(quic_error_code::closed, "server connection stopped")));
         }
     }
-    if (auto server_state = lock_server()) {
-        server_state->unregister_connection(self);
+    if (auto* srv = server_impl()) {
+        srv->unregister_connection(self);
     }
 }
 
@@ -1663,7 +1664,7 @@ void server_connection::fail_transport(quic_error_code error, sstring detail) {
 }
 
 quic_server::quic_server()
-    : _impl(std::make_shared<internal::quic_server_impl>()) {
+    : _impl(make_lw_shared<internal::quic_server_impl>()) {
 }
 
 quic_server::~quic_server() {

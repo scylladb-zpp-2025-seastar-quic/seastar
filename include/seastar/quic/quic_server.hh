@@ -21,9 +21,9 @@
 
 #pragma once
 
-#include <memory>
 #include <vector>
 
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/quic/quic.hh>
 
@@ -74,7 +74,7 @@ public:
     future<> stop();
 
 private:
-    std::shared_ptr<internal::quic_server_impl> _impl;
+    lw_shared_ptr<internal::quic_server_impl> _impl;
 };
 
 } // namespace seastar::quic::experimental
