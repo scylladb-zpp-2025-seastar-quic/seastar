@@ -65,9 +65,8 @@ constexpr int ngtcp2_err_stream_shut_wr = NGTCP2_ERR_STREAM_SHUT_WR;
 
 class fake_connection_transport final : public quic_internal::connection_transport {
 public:
-    fake_connection_transport() {
-        static_cast<quic_internal::connection_transport&>(*this) = quic_internal::make_connection_transport(*this);
-    }
+    fake_connection_transport() = default;
+    ~fake_connection_transport() override = default;
 
     bool active = true;
     bool has_connection = true;
@@ -118,23 +117,23 @@ public:
     std::deque<quic_internal::transport_command> deferred_bidi_open_streams;
     std::deque<quic_internal::transport_command> deferred_uni_open_streams;
 
-    bool transport_active() const noexcept {
+    bool transport_active() const noexcept override {
         return active;
     }
 
-    bool has_transport_connection() const noexcept {
+    bool has_transport_connection() const noexcept override {
         return has_connection;
     }
 
-    bool can_retry_blocked_open_streams() const noexcept {
+    bool can_retry_blocked_open_streams() const noexcept override {
         return retry_blocked_open_streams;
     }
 
-    size_t tx_payload_limit_bytes() const noexcept {
+    size_t tx_payload_limit_bytes() const noexcept override {
         return 1200;
     }
 
-    int64_t write_pending_packet(uint8_t*, size_t) {
+    int64_t write_pending_packet(uint8_t*, size_t) override {
         ++write_pending_calls;
         if (!pending_packet_results.empty()) {
             auto result = pending_packet_results.front();
@@ -150,7 +149,7 @@ public:
       size_t,
       bool,
       uint8_t*,
-      size_t) {
+      size_t) override {
         ++stream_write_calls;
         if (!stream_write_results.empty()) {
             auto result = stream_write_results.front();
@@ -160,7 +159,7 @@ public:
         return {};
     }
 
-    quic_internal::transport_open_stream_result try_open_stream(stream_type) {
+    quic_internal::transport_open_stream_result try_open_stream(stream_type) override {
         ++open_stream_calls;
         if (!open_stream_results.empty()) {
             auto result = open_stream_results.front();
@@ -170,94 +169,94 @@ public:
         return {};
     }
 
-    void complete_send_bytes(size_t len) {
+    void complete_send_bytes(size_t len) override {
         completed_send_bytes += len;
     }
 
-    void retain_stream_data(stream_id, temporary_buffer<char>) {
+    void retain_stream_data(stream_id, temporary_buffer<char>) override {
     }
 
-    int consume_stream_data(stream_id sid, size_t len) {
+    int consume_stream_data(stream_id sid, size_t len) override {
         ++consume_calls;
         consumed_sid = sid;
         consumed_len = len;
         return consume_result;
     }
 
-    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) {
+    int shutdown_stream_write(stream_id sid, application_error_code app_error_code) override {
         ++reset_stream_calls;
         reset_sid = sid;
         reset_error = app_error_code;
         return reset_result;
     }
 
-    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) {
+    int shutdown_stream_read(stream_id sid, application_error_code app_error_code) override {
         ++stop_sending_calls;
         stop_sending_sid = sid;
         stop_sending_error = app_error_code;
         return stop_sending_result;
     }
 
-    int read_transport_datagram(const socket_address&, const char*, size_t) {
+    int read_transport_datagram(const socket_address&, const char*, size_t) override {
         ++read_datagram_calls;
         return read_datagram_result;
     }
 
-    void sync_transport_path() {
+    void sync_transport_path() override {
         ++sync_path_calls;
     }
 
-    uint64_t transport_expiry_ns() const noexcept {
+    uint64_t transport_expiry_ns() const noexcept override {
         return expiry_ns;
     }
 
-    int handle_transport_expiry(uint64_t) {
+    int handle_transport_expiry(uint64_t) override {
         ++timer_expiry_calls;
         return timer_expiry_result;
     }
 
-    temporary_buffer<char>& tx_packet_buffer() {
+    temporary_buffer<char>& tx_packet_buffer() override {
         return tx_buffer;
     }
 
-    future<> send_datagram_packet(temporary_buffer<char>) {
+    future<> send_datagram_packet(temporary_buffer<char>) override {
         ++send_datagram_calls;
         return make_ready_future<>();
     }
 
-    bool can_send_connection_close() const noexcept {
+    bool can_send_connection_close() const noexcept override {
         return can_close;
     }
 
-    int64_t write_connection_close_packet(uint8_t*, size_t) {
+    int64_t write_connection_close_packet(uint8_t*, size_t) override {
         ++write_connection_close_calls;
         return connection_close_result;
     }
 
-    void on_stream_write_closed(stream_id sid) {
+    void on_stream_write_closed(stream_id sid) override {
         ++stream_write_closed_calls;
         write_closed_sid = sid;
     }
 
-    void rearm_transport_timer() {
+    void rearm_transport_timer() override {
         ++rearm_calls;
     }
 
-    void request_close() {
+    void request_close() override {
         ++request_close_calls;
     }
 
-    void stop_transport() {
+    void stop_transport() override {
         ++stop_transport_calls;
         active = false;
     }
 
-    void fail_transport(quic_error_code error, sstring detail) {
+    void fail_transport(quic_error_code error, sstring detail) override {
         last_error = error;
         last_error_detail = std::move(detail);
     }
 
-    void complete_open_stream(quic_internal::open_stream_result_ptr result, stream_id sid) {
+    void complete_open_stream(quic_internal::open_stream_result_ptr result, stream_id sid) override {
         ++complete_open_stream_calls;
         completed_open_sid = sid;
         if (result) {
@@ -265,7 +264,7 @@ public:
         }
     }
 
-    void fail_open_stream(quic_internal::open_stream_result_ptr result, quic_error_code error, sstring detail) {
+    void fail_open_stream(quic_internal::open_stream_result_ptr result, quic_error_code error, sstring detail) override {
         ++fail_open_stream_calls;
         open_stream_error = error;
         open_stream_error_detail = detail;
@@ -274,7 +273,7 @@ public:
         }
     }
 
-    void defer_blocked_open_stream(quic_internal::transport_command cmd) {
+    void defer_blocked_open_stream(quic_internal::transport_command cmd) override {
         ++deferred_open_stream_calls;
         auto& q = cmd.type == stream_type::bidirectional
                     ? deferred_bidi_open_streams
@@ -282,7 +281,7 @@ public:
         q.push_back(std::move(cmd));
     }
 
-    std::optional<quic_internal::transport_command> pop_blocked_open_stream(stream_type type) {
+    std::optional<quic_internal::transport_command> pop_blocked_open_stream(stream_type type) override {
         auto& q = type == stream_type::bidirectional
                     ? deferred_bidi_open_streams
                     : deferred_uni_open_streams;
@@ -294,11 +293,11 @@ public:
         return cmd;
     }
 
-    bool blocked_open_stream_retry_pending(stream_type type) const noexcept {
+    bool blocked_open_stream_retry_pending(stream_type type) const noexcept override {
         return type == stream_type::bidirectional ? bidi_retry_pending : uni_retry_pending;
     }
 
-    void clear_blocked_open_stream_retry(stream_type type) noexcept {
+    void clear_blocked_open_stream_retry(stream_type type) noexcept override {
         if (type == stream_type::bidirectional) {
             ++clear_bidi_retry_calls;
             bidi_retry_pending = false;
