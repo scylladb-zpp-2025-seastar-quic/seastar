@@ -29,8 +29,10 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/quic/quic.hh>
 
+/// \brief Server-side entry points for the experimental QUIC transport.
 namespace seastar::quic::experimental {
 
+/// \cond internal
 namespace internal {
 class quic_server_impl;
 class quic_server_shard;
@@ -43,49 +45,78 @@ public:
     virtual future<> route_quic_packet(unsigned shard, socket_address local_address, socket_address src, temporary_buffer<char> packet) = 0;
 };
 }
+/// \endcond
 
-/// Listener configuration shared by all connections accepted from this server.
+/// \brief Listener configuration shared by all connections accepted from this server.
 struct quic_server_config {
-    /// Local UDP endpoint to bind.
+    /// \brief Local UDP endpoint to bind.
     socket_address listen_address;
 
-    /// PEM certificate chain file used by the server TLS session.
+    /// \brief PEM certificate chain file used by the server TLS session.
     sstring crt_file;
 
-    /// PEM private key file used by the server TLS session.
+    /// \brief PEM private key file used by the server TLS session.
     sstring key_file;
 
-    /// Non-empty ALPN protocols advertised during the TLS handshake.
+    /// \brief Non-empty ALPN protocols advertised during the TLS handshake.
     /// The list and each protocol identifier must be non-empty.
     std::vector<sstring> alpns = {sstring("h3")};
 
-    /// Runtime and transport limits for accepted connections.
+    /// \brief Runtime and transport limits for accepted connections.
     connection_options session_options{};
 };
 
-/// Server-side owner of the listening transport and accepted QUIC connections.
+/// \brief Shard-local QUIC listener and owner of accepted connections.
+///
+/// This low-level server binds one UDP socket on the current shard. Applications
+/// that run on more than one shard should normally use sharded_quic_server,
+/// which creates one listener per shard with `SO_REUSEPORT` and routes packets
+/// to the shard that owns their connection.
 class quic_server final {
 public:
-    /// Constructs a stopped QUIC server.
+    /// \brief Construct a stopped QUIC server.
     quic_server();
+
+    /// \brief Destroy the server and request detached cleanup if it is still running.
     ~quic_server();
 
+    /// \brief Move a shard-local server.
     quic_server(quic_server&&) noexcept;
+
+    /// \brief Replace this server with another shard-local server.
     quic_server& operator=(quic_server&&) noexcept;
 
+    /// \brief Servers cannot be copied.
     quic_server(const quic_server&) = delete;
+
+    /// \brief Servers cannot be copy-assigned.
     quic_server& operator=(const quic_server&) = delete;
 
-    /// Starts listening for QUIC Initial packets using config.
+    /// \brief Bind the configured UDP endpoint and begin receiving QUIC packets.
+    ///
+    /// \param config Listen endpoint, TLS credentials, ALPN list, and per-connection
+    ///               options.
+    /// \return A future that fails with quic_error if the server is already
+    ///         started, the configuration is invalid, credentials cannot be
+    ///         loaded, or the endpoint cannot be bound.
     future<> start(quic_server_config config);
 
-    /// Waits for the next connection that completed the QUIC and TLS handshakes.
+    /// \brief Wait for the next fully established connection.
+    ///
+    /// \return A future containing the next connection after its QUIC and TLS
+    ///         handshakes complete and ALPN is negotiated. The future fails when
+    ///         the server stops or its receive loop fails.
     future<connection> accept();
 
-    /// Returns the local UDP endpoint currently used by the server.
+    /// \brief Get the bound UDP endpoint.
+    ///
+    /// \return The effective endpoint, including an automatically selected port,
+    ///         or an empty address before start() and after stop().
     socket_address local_address() const noexcept;
 
-    /// Stops the listener and all server-owned connections.
+    /// \brief Stop accepting packets and close all server-owned connections.
+    ///
+    /// The operation waits for background work to finish and is idempotent.
     future<> stop();
 
 private:

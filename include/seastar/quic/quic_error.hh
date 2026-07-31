@@ -26,42 +26,52 @@
 #include <string>
 #include <type_traits>
 
+/// \brief Error reporting for the experimental QUIC transport.
 namespace seastar::quic::experimental {
 
-/// Error raised by the experimental QUIC transport.
+/// \brief Error raised by the experimental QUIC transport.
 ///
 /// The numeric values are stable within this API and are exposed through
 /// std::system_error::code() using quic_error_category().
 class quic_error final : public std::system_error {
 public:
-    /// Transport-independent QUIC error classes.
+    /// \brief Transport-independent QUIC error classes.
     enum value : uint8_t {
-        none = 0,
-        invalid_argument,
-        invalid_state,
-        io,
-        timeout,
-        protocol,
-        closed,
-        unsupported,
-        internal,
-        backend,
+        none = 0, ///< No error.
+        invalid_argument, ///< Invalid address, option, or protocol parameter.
+        invalid_state, ///< Operation is not valid in the object's current state.
+        io, ///< UDP or stream input/output failure.
+        timeout, ///< Handshake, idle, or transport timeout.
+        protocol, ///< QUIC protocol violation reported by ngtcp2.
+        closed, ///< Stream, connection, client, or server has closed.
+        unsupported, ///< Requested operation is unavailable on this platform.
+        internal, ///< Internal consistency or resource failure.
+        backend, ///< Error reported by ngtcp2, GnuTLS, or another backend.
     };
 
-    /// Constructs a system_error carrying a QUIC error code and optional detail.
+    /// \brief Construct an exception carrying a QUIC error code and optional context.
+    ///
+    /// \param error Transport-independent error class.
+    /// \param detail Additional diagnostic context appended to what().
     explicit quic_error(value error, std::string detail = {});
 };
 
-/// Returns the std::error_category used by quic_error.
+/// \brief Get the error category shared by all QUIC error codes.
+///
+/// \return A process-lifetime error category named `seastar.quic`.
 const std::error_category& quic_error_category() noexcept;
 
-/// Converts a QUIC error enum to std::error_code.
+/// \brief Convert a QUIC error class to std::error_code.
+///
+/// \param error Transport-independent error class.
+/// \return An error code in quic_error_category().
 std::error_code make_error_code(quic_error::value error) noexcept;
 
 } // namespace seastar::quic::experimental
 
 namespace std {
 
+/// \brief Enable implicit construction of std::error_code from QUIC error values.
 template <>
 struct is_error_code_enum<seastar::quic::experimental::quic_error::value> : true_type {};
 

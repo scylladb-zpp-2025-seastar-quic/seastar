@@ -28,51 +28,85 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/quic/quic.hh>
 
+/// \brief Client-side entry points for the experimental QUIC transport.
 namespace seastar::quic::experimental {
 
+/// \cond internal
 namespace internal {
 class quic_client_impl;
 }
+/// \endcond
 
-/// Configuration for a single outbound QUIC connection attempt.
+/// \brief Configuration for a single outbound QUIC connection attempt.
 struct quic_client_config {
-    /// Remote UDP endpoint to connect to.
+    /// \brief Remote UDP endpoint to connect to.
     socket_address remote_address;
 
-    /// Local UDP endpoint to bind, or any address in the remote address family.
+    /// \brief Local UDP endpoint to bind.
+    ///
+    /// When unset, the client binds a wildcard address in the remote endpoint's
+    /// address family and lets the operating system choose the source port.
     std::optional<socket_address> local_address{};
 
-    /// Server Name Indication value used for TLS certificate validation.
+    /// \brief DNS name sent as TLS Server Name Indication and verified in the certificate.
+    ///
+    /// An empty value disables SNI and hostname matching, but not certificate
+    /// chain verification.
     sstring server_name = "localhost";
 
-    /// Optional CA bundle used to validate the server certificate.
+    /// \brief Additional PEM CA bundle used to validate the server certificate.
+    ///
+    /// The system trust store is loaded whether or not this value is set.
     std::optional<sstring> ca_file{};
 
-    /// Non-empty ALPN protocols offered during the TLS handshake.
+    /// \brief Non-empty ALPN protocols offered during the TLS handshake.
     /// The list and each protocol identifier must be non-empty.
     std::vector<sstring> alpns = {sstring("h3")};
 
-    /// Runtime and transport limits for the resulting connection.
+    /// \brief Runtime and transport limits for the resulting connection.
     connection_options session_options{};
 };
 
-/// Client-side owner of transport state that yields one established connection.
+/// \brief Client-side owner of one UDP transport and one QUIC connection.
+///
+/// A client instance supports one active connect() attempt or connection at a
+/// time. Call stop() before reusing or destroying an active client.
 class quic_client final {
 public:
-    /// Constructs a stopped QUIC client.
+    /// \brief Construct a stopped QUIC client.
     quic_client();
+
+    /// \brief Destroy the client and its implementation state.
     ~quic_client();
 
+    /// \brief Move a client, including any active transport state.
     quic_client(quic_client&&) noexcept;
+
+    /// \brief Replace this client with another client.
     quic_client& operator=(quic_client&&) noexcept;
 
+    /// \brief Clients cannot be copied.
     quic_client(const quic_client&) = delete;
+
+    /// \brief Clients cannot be copy-assigned.
     quic_client& operator=(const quic_client&) = delete;
 
-    /// Opens a QUIC connection using config.
+    /// \brief Establish a QUIC connection.
+    ///
+    /// The future resolves only after the QUIC and TLS handshakes complete and
+    /// ALPN is negotiated.
+    ///
+    /// \param config Remote endpoint, TLS identity, ALPN list, and transport options.
+    /// \return A future containing the established connection. It fails with
+    ///         quic_error if the configuration is invalid, a connection is
+    ///         already active, certificate validation fails, or the handshake
+    ///         fails.
     future<connection> connect(quic_client_config config);
 
-    /// Stops background transport work and closes the UDP channel.
+    /// \brief Stop background transport work and close the UDP channel.
+    ///
+    /// Active streams and pending operations are failed. The operation is
+    /// idempotent.
     future<> stop();
 
 private:
